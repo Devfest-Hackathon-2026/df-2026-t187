@@ -18,6 +18,7 @@
 
   --shadow-soft: 0 2px 6px var(--ink-05), 0 12px 32px var(--ink-05);
   --shadow-phone: 0 4px 12px rgba(28, 25, 23, 0.08), 0 24px 48px rgba(28, 25, 23, 0.12);
+  --font-sans: "Zen Maru Gothic", "Hiragino Maru Gothic ProN", "BIZ UDPGothic", "Hiragino Sans", "Noto Sans JP", system-ui, sans-serif;
 }
 
 * {
@@ -28,6 +29,13 @@
   -webkit-user-select: none;
 }
 
+button,
+input,
+select,
+textarea {
+  font-family: inherit;
+}
+
 input,
 textarea {
   user-select: text;
@@ -35,7 +43,8 @@ textarea {
 }
 
 body {
-  font-family: "Hiragino Kaku Gothic ProN", "Hiragino Sans", "Noto Sans JP", system-ui, sans-serif;
+  font-family: var(--font-sans);
+  font-weight: 700;
   background-color: var(--paper-bg);
   background-image: radial-gradient(var(--ink-15) 1px, transparent 1px);
   background-size: 22px 22px;
@@ -82,13 +91,20 @@ body {
   margin: 0 auto;
   padding: 10px clamp(20px, 3vw, 40px) 0;
   display: flex;
-  flex-wrap: wrap;
+  /* 版が増えても折り返さず、スマホや下のボタンの位置がずれないようにする。版が出る前から同じ高さを取っておく */
+  flex-wrap: nowrap;
+  min-height: 49px;
   align-items: center;
   justify-content: space-between;
   gap: 10px;
 }
 
 .goal-status-bar {
+  flex: 0 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   background: var(--paper-card);
   color: var(--ink-80);
   border: 1px solid var(--ink-15);
@@ -103,9 +119,18 @@ body {
   display: flex;
   align-items: center;
   gap: 6px;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.checkpoint-bar::-webkit-scrollbar {
+  display: none;
 }
 
 .checkpoint-pill {
+  flex: 0 0 auto;
   background: var(--paper-subtle);
   color: var(--ink-60);
   border: 1px solid var(--ink-15);
@@ -202,6 +227,18 @@ body {
 
 .btn-bottom-evaluate:hover {
   opacity: 0.9;
+}
+
+/* 誰のために改造するかを選ぶまでは押せないので、目立たない色にする */
+.btn-bottom-evaluate.is-locked {
+  background: var(--paper-subtle);
+  color: var(--ink-60);
+  box-shadow: none;
+  cursor: not-allowed;
+}
+
+.btn-bottom-evaluate.is-locked:hover {
+  opacity: 1;
 }
 
 /* ==================== メインゲームステージ（比率を保ちながら大きく表示） ==================== */
@@ -322,8 +359,8 @@ body {
   --app-line: rgba(47, 31, 21, 0.1);
   --muted: rgba(47, 31, 21, 0.56);
   --card-shadow: 0 1px 0 var(--app-line), 0 0.5rem 1.5rem rgba(91, 58, 38, 0.06);
-  --mincho: 'Shippori Mincho', 'Hiragino Mincho ProN', serif;
-  --gothic: 'Zen Kaku Gothic New', 'Hiragino Sans', 'Noto Sans JP', sans-serif;
+  --gothic: 'Zen Maru Gothic', 'Hiragino Maru Gothic ProN', 'BIZ UDPGothic', 'Hiragino Sans', 'Noto Sans JP', sans-serif;
+  --mincho: var(--gothic);
   position: relative;
   width: 100%;
   height: 100%;
@@ -331,6 +368,7 @@ body {
   flex-direction: column;
   overflow: hidden;
   font-family: var(--gothic);
+  font-weight: 700;
   letter-spacing: 0.01em;
 }
 
@@ -412,7 +450,7 @@ body {
 
 .sandbox-app-title {
   font-size: 1rem;
-  font-weight: 700;
+  font-weight: 900;
   letter-spacing: 0.08em;
 }
 
@@ -457,7 +495,7 @@ body {
 
 .sandbox-sticky-bar .sandbox-comp-item[data-role='total'] .comp-text {
   font-family: var(--mincho);
-  font-weight: 700;
+  font-weight: 900;
   line-height: 1.1;
 }
 
@@ -467,10 +505,33 @@ body {
   transition: outline-color 140ms ease;
 }
 
+.sandbox-comp-item.is-just-changed {
+  outline: 2.5px solid #2563eb;
+  outline-offset: 0.2rem;
+  border-radius: 1rem;
+  box-shadow: 0 0 0 0.45rem rgba(37, 99, 235, 0.18);
+}
+
 .sandbox-comp-item.is-circled-target {
   outline: 2.5px solid var(--accent-red);
   outline-offset: 0.2rem;
   border-radius: 1rem;
+}
+
+/* 必須の項目が空のまま先へ進もうとしたとき、その項目を一瞬揺らして赤く縁取る */
+.sandbox-comp-item.is-missing {
+  outline: 2px solid #c2410c;
+  outline-offset: 0.2rem;
+  border-radius: 1rem;
+  animation: sandboxMissingShake 420ms ease;
+}
+
+@keyframes sandboxMissingShake {
+  0%, 100% { transform: translateX(0); }
+  20% { transform: translateX(-0.35rem); }
+  40% { transform: translateX(0.35rem); }
+  60% { transform: translateX(-0.2rem); }
+  80% { transform: translateX(0.2rem); }
 }
 
 /* 文字の大きさ（size-*）はシミュレーターの判定と一致させる */
@@ -492,20 +553,21 @@ body {
 }
 
 .comp-heading {
-  font-weight: 700;
+  font-weight: 900;
   letter-spacing: 0.06em;
   padding: 0.25rem 0.25rem 0;
   margin-bottom: -0.4rem;
 }
 
-.comp-text { font-weight: 500; line-height: 1.55; }
-.comp-caption { color: var(--muted); }
+.comp-text { font-weight: 700; line-height: 1.55; }
+.comp-caption { font-weight: 700; color: var(--muted); }
 
 /* 点滅して注意を奪う表示 */
-.sandbox-comp-item.is-noisy { animation: sandboxBlink 0.9s steps(2, start) infinite; }
+/* 点滅は消さずに薄くするだけにして、消えている間に画面が空いて見えないようにする */
+.sandbox-comp-item.is-noisy { animation: sandboxBlink 0.9s ease-in-out infinite; }
 
 @keyframes sandboxBlink {
-  to { visibility: hidden; }
+  50% { opacity: 0.35; }
 }
 
 /* 崩れたレイアウト */
@@ -581,8 +643,8 @@ body {
   margin-bottom: 0.2rem;
 }
 
-.product-name { font-family: var(--mincho); font-weight: 700; font-size: 1.15em; line-height: 1.35; }
-.product-meta { font-size: 0.75rem; color: var(--muted); margin-top: 0.15rem; }
+.product-name { font-family: var(--mincho); font-weight: 900; font-size: 1.15em; line-height: 1.35; }
+.product-meta { font-size: 0.75rem; font-weight: 700; color: var(--muted); margin-top: 0.15rem; }
 
 .product-row {
   display: flex;
@@ -592,7 +654,7 @@ body {
   margin-top: 0.6rem;
 }
 
-.product-price { font-family: var(--mincho); font-weight: 700; font-size: 1.12rem; }
+.product-price { font-family: var(--mincho); font-weight: 900; font-size: 1.12rem; }
 
 .product-stepper {
   display: inline-flex;
@@ -1039,6 +1101,67 @@ body {
   overflow: hidden;
 }
 
+/* 改造の作業ログ（システムメッセージ領域に表示） */
+.system-worklog {
+  background: var(--paper-subtle);
+  border: 1px solid var(--ink-10);
+  border-radius: 12px;
+  padding: 8px 14px;
+  max-width: 90%;
+}
+
+.worklog-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 4px;
+  font-size: 0.76rem;
+}
+
+.worklog-list li {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  color: var(--ink-80);
+}
+
+.worklog-list li.is-active {
+  color: var(--ink-60);
+}
+
+.worklog-mark {
+  flex: 0 0 1em;
+  color: #2563eb;
+  font-weight: 800;
+}
+
+/* 作業中の行は、印の代わりに小さく回る輪を出す */
+.worklog-list li.is-active .worklog-mark::before {
+  content: '';
+  display: inline-block;
+  width: 0.7em;
+  height: 0.7em;
+  border: 2px solid #93c5fd;
+  border-top-color: #2563eb;
+  border-radius: 50%;
+  animation: worklogSpin 0.8s linear infinite;
+}
+
+@keyframes worklogSpin {
+  to { transform: rotate(360deg); }
+}
+
+.composer-pending-note {
+  font-size: 0.74rem;
+  color: var(--ink-60);
+  padding: 0 4px 6px;
+}
+
+.vibe-chat-stream.is-skippable {
+  cursor: pointer;
+}
+
 .vibe-chat-stream {
   flex: 1;
   min-height: 0;
@@ -1135,7 +1258,7 @@ body {
   align-items: flex-start;
   gap: 3px;
   min-width: 0;
-  max-width: 82%;
+  max-width: 90%;
 }
 
 /* 作戦カードを載せるため、エージェントの吹き出しは広めにとる */
@@ -1178,6 +1301,11 @@ body {
 .chat-bubble.is-customer.is-achieved {
   background: #f0fdf4;
   border-color: #bbf7d0;
+}
+
+.chat-bubble.is-customer.is-bothered {
+  background: #fefce8;
+  border-color: #fde68a;
 }
 
 .chat-bubble.is-customer.is-regretted {
@@ -1233,14 +1361,17 @@ body {
 }
 
 .chat-bubble {
-  max-width: 92%;
+  max-width: 96%;
   border-radius: 16px;
-  padding: 12px 15px;
-  font-size: 0.85rem;
-  line-height: 1.5;
+  padding: 12px 16px;
+  font-size: 0.86rem;
+  font-weight: 700;
+  line-height: 1.56;
   display: flex;
   flex-direction: column;
   gap: 10px;
+  overflow-wrap: break-word;
+  word-break: break-word;
 }
 
 .chat-bubble.is-entering {
@@ -1363,6 +1494,7 @@ body {
   border: 1px solid var(--ink-15);
   background: #ffffff;
   font-size: 0.76rem;
+  font-weight: 700;
   color: var(--ink);
 }
 
@@ -1394,17 +1526,19 @@ body {
 
 .disposition-choice-row {
   display: flex;
+  flex-wrap: nowrap;
   gap: 6px;
   margin-top: 2px;
 }
 
 .btn-disposition-pill {
-  flex: 1;
+  flex: 1 0 auto;
+  white-space: nowrap;
   background: var(--paper-subtle);
   border: 1px solid var(--ink-15);
   border-radius: 8px;
-  padding: 4px 8px;
-  font-size: 0.7rem;
+  padding: 5px 10px;
+  font-size: 0.72rem;
   font-weight: 800;
   color: var(--ink-80);
   cursor: pointer;
@@ -1417,119 +1551,17 @@ body {
   border-color: var(--ink);
 }
 
-/* チャット内の3つの作戦カード */
-.inline-choice-deck {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.inline-choice-card {
-  width: 100%;
-  text-align: left;
-  background: #ffffff;
-  border: 1.5px solid var(--ink-15);
-  border-radius: 12px;
-  padding: 10px 12px;
-  transition: all 140ms ease;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.inline-choice-card.is-draft {
-  border-color: var(--accent-blue);
-}
-
-.inline-choice-trigger {
-  width: 100%;
-  text-align: left;
-  background: transparent;
-  border: none;
-  padding: 0;
+.speaker-avatar.is-selectable,
+.speaker-name.is-selectable {
   cursor: pointer;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
 }
 
-.inline-choice-card:hover {
-  border-color: var(--accent-blue);
-  box-shadow: 0 2px 8px rgba(37, 99, 235, 0.12);
-}
-
-.inline-choice-card.is-picked {
-  border-color: var(--accent-green);
-  background: #f0fdf4;
-}
-
-.inline-choice-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.choice-letter {
-  width: 22px;
-  height: 22px;
-  border-radius: 6px;
-  background: var(--ink);
-  color: #ffffff;
-  font-size: 0.72rem;
-  font-weight: 800;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  flex: none;
-}
-
-.choice-title {
-  font-size: 0.84rem;
-  font-weight: 800;
-  color: var(--ink);
-  flex: 1;
-}
-
-.inline-choice-cta {
-  font-size: 0.72rem;
-  font-weight: 800;
+.speaker-name.is-selectable:hover {
   color: var(--accent-blue);
-  white-space: nowrap;
+  text-decoration: underline;
 }
 
-.choice-tradeoff-rows {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-  font-size: 0.74rem;
-  color: var(--ink-80);
-}
-
-.tradeoff-line {
-  display: flex;
-  align-items: baseline;
-  gap: 6px;
-}
-
-.tradeoff-badge {
-  font-size: 0.65rem;
-  font-weight: 800;
-  padding: 1px 6px;
-  border-radius: 4px;
-  flex: none;
-}
-
-.tradeoff-line.is-plus .tradeoff-badge {
-  background: #dcfce7;
-  color: var(--accent-green);
-}
-
-.tradeoff-line.is-minus .tradeoff-badge {
-  background: #fee2e2;
-  color: #b91c1c;
-}
-
-/* 下部コンポーザー（赤ペン選択バー ＋ 質問/改造チップ ＋ 自由入力） */
+/* 下部コンポーザー（宛先選択 ＋ 自由入力） */
 .vibe-composer {
   border-top: 1px solid var(--ink-10);
   background: var(--paper-subtle);
@@ -1537,6 +1569,78 @@ body {
   display: flex;
   flex-direction: column;
   gap: 8px;
+}
+
+.composer-recipient-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.composer-recipient-label {
+  font-size: 0.72rem;
+  font-weight: 800;
+  color: var(--ink-60);
+  margin-right: 2px;
+}
+
+.composer-recipient-pill {
+  background: #ffffff;
+  border: 1px solid var(--ink-15);
+  border-radius: 999px;
+  padding: 3px 10px;
+  font-size: 0.72rem;
+  font-weight: 800;
+  color: var(--ink-80);
+  cursor: pointer;
+  transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease, transform 140ms ease;
+}
+
+.composer-recipient-pill:hover {
+  border-color: var(--accent-blue);
+  color: var(--accent-blue);
+}
+
+.composer-recipient-pill.is-active {
+  background: var(--ink);
+  border-color: var(--ink);
+  color: #ffffff;
+}
+
+.composer-recipient-pill.is-entering {
+  animation: recipient-pill-enter 420ms cubic-bezier(0.22, 1.28, 0.36, 1) both;
+}
+
+.composer-recipient-pill.is-auto-switched {
+  animation: recipient-pill-switch 320ms cubic-bezier(0.22, 1.28, 0.36, 1);
+}
+
+@keyframes recipient-pill-enter {
+  0% {
+    opacity: 0;
+    transform: translateY(6px) scale(0.72);
+  }
+  65% {
+    opacity: 1;
+    transform: translateY(-2px) scale(1.08);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes recipient-pill-switch {
+  0% {
+    transform: scale(0.88);
+  }
+  55% {
+    transform: scale(1.1);
+  }
+  100% {
+    transform: scale(1);
+  }
 }
 
 .composer-form-row {
@@ -1551,6 +1655,7 @@ body {
   border: 1px solid var(--ink-15);
   background: #ffffff;
   font-size: 0.84rem;
+  font-weight: 700;
   color: var(--ink);
 }
 

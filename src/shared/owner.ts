@@ -1,7 +1,13 @@
 // 店長（依頼主）の反応。お客さんの結果から、お店の側の数字を数えて一言にする。
 // 数字はコードで数え、AIには任せない（お店の側の結果もお客さんの達成・離脱と同じく客観的にする）。
 
-import { hasCompletionAction, type AppState } from './appRuntime.ts';
+import {
+  createInitialState,
+  hasCompletionAction,
+  isHonestOptInComponent,
+  renderLabel,
+  type AppState,
+} from './appRuntime.ts';
 import type { OwnerDefinition } from './theme.ts';
 import type { AppSpec, OwnerReport, ReviewOutcome } from './types.ts';
 
@@ -27,7 +33,8 @@ export function buildOwnerReport(
   spec: AppSpec,
   results: OwnerInput[],
 ): OwnerReport {
-  const ordered = results.filter((r) => r.outcome === 'achieved' || r.outcome === 'regretted');
+  // 不満があっても後悔していても、買ってくれたことに変わりはない
+  const ordered = results.filter((r) => r.outcome !== 'abandoned');
   const stateKeys = new Set(spec.state.map((s) => s.key));
 
   const metrics = owner.metrics
@@ -67,16 +74,39 @@ export function buildOwnerReport(
   };
 }
 
+/** 改造で変わったことのうち店長が気にするもの。fact はAIに渡す事実、line はAIを使えないときの決まったせりふ */
+export interface OwnerChangeFact {
+  fact: string;
+  line: string;
+}
+
+function labelsOf(spec: AppSpec, ids: string[]): string {
+  const state = createInitialState(spec);
+  return ids
+    .map((id) => {
+      const comp = spec.components.find((c) => c.id === id);
+      return comp ? renderLabel(comp, state) : '';
+    })
+    .filter(Boolean)
+    .map((l) => `「${l}」`)
+    .join('と');
+}
+
 /**
- * 画面が改造された直後に、店長が変更前後の仕様差分からお店・売上の立場でリアクションする。
+ * 画面が改造された直後に、店長が気にする変化を変更前後の仕様から調べる。
+ * 何が変わったかはコードで決め、言い方だけをAIに任せる（数字や事実がぶれないようにする）
  */
-export function buildOwnerChangeReaction(
+export function describeOwnerChange(
   owner: OwnerDefinition,
   prevSpec: AppSpec,
   nextSpec: AppSpec,
-): string {
+): OwnerChangeFact[] {
   const lines = owner.lines;
-  const reactions: string[] = [];
+  const facts: OwnerChangeFact[] = [];
+  const removedIds = (pred: (c: AppSpec['components'][number]) => boolean) =>
+    prevSpec.components
+      .filter((c) => pred(c) && !nextSpec.components.some((n) => n.id === c.id))
+      .map((c) => c.id);
 
   const prevHadCompletion = prevSpec.components.some(
     (c) => c.type === 'button' && hasCompletionAction(c),
@@ -85,7 +115,7 @@ export function buildOwnerChangeReaction(
     (c) => c.type === 'button' && hasCompletionAction(c),
   );
   if (!prevHadCompletion && nextHasCompletion) {
-    reactions.push(lines.completionFixed);
+    facts.push({ fact: '押しても反応しなかった購入のボタンが、押せば買えるようになった', line: lines.completionFixed });
   }
 
   // 店長が重視している数字（題材で決めたもの）の変化を調べる
@@ -96,57 +126,76 @@ export function buildOwnerChangeReaction(
     const nextState = nextSpec.state.find((s) => s.key === m.stateKey);
 
     if (prevComp && !nextComp) {
-      reactions.push(fill(lines.metricRemoved, { label: m.label }));
+      facts.push({
+        fact: `お店の売上につながる${m.label}の申し込み欄を、画面から消した`,
+        line: fill(lines.metricRemoved, { label: m.label }),
+      });
+    } else if (
+      m.countWhen === true &&
+      isHonestOptInComponent(nextComp, nextState?.initialValue) &&
+      !isHonestOptInComponent(prevComp, prevState?.initialValue)
+    ) {
+      facts.push({
+        fact: `${m.label}を消さずに残したうえで、最初のチェックを外して文字や条件を正直で分かりやすい形に整えた`,
+        line: `おっ、${m.label}を消さずに分かりやすく残してくれたんだな！それでお客さんが選んでくれるなら嬉しいよ`,
+      });
     } else if (
       m.countWhen === true &&
       prevState?.initialValue === true &&
       nextState?.initialValue === false
     ) {
-      reactions.push(fill(lines.metricUnchecked, { label: m.label }));
-    } else if (
-      prevComp &&
-      nextComp &&
-      prevComp.style.size === 'xs' &&
-      nextComp.style.size !== 'xs'
-    ) {
-      reactions.push(fill(lines.metricEnlarged, { label: m.label }));
+      facts.push({
+        fact: `${m.label}に最初から入っていたチェックを外し、申し込みたい人だけが自分で選ぶようにした`,
+        line: fill(lines.metricUnchecked, { label: m.label }),
+      });
+    } else if (prevComp && nextComp && prevComp.style.size === 'xs' && nextComp.style.size !== 'xs') {
+      facts.push({
+        fact: `小さくて目立たなかった${m.label}の説明を、読める大きさにした`,
+        line: fill(lines.metricEnlarged, { label: m.label }),
+      });
     }
   }
 
-  // 時間差で出る広告の削除
-  const prevPopups = prevSpec.components.filter((c) => c.role === 'popup').length;
-  const nextPopups = nextSpec.components.filter((c) => c.role === 'popup').length;
-  if (prevPopups > nextPopups) {
-    reactions.push(lines.popupRemoved);
+  const popups = removedIds((c) => c.role === 'popup');
+  if (popups.length > 0) {
+    facts.push({
+      fact: `店長が付けた広告${labelsOf(prevSpec, popups)}を消した`,
+      line: lines.popupRemoved,
+    });
   }
-
-  // おとりボタン・煽りバナーの削除
-  const prevDecoysOrDistractions = prevSpec.components.filter(
-    (c) => c.role === 'decoy' || c.role === 'distraction',
-  ).length;
-  const nextDecoysOrDistractions = nextSpec.components.filter(
-    (c) => c.role === 'decoy' || c.role === 'distraction',
-  ).length;
-  if (prevDecoysOrDistractions > nextDecoysOrDistractions) {
-    reactions.push(lines.distractionRemoved);
+  const decoys = removedIds((c) => c.role === 'decoy');
+  if (decoys.length > 0) {
+    facts.push({
+      fact: `店長が目立たせていたボタン${labelsOf(prevSpec, decoys)}を消した`,
+      line: lines.distractionRemoved,
+    });
+  }
+  const distractions = removedIds((c) => c.role === 'distraction');
+  if (distractions.length > 0) {
+    facts.push({
+      fact: `店長が付けた煽りの表示${labelsOf(prevSpec, distractions)}を消した`,
+      line: lines.distractionRemoved,
+    });
   }
 
   // 確認ダイアログまたは確認ステップの追加
-  const prevConfirms =
-    prevSpec.components.some((c) => c.behavior?.effect === 'confirm_dialog') ||
-    prevSpec.state.some((s) => s.key === 'step');
-  const nextConfirms =
-    nextSpec.components.some((c) => c.behavior?.effect === 'confirm_dialog') ||
-    nextSpec.state.some((s) => s.key === 'step');
-  if (!prevConfirms && nextConfirms) {
-    reactions.push(lines.confirmAdded);
+  const hasConfirm = (spec: AppSpec) =>
+    spec.components.some((c) => c.behavior?.effect === 'confirm_dialog') ||
+    spec.state.some((s) => s.key === 'step');
+  if (!hasConfirm(prevSpec) && hasConfirm(nextSpec)) {
+    facts.push({ fact: '注文を確定する前に、内容を確かめる確認を足した', line: lines.confirmAdded });
   }
 
-  if (reactions.length === 0) {
-    return '';
-  }
+  return facts;
+}
 
-  return reactions.join('\n');
+/** 改造の直後の店長の反応を、決まったせりふでつなげる（AIを使えないとき・テスト用） */
+export function buildOwnerChangeReaction(
+  owner: OwnerDefinition,
+  prevSpec: AppSpec,
+  nextSpec: AppSpec,
+): string {
+  return [...new Set(describeOwnerChange(owner, prevSpec, nextSpec).map((f) => f.line))].join('\n');
 }
 
 /**

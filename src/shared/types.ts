@@ -136,6 +136,11 @@ export interface AppComponent {
   style: ComponentStyle;
   behavior?: ComponentBehavior;
   visibleWhen?: VisibilityCondition;
+  /**
+   * お客さんをだます仕掛けの種類。false_urgency は偽の残り時間などで急かすもの。
+   * ラベルに {countdown} がある部品も急かす仕掛けとして扱う
+   */
+  darkPattern?: 'false_urgency';
   /** role が trap のとき、この条件が成り立ったまま完了すると後悔につながる */
   trapWhen?: VisibilityCondition;
   /** role が trap のとき、気づいた人が直す値。未指定なら気づいても直せない（承知のうえで進む） */
@@ -200,6 +205,8 @@ export interface PersonaConstraints {
   wantsConfirmation: boolean;
   /** 合計金額がすぐ読めないと完了しない */
   needsReadableTotal: boolean;
+  /** 残り時間などで急かされると嫌な気分になる（買えても不満が残る） */
+  dislikesPressure?: boolean;
 }
 
 export interface ReviewerPersona {
@@ -227,7 +234,11 @@ export interface ReviewerDispositionRecord {
 }
 
 /** 達成・離脱に加え、完了はできたが罠に気づかず後悔したケースを区別する */
-export type ReviewOutcome = 'achieved' | 'abandoned' | 'regretted';
+/**
+ * achieved は嫌な思いをせず買えた、bothered は買えたが途中で嫌な思いをした（おとりを押した・罠に気づいて自分で外した・広告を閉じた など）、
+ * abandoned は途中でやめた、regretted は買えたが罠に気づかず後悔した
+ */
+export type ReviewOutcome = 'achieved' | 'bothered' | 'abandoned' | 'regretted';
 
 export interface ReviewerEvaluation {
   reviewerId: string;
@@ -248,6 +259,8 @@ export interface OwnerReport {
   metrics: Array<{ label: string; count: number; missing: boolean }>;
   /** 店長の一言 */
   comment: string;
+  /** 選んだお客さん全員が満足したときの、AIが作った店長の締めのせりふ */
+  closingLines?: string[];
 }
 
 export interface EvaluationResponse {
@@ -330,10 +343,31 @@ export interface ApplyResponse {
   commitMessage: string;
   updatedSpec: AppSpec;
   patches?: SpecPatch[];
+  /** 改造の作業内容を短い言葉にしたもの。チャットで作業の過程として見せる */
+  workSteps?: Array<{ text: string; componentId?: string }>;
+  /** 店長の決まったせりふ（AIを使えないときの代わり） */
   ownerReaction?: string;
+  /** 店長が気にする変化の事実。店長のせりふはこれをもとにAIが作る */
+  ownerFacts?: string[];
   validation?: SandboxValidationResult;
   rolledBack?: boolean;
   decisionRecord?: HumanDecisionRecord;
+}
+
+// 店長のせりふ API の入出力
+export interface OwnerLineRequest {
+  /** change は改造の直後、closing は選んだお客さん全員が満足したとき、reply は店長に話しかけられたとき */
+  situation: 'change' | 'closing' | 'reply';
+  /** reply のときの、学習者が店長に話しかけた言葉 */
+  userMessage?: string;
+  facts: string[];
+  /** AIが使えないときのせりふ */
+  fallback: string;
+  history?: ChatHistoryEntry[];
+}
+
+export interface OwnerLineResponse {
+  text: string;
 }
 
 // レビュアー使用テスト API の入出力
@@ -344,6 +378,8 @@ export interface EvaluateRequest {
   cohortId?: TargetCohortId;
   screenshotBase64?: string;
   componentBounds?: ComponentBoundsInput[];
+  /** 店長が同じ言い回しを繰り返さないための、これまでの会話 */
+  history?: ChatHistoryEntry[];
 }
 
 // チェックポイント履歴 (Gitのコミット相当)
@@ -357,16 +393,29 @@ export interface Checkpoint {
 }
 
 // 自由対話タイムライン型ハイブリッド壁打ち API
-/** explain は質問への回答、clarify は曖昧な発言への聞き返し、apply は改修の実行 */
-export type ChatIntent = 'explain' | 'clarify' | 'apply';
+/** explain は質問への回答、clarify は曖昧な発言への聞き返し、apply は改修の実行、owner は店長の返事、customer はお客さん本人の返事 */
+export type ChatIntent = 'explain' | 'clarify' | 'apply' | 'owner' | 'customer';
+
+/** お助けエージェントに渡す、直近にお客さんが実際に操作した記録 */
+export interface LatestReviewRecord {
+  /** どの画面での記録か（最初・改造1など）と、それが今の画面かどうか */
+  screenLabel: string;
+  isCurrentScreen: boolean;
+  reviews: Array<{ name: string; outcome: ReviewOutcome; actionTrace: string[] }>;
+}
 
 export interface ChatRequest {
   currentSpec: AppSpec;
+  latestReviews?: LatestReviewRecord;
   targetComponentIds: string[];
   userMessage: string;
   cohortId?: TargetCohortId;
   annotatedImageBase64?: string;
   history?: ChatHistoryEntry[];
+  /** circled は、学習者が赤ペンで囲んだだけのとき。受け止めて尋ねるだけで、画面は変えない */
+  mode?: 'circled';
+  /** 誰に向けて送った発言か（auto / assistant / owner / ペルソナID） */
+  recipient?: string;
 }
 
 export interface ChatResponse {
@@ -374,4 +423,6 @@ export interface ChatResponse {
   reply: string;
   suggestedFollowUps: string[];
   applied?: ApplyResponse;
+  /** intent が customer のときの返答したペルソナID */
+  customerPersonaId?: string;
 }

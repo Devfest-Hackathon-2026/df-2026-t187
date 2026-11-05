@@ -4,8 +4,10 @@ import {
   evaluateExpression,
   hasCompletionAction,
   isComponentVisible,
+  isHonestOptInComponent,
   isInputFilled,
   matchesCondition,
+  renderLabel,
   type AppState,
 } from './appRuntime.ts';
 import type {
@@ -27,14 +29,22 @@ export function escapeHtml(raw: string): string {
     .replace(/'/g, '&#39;');
 }
 
+const SAFE_CSS_COLOR_RE =
+  /^(#[0-9a-fA-F]{3,8}|[a-zA-Z]+|(?:rgb|hsl|oklch)a?\([0-9.,%\s/deg+-]+\))$/;
+
+function sanitizeCssColor(raw: string | undefined, fallback: string): string {
+  const trimmed = raw?.trim() ?? '';
+  return SAFE_CSS_COLOR_RE.test(trimmed) ? trimmed : fallback;
+}
+
 /**
  * お題アプリ仕様 (AppSpec) から、iframe 内で単一HTMLとして独立動作する HTML 文字列を生成する。
  * タスク完了時には window.parent.postMessage({ type: 'PONKOTSU_TASK_COMPLETED' }, '*') を発火する。
  */
 export function buildStandaloneSandboxHtml(spec: AppSpec): string {
   const safeTitle = escapeHtml(spec.title || 'お題アプリ');
-  const bg = escapeHtml(spec.theme?.bgColor || '#ffffff');
-  const fg = escapeHtml(spec.theme?.textColor || '#1c1917');
+  const bg = sanitizeCssColor(spec.theme?.bgColor, '#ffffff');
+  const fg = sanitizeCssColor(spec.theme?.textColor, '#1c1917');
   const serializedSpec = JSON.stringify(spec).replace(/</g, '\\u003c');
 
   return `<!DOCTYPE html>
@@ -50,7 +60,8 @@ export function buildStandaloneSandboxHtml(spec: AppSpec): string {
     html, body {
       width: 100%;
       height: 100%;
-      font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", sans-serif;
+      font-family: "Zen Maru Gothic", "Hiragino Maru Gothic ProN", "BIZ UDPGothic", "Hiragino Sans", "Noto Sans JP", sans-serif;
+      font-weight: 700;
       background: ${bg};
       color: ${fg};
       overflow: hidden;
@@ -433,6 +444,7 @@ function describeConstraints(persona: ReviewerPersona): string {
     c.readsFinePrint ? '細かい字も読む' : '細かい字は読み飛ばす',
     c.wantsConfirmation ? '確認したい' : '',
     c.needsReadableTotal ? '合計金額を確かめたい' : '',
+    c.dislikesPressure ? '急かされるのが嫌い' : '',
   ]
     .filter(Boolean)
     .join('・');
@@ -464,6 +476,9 @@ export function simulatePersonaComputerUse(
   const closedPopups = new Set<string>();
   const noticedTrapIds = new Set<string>();
   const triedDecoyIds = new Set<string>();
+  let pressureNoticed = false;
+  /** 買えたとしても嫌な思いをしたこと。1つでもあれば「買えたけど不満」になる */
+  const bothers: Array<{ friction: string; comment: string }> = [];
 
   const fail = (reason: FailureReason): ComputerUseSimulationResult => ({
     outcome: 'abandoned',
@@ -539,6 +554,7 @@ export function simulatePersonaComputerUse(
         return 'popup_tapped';
       }
       actionTrace.push(`${steps}手目: ${popup.label}を閉じた`);
+      bothers.push({ friction: '途中で広告を閉じさせられた', comment: '途中で広告が出てきて、閉じるのが面倒だった' });
     }
     return null;
   };
@@ -577,11 +593,22 @@ export function simulatePersonaComputerUse(
     }
     elapsedMs += distractions * MS_PER_DISTRACTION;
 
+    // 偽の残り時間などで急かされると、急かされるのが嫌いな人は買えても不満が残る
+    const pressure = visible.find(
+      (comp) => comp.darkPattern === 'false_urgency' || comp.label.includes('{countdown}'),
+    );
+    if (pressure && c.dislikesPressure && !pressureNoticed) {
+      pressureNoticed = true;
+      actionTrace.push(`画面確認: ${renderLabel(pressure, state)}で急かされて嫌な気分になった`);
+      bothers.push({ friction: '残り時間で急かされた', comment: '残り時間で急かされて、落ち着いて選べなかった' });
+    }
+
     // 漢数字の値段は読むのに時間がかかる
     if (!kanjiPenaltyApplied && visible.some((comp) => comp.style.numberFormat === 'kanji')) {
       kanjiPenaltyApplied = true;
       elapsedMs += MS_KANJI_READING;
       actionTrace.push('画面確認: 漢数字の値段を読むのに時間がかかった');
+      bothers.push({ friction: '値段が読みにくかった', comment: '値段が漢数字で、いくらなのか読むのに手間取った' });
     }
 
     // 3. 必須の入力欄を埋める
@@ -611,6 +638,7 @@ export function simulatePersonaComputerUse(
       noticedTrapIds.add(comp.id);
       if (comp.trapSafeValue === undefined || !comp.stateKey) {
         actionTrace.push(`画面確認: ${comp.label}に気づいたうえで進む`);
+        bothers.push({ friction: '分かりにくい条件が付いていた', comment: `${comp.label}に気づいたけど、なんだか気分が悪い` });
         continue;
       }
       const box = boxOf(comp);
@@ -619,8 +647,40 @@ export function simulatePersonaComputerUse(
       if (result !== 'hit') return fail(result);
       state = { ...state, [comp.stateKey]: comp.trapSafeValue };
       actionTrace.push(`${steps}手目: ${comp.label}に気づいて直した`);
+      bothers.push({ friction: '勝手に付いていた申し込みを外した', comment: `危うく${comp.label}のまま買うところだった` });
       const budget = overBudget();
       if (budget) return fail(budget);
+    }
+
+    // 4b. 正直な定期便（最初からOFF・読める文字サイズ・不当な縛り文言なし）なら、よく読む人は自分の意思で申し込む
+    for (const comp of visible.filter(
+      (v) =>
+        v.stateKey === 'subscription' &&
+        (v.type === 'checkbox' || v.type === 'toggle'),
+    )) {
+      const initialSub = spec.state.find((s) => s.key === 'subscription')?.initialValue;
+      const isHonest =
+        isHonestOptInComponent(comp, initialSub) &&
+        state.subscription === false &&
+        canRead(comp, persona);
+      if (isHonest && c.readsFinePrint && !noticedTrapIds.has(comp.id)) {
+        noticedTrapIds.add(comp.id);
+        state = { ...state, subscription: true };
+        actionTrace.push(`${steps}手目: 条件が分かりやすいので${comp.label}を自分で選んだ`);
+      }
+    }
+
+    // 確認画面（2画面目以降）で内容表示の文字が小さすぎて読めないと不満が残る
+    if (screen > 0) {
+      const unreadableConfirmInfo = visible.find(
+        (v) => (v.role === 'info' || v.role === 'total') && !canRead(v, persona),
+      );
+      if (unreadableConfirmInfo) {
+        bothers.push({
+          friction: '確認画面の文字が小さかった',
+          comment: '確認画面の文字が小さくて、内容を確かめづらかった',
+        });
+      }
     }
 
     // 5. 押すボタンを決める
@@ -694,6 +754,7 @@ export function simulatePersonaComputerUse(
       if (target.comp.role === 'decoy') {
         actionTrace.push(`${steps}手目: 目立つ${target.comp.label}を押したが何も起きない`);
         triedDecoyIds.add(target.comp.id);
+        bothers.push({ friction: '目立つボタンが効かなかった', comment: `${target.comp.label}を押しても何も起きなくて焦った` });
         screen--;
         if (triedDecoyIds.size >= 3) return fail('decoy_only');
         continue;
@@ -733,6 +794,16 @@ export function simulatePersonaComputerUse(
         };
       }
       actionTrace.push(`${steps}手目: ${target.comp.label}を押してタスク完了イベントを検知`);
+      if (bothers.length > 0) {
+        return {
+          outcome: 'bothered',
+          frictionPoint: bothers[0].friction,
+          simulatedComment: `買えたけど、${bothers[0].comment}`,
+          actionTrace,
+          appliedConstraintNote,
+          finalState: state,
+        };
+      }
       return {
         outcome: 'achieved',
         frictionPoint: `${steps}手で迷わず完了`,

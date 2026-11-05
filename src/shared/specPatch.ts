@@ -1,3 +1,4 @@
+import { isSafeStateKey } from './appRuntime.ts';
 import type { AppComponent, AppSpec, SpecPatch } from './types.ts';
 
 export interface ApplySpecPatchesResult {
@@ -170,8 +171,8 @@ export function applySpecPatches(
 
       case 'upsert_state': {
         const v = patch.variable;
-        if (!v?.key) {
-          warnings.push('upsert_state に variable.key がありません');
+        if (!v?.key || !isSafeStateKey(v.key)) {
+          warnings.push('upsert_state に有効な variable.key がありません');
           break;
         }
         const existing = spec.state.find((s) => s.key === v.key);
@@ -186,8 +187,8 @@ export function applySpecPatches(
       }
 
       case 'upsert_derived': {
-        if (!patch.key || !patch.expression) {
-          warnings.push('upsert_derived に key または expression がありません');
+        if (!patch.key || !isSafeStateKey(patch.key) || !patch.expression) {
+          warnings.push('upsert_derived に有効な key または expression がありません');
           break;
         }
         if (!spec.derived) spec.derived = [];

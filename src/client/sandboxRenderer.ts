@@ -1,7 +1,9 @@
 import {
   applyActions,
   createInitialState,
+  hasCompletionAction,
   isComponentVisible,
+  isInputFilled,
   renderLabel,
   renderTemplate,
   withDerivedValues,
@@ -17,6 +19,8 @@ export interface SandboxCallbacks {
   onStatePatch: (patch: AppState) => void;
   /** スマホの中で起きたことのお知らせ。画面を邪魔しないよう、画面の外（チャット）に出す */
   onNotice: (message: string, type: 'info' | 'success' | 'warning') => void;
+  /** 改造の作業ログを流している間に光らせる部品 */
+  justChangedIds?: Set<string>;
 }
 
 /**
@@ -298,6 +302,31 @@ function renderProductCard(
   return card;
 }
 
+/** 状態 step が初期値から次の画面（確認画面など）に進んでいれば、手順表示も最後の手順へ進める */
+function resolveProgressCurrentStep(
+  spec: AppSpec,
+  comp: AppComponent,
+  label: string,
+  liveState: AppState,
+): string {
+  const steps = comp.options ?? [];
+  if (steps.length === 0) return label;
+  const stepDef = spec.state.find((s) => s.key === 'step');
+  const currentStepVal = liveState.step;
+  if (
+    stepDef !== undefined &&
+    currentStepVal !== undefined &&
+    String(currentStepVal) !== String(stepDef.initialValue) &&
+    currentStepVal !== '' &&
+    currentStepVal !== false &&
+    currentStepVal !== 0
+  ) {
+    const matched = steps.find((s) => s === String(currentStepVal));
+    return matched ?? steps[steps.length - 1];
+  }
+  return label;
+}
+
 /** 手順の表示：今の手順より前は済み、今の手順を強調する */
 function renderProgressSteps(doc: Document, comp: AppComponent, current: string): HTMLElement {
   const wrap = doc.createElement('div');
@@ -366,6 +395,53 @@ function renderChoiceCards(
 }
 
 /**
+ * 煽り用の偽のカウントダウン。ラベルに {countdown} と書くと「2:59」から1秒ずつ減り、0になるとまた戻る。
+ * 画面を作り直しても続きから数えるよう、開始時刻はページを開いたときの1つだけにする。
+ * 状態として持つと毎秒画面を作り直すことになるため、数字の部分だけを直接書き換える。
+ */
+const COUNTDOWN_SECONDS = 179; // 2:59。appRuntime の COUNTDOWN_INITIAL_TEXT と揃える
+const countdownStartedAt = Date.now();
+let countdownDoc: Document | null = null;
+let countdownTimer: number | null = null;
+
+function currentCountdownText(): string {
+  const elapsed = Math.floor((Date.now() - countdownStartedAt) / 1000);
+  const left = COUNTDOWN_SECONDS - (elapsed % (COUNTDOWN_SECONDS + 1));
+  return `${Math.floor(left / 60)}:${String(left % 60).padStart(2, '0')}`;
+}
+
+function startCountdownTicker(doc: Document): void {
+  countdownDoc = doc;
+  if (countdownTimer !== null) return;
+  countdownTimer = window.setInterval(() => {
+    const text = currentCountdownText();
+    countdownDoc?.querySelectorAll<HTMLElement>('.js-countdown').forEach((el) => {
+      el.textContent = text;
+    });
+  }, 1000);
+}
+
+/** ラベルを書き込む。{countdown} の部分だけは毎秒書き換えられる要素にする */
+function writeLabel(el: HTMLElement, comp: AppComponent, state: AppState): void {
+  if (!comp.label.includes('{countdown}')) {
+    el.textContent = renderLabel(comp, state);
+    return;
+  }
+  el.textContent = '';
+  const doc = el.ownerDocument;
+  comp.label.split('{countdown}').forEach((part, i) => {
+    if (i > 0) {
+      const span = doc.createElement('span');
+      span.className = 'js-countdown';
+      span.textContent = currentCountdownText();
+      el.appendChild(span);
+    }
+    el.appendChild(doc.createTextNode(renderTemplate(part, state, comp.style.numberFormat)));
+  });
+  startCountdownTicker(doc);
+}
+
+/**
  * 文字の基準（スマホ画面の幅に対する割合）。中身が収まらないときは下限まで少しずつ小さくする。
  * 合計と購入ボタンは画面下に固定されているため、下限まで縮めても収まらない分はスクロールにする。
  */
@@ -397,11 +473,20 @@ function fitContentToScreen(doc: Document, scroller: HTMLElement): void {
 let fitTarget: { doc: Document; scroller: HTMLElement } | null = null;
 let fitObserver: ResizeObserver | null = null;
 
-function scheduleFit(iframe: HTMLIFrameElement | null, doc: Document, scroller: HTMLElement): void {
+function scheduleFit(
+  iframe: HTMLIFrameElement | null,
+  doc: Document,
+  scroller: HTMLElement,
+  restoreScrollTop = 0,
+): void {
   fitTarget = { doc, scroller };
   fitContentToScreen(doc, scroller);
+  scroller.scrollTop = restoreScrollTop;
   window.requestAnimationFrame(() => {
-    if (fitTarget?.scroller === scroller) fitContentToScreen(doc, scroller);
+    if (fitTarget?.scroller !== scroller) return;
+    fitContentToScreen(doc, scroller);
+    scroller.scrollTop = restoreScrollTop;
+    updateScrollHint(scroller);
   });
   if (iframe && !fitObserver) {
     fitObserver = new ResizeObserver(() => {
@@ -418,6 +503,7 @@ export function renderSandboxApp(
   selectedComponentIds: Set<string>,
   callbacks: SandboxCallbacks,
 ): void {
+  let previousScrollTop = 0;
   // 単一HTMLとしてiframe内で隔離実行する
   let iframe = container.querySelector<HTMLIFrameElement>('iframe.sandbox-iframe');
   if (!iframe) {
@@ -446,6 +532,8 @@ export function renderSandboxApp(
       specScript.textContent = JSON.stringify(spec);
     }
     mountRoot = iframeDoc.getElementById('sandbox-mount') ?? iframeDoc.body;
+    // 状態が変わるたびに中身を作り直すため、スクロール位置を覚えておき、作り直したあとに戻す
+    previousScrollTop = mountRoot.querySelector<HTMLElement>('.sandbox-app-body')?.scrollTop ?? 0;
     mountRoot.innerHTML = '';
   } else {
     container.innerHTML = '';
@@ -600,10 +688,10 @@ export function renderSandboxApp(
   const renderPopup = (comp: AppComponent) => {
     const backdrop = targetDoc.createElement('div');
     backdrop.className = 'inapp-popup-backdrop';
-    backdrop.dataset.componentId = comp.id;
 
     const card = targetDoc.createElement('div');
     card.className = `inapp-popup-card variant-${comp.style.variant} ${comp.style.skin === 'intrusive' ? 'is-intrusive' : ''}`;
+    card.dataset.componentId = comp.id;
 
     const closeBtn = targetDoc.createElement('button');
     closeBtn.type = 'button';
@@ -659,6 +747,7 @@ export function renderSandboxApp(
       comp.style.skin === 'intrusive' ? 'is-intrusive' : '',
       comp.style.sticky ? 'is-sticky' : '',
       selectedComponentIds.has(comp.id) ? 'is-circled-target' : '',
+      callbacks.justChangedIds?.has(comp.id) ? 'is-just-changed' : '',
     ]
       .filter(Boolean)
       .join(' ');
@@ -676,7 +765,13 @@ export function renderSandboxApp(
     if (comp.type === 'product_card') {
       itemWrap.appendChild(renderProductCard(targetDoc, comp, liveState, label, caption, setValue));
     } else if (comp.type === 'progress_steps') {
-      itemWrap.appendChild(renderProgressSteps(targetDoc, comp, label));
+      itemWrap.appendChild(
+        renderProgressSteps(
+          targetDoc,
+          comp,
+          resolveProgressCurrentStep(spec, comp, label, liveState),
+        ),
+      );
     } else if (comp.type === 'choice_cards') {
       itemWrap.appendChild(renderChoiceCards(targetDoc, comp, liveState, setValue));
     } else if (comp.type === 'summary') {
@@ -798,7 +893,7 @@ export function renderSandboxApp(
     } else if (comp.type === 'status_banner') {
       const banner = targetDoc.createElement('div');
       banner.className = 'comp-status-banner';
-      banner.textContent = label;
+      writeLabel(banner, comp, liveState);
       itemWrap.appendChild(banner);
     } else if (comp.type === 'button') {
       const btn = targetDoc.createElement('button');
@@ -837,6 +932,30 @@ export function renderSandboxApp(
           return;
         }
 
+        // 本物の購入画面と同じく、必須の項目が空のまま先へは進ませない
+        if (comp.role === 'primary_action' || hasCompletionAction(comp)) {
+          const missing = spec.components.find(
+            (c) =>
+              c.role === 'required_input' &&
+              isComponentVisible(c, liveState) &&
+              !isInputFilled(c, liveState),
+          );
+          if (missing) {
+            const verb = missing.type === 'input' ? '入力' : '選択';
+            callbacks.onNotice(`${renderLabel(missing, liveState)}を${verb}してください`, 'warning');
+            const missingEl = Array.from(
+              body.querySelectorAll<HTMLElement>('[data-component-id]'),
+            ).find((el) => el.dataset.componentId === missing.id);
+            if (missingEl) {
+              missingEl.classList.remove('is-missing');
+              void missingEl.offsetWidth;
+              missingEl.classList.add('is-missing');
+              missingEl.scrollIntoView({ block: 'center', behavior: 'smooth' });
+            }
+            return;
+          }
+        }
+
         if (effect === 'confirm_dialog') {
           openConfirmOverlay(comp, () => executeActions(comp.actions));
           return;
@@ -855,7 +974,7 @@ export function renderSandboxApp(
       }
       const txt = targetDoc.createElement('div');
       txt.className = comp.type === 'heading' ? 'comp-heading' : 'comp-text';
-      txt.textContent = label;
+      writeLabel(txt, comp, liveState);
       itemWrap.appendChild(txt);
     }
 
@@ -867,5 +986,19 @@ export function renderSandboxApp(
   phoneScreen.append(overlaySlot);
   mountRoot.appendChild(phoneScreen);
   body.addEventListener('scroll', () => updateScrollHint(body), { passive: true });
-  scheduleFit(iframeDoc ? iframe : null, targetDoc, body);
+  scheduleFit(iframeDoc ? iframe : null, targetDoc, body, previousScrollTop);
+}
+
+/**
+ * スマホ画面の本文を縦にスクロールする。赤ペンで囲むときは画面の上に透明な描画面が重なり、
+ * ホイールが本文に届かないため、描画面で受けたホイールをこちらに渡す。
+ */
+export function scrollSandboxBy(container: HTMLElement, deltaY: number): boolean {
+  const iframe = container.querySelector<HTMLIFrameElement>('iframe.sandbox-iframe');
+  const doc = iframe?.contentDocument ?? document;
+  const body = doc.querySelector<HTMLElement>('.sandbox-app-body');
+  if (!body) return false;
+  const before = body.scrollTop;
+  body.scrollTop += deltaY;
+  return body.scrollTop !== before;
 }

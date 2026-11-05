@@ -6,6 +6,7 @@ import {
   applyPatchesToSpecWithValidation,
   chatWithStudio,
   classifyUserMessageIntent,
+  detectExplicitRecipientMention,
   evaluateAppWithPersonas,
   getAiConnectionStatus,
   normalizeUpdatedSpec,
@@ -18,6 +19,7 @@ import {
   renderLabel,
   renderTemplate,
   toKanjiNumber,
+  withDerivedValues,
 } from '../src/shared/appRuntime.ts';
 import { detectHitComponents, type Rect2D } from '../src/shared/hitTest.ts';
 import {
@@ -33,7 +35,7 @@ import {
 } from '../src/shared/owner.ts';
 import { applySpecPatches } from '../src/shared/specPatch.ts';
 import { buildInitialSpec, buildScenarioSpec, findComponent } from '../src/shared/theme.ts';
-import type { AppSpec, ReviewOutcome } from '../src/shared/types.ts';
+import type { AppSpec, ReviewOutcome, SpecPatch } from '../src/shared/types.ts';
 
 // テストは AI に接続しない前提で実行する（package.json の test スクリプトで接続設定を空にしている）
 
@@ -74,6 +76,25 @@ describe('core-loop', () => {
       { x: 15, y: 175 },
     ];
     assert.deepEqual(detectHitComponents(stroke, rects), ['btn-clear-cart']);
+
+    // 線が隣の部品に少しはみ出しても、中心まで囲んだ部品だけを選ぶ
+    const sloppy = [
+      { x: 15, y: 175 },
+      { x: 305, y: 175 },
+      { x: 305, y: 275 },
+      { x: 15, y: 275 },
+      { x: 15, y: 175 },
+    ];
+    assert.deepEqual(detectHitComponents(sloppy, rects), ['btn-clear-cart']);
+
+    // 大きな部品の一部だけを囲んだときは、その部品を選ぶ
+    const partial = [
+      { x: 30, y: 25 },
+      { x: 90, y: 25 },
+      { x: 90, y: 50 },
+      { x: 30, y: 50 },
+    ];
+    assert.deepEqual(detectHitComponents(partial, rects), ['product-hero']);
   });
 
   it('計算式で合計金額を求め、漢数字でも表示できる', () => {
@@ -103,6 +124,9 @@ describe('core-loop', () => {
       kanjiSummary.rows?.map((r) => renderTemplate(r.value, state, kanjiSummary.style.numberFormat)),
       ['千九百八十円', '六百円'],
     );
+    // 偽のカウントダウンは、画面の外では最初の値で表す
+    const countdown = findComponent(withAnnoyance(cleanSpec(), 'countdown_pressure'), 'banner-countdown');
+    assert.equal(renderLabel(countdown, state), '⏰ 残り 2:59 で売り切れ！！');
   });
 
   it('初期画面は毎回ランダムに妨害要素を組み込み、同じ乱数の元なら同じ画面になる', () => {
@@ -189,8 +213,9 @@ describe('core-loop', () => {
     assert.equal(outcomeOf(spec, 'hina'), 'regretted');
     // 細かい字は読むが、小さすぎて読めない人
     assert.equal(outcomeOf(spec, 'kazuko'), 'regretted');
-    // 細かい字を読み、読める人は気づいて外す
-    assert.equal(outcomeOf(spec, 'shota'), 'achieved');
+    // 細かい字を読み、読める人は気づいて外す。買えはするが、勝手に付いていたことに不満が残る
+    assert.equal(outcomeOf(spec, 'shota'), 'bothered');
+    assert.equal(outcomeOf(cleanSpec(), 'shota'), 'achieved');
   });
 
   it('妨害要素ごとに、困る人が変わる', () => {
@@ -202,6 +227,17 @@ describe('core-loop', () => {
     assert.equal(outcomeOf(withAnnoyance(cleanSpec(), 'tiny_text'), 'kazuko'), 'abandoned');
     // 注文ボタンが反応しなければ誰も完了できない
     assert.equal(outcomeOf(withAnnoyance(cleanSpec(), 'broken_order_button'), 'kenta'), 'abandoned');
+  });
+
+  it('偽のカウントダウンは、急かされるのが嫌いな人だけを不満にする', () => {
+    const spec = withAnnoyance(cleanSpec(), 'countdown_pressure');
+    // 損をしたくない人は急かされると嫌
+    assert.equal(outcomeOf(spec, 'shota'), 'bothered');
+    assert.equal(outcomeOf(spec, 'hina'), 'bothered');
+    // さっと買いたい人は気にしない
+    assert.equal(outcomeOf(spec, 'kenta'), 'achieved');
+    // 帯を消せば、損をしたくない人も満足して買える
+    assert.equal(outcomeOf(cleanSpec(), 'shota'), 'achieved');
   });
 
   it('合計金額を消す改修も取り消さず、結果はお客さんの反応で分かる', () => {
@@ -243,10 +279,12 @@ describe('core-loop', () => {
     assert.equal(initial.owner.orders, 0);
     assert.match(initial.owner.comment, /注文がひとつも入らない/);
 
-    // 注文ボタンを直すと、注文できる人と、定期便に気づかず後悔する人が現れる。店長は定期便が取れて喜ぶ
+    // 注文ボタンを直すと、定期便に気づいて外したが不満の残る人と、気づかず後悔する人が現れる。
+    // まだ誰も嫌な思いをせずには買えない。店長は定期便が取れて喜ぶ
     const fixed = report(build(['broken_order_button']));
-    assert.ok(fixed.outcomes.includes('achieved'));
+    assert.ok(fixed.outcomes.includes('bothered'));
     assert.ok(fixed.outcomes.includes('regretted'));
+    assert.ok(!fixed.outcomes.includes('achieved'));
     const subscription = fixed.owner.metrics.find((m) => m.label === '定期便')!;
     assert.ok(subscription.count > 0);
     assert.match(fixed.owner.comment, /定期便も\d+件取れたぞ/);
@@ -292,7 +330,36 @@ describe('core-loop', () => {
       assert.ok(p.greeting.trim().length > 0, `${p.name} の来店時の一言が空です`);
     }
     for (const cohort of ACTIVE_THEME.cohorts) {
-      assert.equal(getReviewersByCohort(cohort.id).length, 3);
+      const reviewers = getReviewersByCohort(cohort.id);
+      assert.equal(reviewers.length, 3);
+      assert.deepEqual(reviewers.map((r) => r.name), ['客A', '客B', '客C']);
+      assert.deepEqual(reviewers.map((r) => r.icon), ['A', 'B', 'C']);
+    }
+  });
+
+  it('明確なメンション・呼びかけだけ宛先を切り替え、文中に名前が入っているだけでは切り替えない', () => {
+    const carefulPersonas = getReviewersByCohort('careful');
+
+    // 明確なメンション・呼びかけ
+    assert.equal(detectExplicitRecipientMention('店長、広告を消してもいい？', carefulPersonas), 'owner');
+    assert.equal(detectExplicitRecipientMention('@店長 定期便はどうする？', carefulPersonas), 'owner');
+    assert.equal(detectExplicitRecipientMention('ねえ店長！売上って大事？', carefulPersonas), 'owner');
+    assert.equal(detectExplicitRecipientMention('客A、どこで困ったの？', carefulPersonas), 'kazuko');
+    assert.equal(detectExplicitRecipientMention('客Bさん、何が嫌だった？', carefulPersonas), 'shigeru');
+    assert.equal(detectExplicitRecipientMention('@客C どこが分かりにくかった？', carefulPersonas), 'harue');
+    assert.equal(detectExplicitRecipientMention('お助けAI、注文ボタンを直して', carefulPersonas), 'assistant');
+    assert.equal(detectExplicitRecipientMention('@お助けAI これ何の部品？', carefulPersonas), 'assistant');
+
+    // 文中に名前が入っているだけ（第三者としての言及）では切り替えない
+    for (const msg of [
+      '店長が付けた広告を消して',
+      '店長の言ってる定期便って何？',
+      '客Aはどこで困ったの？',
+      '客Bが買えなかった原因を教えて',
+      '客Cの言ってるボタンを直して',
+      'お助けAIに頼む前にどう思う？',
+    ]) {
+      assert.equal(detectExplicitRecipientMention(msg, carefulPersonas), null, msg);
     }
   });
 
@@ -442,6 +509,47 @@ describe('core-loop', () => {
     );
   });
 
+  it('改造の作業内容を、学習者が読める短い言葉の行にする', () => {
+    const initial = buildScenarioSpec(ACTIVE_THEME, ACTIVE_THEME.defaultScenarioId).spec;
+    const order = initial.components.find((c) => c.id === 'btn-order')!;
+    const patches: SpecPatch[] = [
+      {
+        op: 'replace_component',
+        component: { ...order, actions: [{ type: 'complete_task', message: 'ご購入ありがとうございます' }] },
+      },
+      { op: 'remove_component', id: 'popup-coupon' },
+      { op: 'upsert_state', variable: { key: 'subscription', label: '定期便', type: 'boolean', initialValue: false } },
+    ];
+    const result = applyPatchesToSpecWithValidation(initial, '直しました', patches);
+    const texts = (result.workSteps ?? []).map((s) => s.text);
+    assert.equal(texts.length, 3);
+    assert.match(texts[0], /注文を確定する.*押したときの動きを変更/);
+    assert.match(texts[1], /を削除$/);
+    assert.equal(texts[2], '「定期便」の最初の状態を変更');
+    // 変えた部品はスマホで光らせられるよう、部品の名前が付いている
+    assert.equal(result.workSteps?.[0].componentId, 'btn-order');
+    assert.equal(result.workSteps?.[2].componentId, 'check-subscription');
+    // 偽のカウントダウンも、画面に出る文字で書く
+    const removedBanner = applyPatchesToSpecWithValidation(initial, '消しました', [
+      { op: 'remove_component', id: 'banner-countdown' },
+    ]);
+    assert.match(removedBanner.workSteps?.[0].text ?? '', /2:59/);
+  });
+
+  it('店長が気にする変化は、何を消したかを区別した事実として取り出せる', () => {
+    const initial = buildScenarioSpec(ACTIVE_THEME, ACTIVE_THEME.defaultScenarioId).spec;
+    const removed = applyPatchesToSpecWithValidation(initial, '消しました', [
+      { op: 'remove_component', id: 'btn-buy-now' },
+      { op: 'remove_component', id: 'banner-countdown' },
+    ]);
+    const facts = removed.ownerFacts ?? [];
+    assert.equal(facts.length, 2);
+    assert.ok(facts.some((f) => f.includes('ボタン') && f.includes('今すぐ購入')));
+    assert.ok(facts.some((f) => f.includes('煽り') && f.includes('2:59')));
+    // AIを使えないときの決まったせりふは、同じものを重ねない
+    assert.equal(removed.ownerReaction?.split('\n').length, 1);
+  });
+
   it('客層選択はシステムメッセージで出され、別ページ遷移時にもシステム通知が生成される', () => {
     const cohortLine = ACTIVE_THEME.introScript.find((l) => l.showCohortSelector);
     assert.ok(cohortLine);
@@ -485,5 +593,129 @@ describe('core-loop', () => {
     assert.equal(withoutSubClosing.length, 2);
     assert.ok(withoutSubClosing[1].includes('まずはちゃんと買ってもらえる画面が一番'));
     assert.ok(withSubClosing[0].includes('3人とも'));
+  });
+
+  it('代引き手数料が合計金額に反映され、定義順が逆でも収束計算され、作業ログも日本語になる', () => {
+    const spec = cleanSpec();
+    const initial = createInitialState(spec);
+    assert.equal(initial.codFee, 0);
+    assert.equal(initial.total, 2580);
+
+    // 代金引換を選ぶと +330 円が合計に入る
+    const codState = withDerivedValues(spec, { ...initial, paymentMethod: '代金引換' });
+    assert.equal(codState.codFee, 330);
+    assert.equal(codState.total, 2910);
+
+    // AIが後から計算値を足して、total の後ろに extraFee が並んだ場合でも total に反映される
+    const patched = applyPatchesToSpecWithValidation(spec, '手数料を反映しました', [
+      { op: 'upsert_derived', key: 'total', expression: 'subtotal + shipping + codFee' },
+      { op: 'upsert_derived', key: 'codFee', expression: "paymentMethod == '代金引換' ? 330 : 0" },
+    ]);
+    assert.equal(patched.rolledBack, false);
+    const reorderedSpec: AppSpec = {
+      ...patched.updatedSpec,
+      derived: [
+        { key: 'subtotal', expression: 'unitPrice * quantity' },
+        { key: 'shipping', expression: 'subtotal >= 3960 ? 0 : shippingFee' },
+        { key: 'total', expression: 'subtotal + shipping + extraFee' },
+        { key: 'extraFee', expression: "paymentMethod == '代金引換' ? 330 : 0" },
+      ],
+    };
+    const reorderedState = withDerivedValues(reorderedSpec, {
+      ...createInitialState(reorderedSpec),
+      paymentMethod: '代金引換',
+    });
+    assert.equal(reorderedState.extraFee, 330);
+    assert.equal(reorderedState.total, 2910);
+
+    // 作業ログに codFee などの英語キーが出ないこと
+    const stepTexts = (patched.workSteps ?? []).map((s) => s.text);
+    assert.ok(stepTexts.some((t) => t.includes('代引き手数料')));
+    assert.ok(stepTexts.every((t) => !t.includes('codFee')));
+  });
+
+  it('定期便を正直で読みやすい選択欄に直すと、注意書きを読む客が自ら申し込み店長も喜ぶ', () => {
+    const base = cleanSpec();
+    // 最初は極小文字で最初からチェック入りの定期便罠がある画面
+    const trapSpec: AppSpec = {
+      ...base,
+      state: [
+        ...base.state,
+        { key: 'subscription', label: '定期便', type: 'boolean', initialValue: true },
+      ],
+      components: [
+        ...base.components,
+        {
+          id: 'check-subscription',
+          type: 'checkbox',
+          role: 'trap',
+          label: '定期便でのお届けに同意する（毎月自動発送・解約は電話のみ）',
+          stateKey: 'subscription',
+          style: { variant: 'muted', size: 'xs' },
+          actions: [],
+        },
+      ],
+    };
+
+    // 正直な定期便（最初からOFF・読める文字サイズ・解約縛りなし）に改修する
+    const reformed = applyPatchesToSpecWithValidation(trapSpec, '定期便を正直な選択欄に直しました', [
+      {
+        op: 'upsert_state',
+        variable: { key: 'subscription', label: '定期便', type: 'boolean', initialValue: false },
+      },
+      {
+        op: 'replace_component',
+        component: {
+          id: 'check-subscription',
+          type: 'checkbox',
+          role: 'trap',
+          label: '定期便でお届け（毎回10%引き・いつでも解約OK）',
+          stateKey: 'subscription',
+          style: { variant: 'default', size: 'sm' },
+          actions: [],
+        },
+      },
+    ]);
+
+    assert.equal(reformed.rolledBack, false);
+    // 店長が前向きな反応を返すこと
+    assert.ok(reformed.ownerReaction?.includes('消さずに分かりやすく残してくれた'));
+    assert.ok((reformed.ownerFacts ?? []).some((f) => f.includes('正直で分かりやすい形に整えた')));
+
+    // 後悔したくない客層（no_regret）で試すと、注意書きを読む客（美穂）が納得して定期便を申し込み、3人とも達成かつ店長の定期便件数も1件になる
+    const noRegretPersonas = getReviewersByCohort('no_regret');
+    const results = noRegretPersonas.map((p) => simulatePersonaComputerUse(reformed.updatedSpec, p));
+    assert.equal(results.filter((r) => r.outcome === 'achieved').length, 3);
+    const ownerReport = buildOwnerReport(ACTIVE_THEME.owner, reformed.updatedSpec, results);
+    const subMetric = ownerReport.metrics.find((m) => m.label === '定期便');
+    assert.ok((subMetric?.count ?? 0) >= 1);
+
+    // 店長の関心事（定期便・広告・煽り・今すぐ購入）と無関係な改修では、店長の事実リストが空になり毎回同じ小言を繰り返さない
+    const unrelated = applyPatchesToSpecWithValidation(reformed.updatedSpec, '合計欄を大きくしました', [
+      {
+        op: 'replace_component',
+        component: {
+          ...reformed.updatedSpec.components.find((c) => c.id === 'card-total')!,
+          style: { variant: 'primary', size: 'lg' },
+        },
+      },
+    ]);
+    assert.deepEqual(unrelated.ownerFacts, []);
+    assert.equal(unrelated.ownerReaction, '');
+
+    // プロトタイプ汚染キー（__proto__, constructor, prototype）や不正CSS値が安全に拒否・無害化されること
+    const state = createInitialState(reformed.updatedSpec);
+    assert.equal(evaluateExpression('constructor', state), 0);
+    assert.equal(evaluateExpression('__proto__', state), 0);
+    assert.equal(renderTemplate('{constructor}{__proto__}', state), '');
+    const unsafePatched = applySpecPatches(reformed.updatedSpec, [
+      {
+        op: 'upsert_state',
+        variable: { key: '__proto__', label: '危険', type: 'string', initialValue: 'polluted' },
+      },
+      { op: 'upsert_derived', key: 'constructor', expression: '1 + 1' },
+    ]);
+    assert.equal(unsafePatched.spec.state.some((s) => s.key === '__proto__'), false);
+    assert.equal(unsafePatched.spec.derived?.some((d) => d.key === 'constructor'), false);
   });
 });

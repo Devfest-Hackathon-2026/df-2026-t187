@@ -3,19 +3,30 @@ import type {
   ApplyRequest,
   ChatRequest,
   EvaluateRequest,
+  OwnerLineRequest,
   RecordDecisionRequest,
 } from '../shared/types.ts';
 import {
   AiNotConfiguredError,
+  AiTimeoutError,
   applyOptionToSpec,
   chatWithStudio,
   evaluateAppWithPersonas,
   getAiConnectionStatus,
   recordHumanDecisionWithFunctionCalling,
+  voiceOwnerLine,
 } from './gemini.ts';
 import { listHumanDecisions, verifyAppCheckHeader } from './store.ts';
 
 const MAX_BODY_BYTES = 8 * 1024 * 1024; // 8MB (ペン描きスクリーンショットBase64対応)
+
+class PayloadTooLargeError extends Error {
+  readonly statusCode = 413;
+  constructor() {
+    super('リクエストサイズが上限を超えています');
+    this.name = 'PayloadTooLargeError';
+  }
+}
 
 function readJsonBody<T>(req: IncomingMessage): Promise<T> {
   return new Promise((resolve, reject) => {
@@ -25,7 +36,7 @@ function readJsonBody<T>(req: IncomingMessage): Promise<T> {
     req.on('data', (chunk: Buffer) => {
       total += chunk.length;
       if (total > MAX_BODY_BYTES) {
-        reject(new Error('リクエストサイズが上限を超えています'));
+        reject(new PayloadTooLargeError());
         req.destroy();
         return;
       }
@@ -109,11 +120,21 @@ export async function handleApiRequest(
     if (req.method === 'POST' && url === '/api/apply') {
       const body = await readJsonBody<ApplyRequest>(req);
       if (!body?.currentSpec || !body?.userInstruction?.trim()) {
-        sendJson(res, 400, { error: 'currentSpec と改造内容が必要です' });
+        sendJson(res, 400, { error: 'currentSpec と手直し内容が必要です' });
         return true;
       }
       const result = await applyOptionToSpec(body);
       sendJson(res, 200, result);
+      return true;
+    }
+
+    if (req.method === 'POST' && url === '/api/owner-line') {
+      const body = await readJsonBody<OwnerLineRequest>(req);
+      if (!body?.situation || !Array.isArray(body.facts) || typeof body.fallback !== 'string') {
+        sendJson(res, 400, { error: 'situation, facts, fallback が必要です' });
+        return true;
+      }
+      sendJson(res, 200, await voiceOwnerLine(body));
       return true;
     }
 
@@ -131,13 +152,23 @@ export async function handleApiRequest(
     sendJson(res, 404, { error: `未対応のAPIエンドポイントです: ${req.method} ${url}` });
     return true;
   } catch (err) {
-    if (err instanceof AiNotConfiguredError) {
+    if (
+      err instanceof AiNotConfiguredError ||
+      err instanceof AiTimeoutError ||
+      err instanceof PayloadTooLargeError
+    ) {
       sendJson(res, err.statusCode, { error: err.message });
       return true;
     }
+    if (err instanceof SyntaxError) {
+      sendJson(res, 400, { error: 'JSONの形式が正しくありません' });
+      return true;
+    }
+    // 原因は開発者向けにログへ残し、学習者には分かる言葉だけを返す
     console.error('[api] リクエスト処理に失敗しました:', err);
-    const message = err instanceof Error ? err.message : 'サーバー内部エラーが発生しました';
-    sendJson(res, 500, { error: message });
+    sendJson(res, 500, {
+      error: 'お助けAIがうまく返事できませんでした。もう一度送ってください。',
+    });
     return true;
   }
 }

@@ -89,6 +89,9 @@ export interface OwnerDefinition {
   /** 顧客層が選ばれたあとに話す一言。{cohort} に顧客層の名前が入る */
   afterCohortLine: string;
   metrics: OwnerMetric[];
+  /** AIが店長のせりふを作るときの人物像と話し方 */
+  voice: string;
+  /** AIを使えないときの決まったせりふ。AIにも話し方の見本として渡す */
   lines: OwnerLines;
 }
 
@@ -122,6 +125,11 @@ export interface ThemeDefinition {
   defaultReviewerIds: string[];
   /** 実装AIへの補足（題材特有のルールや部品箱） */
   implementerNotes: string[];
+  /**
+   * お助けエージェントが質問に答えるときに使ってよい、画面の仕組みの事実（部品の仕様だけでは分からない動き）。
+   * どこが悪いか・どう直すべきかは書かない
+   */
+  explainerNotes?: string[];
 }
 
 /** 再現できる乱数（mulberry32） */

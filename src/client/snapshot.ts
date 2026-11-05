@@ -2,22 +2,15 @@ import { renderLabel } from '../shared/appRuntime.ts';
 import type { AppSpec, StateValue } from '../shared/types.ts';
 import { querySandboxComponentElements } from './sandboxRenderer.ts';
 
-export interface SnapshotVisionOptions {
-  blurPx?: number;
-  contrast?: number;
-}
-
 /**
  * サンドボックス内の現在のお題アプリ画面と、ユーザーが描き込んだペン軌跡キャンバスを合成し、
  * Gemini マルチモーダル入力用の PNG Data URL を生成する。
- * レビューAI向けには視力制約（ぼかし・コントラスト低下）をキャンバス描画時に適用できる。
  */
 export function captureSandboxSnapshot(
   spec: AppSpec,
   liveState: Record<string, StateValue>,
   sandboxContainer: HTMLElement,
   penCanvas: HTMLCanvasElement | null,
-  visionOptions?: SnapshotVisionOptions,
 ): string {
   const rect = sandboxContainer.getBoundingClientRect();
   const width = Math.max(360, Math.round(rect.width || 480));
@@ -28,18 +21,6 @@ export function captureSandboxSnapshot(
   out.height = height;
   const ctx = out.getContext('2d');
   if (!ctx) return '';
-
-  // 視力制約（ぼかし・コントラスト低下）の適用
-  const filters: string[] = [];
-  if (visionOptions?.blurPx && visionOptions.blurPx > 0) {
-    filters.push(`blur(${visionOptions.blurPx}px)`);
-  }
-  if (visionOptions?.contrast && visionOptions.contrast !== 1) {
-    filters.push(`contrast(${Math.round(visionOptions.contrast * 100)}%)`);
-  }
-  if (filters.length > 0) {
-    ctx.filter = filters.join(' ');
-  }
 
   // 背景
   ctx.fillStyle = spec.theme.bgColor || '#f8fafc';
@@ -103,8 +84,6 @@ export function captureSandboxSnapshot(
     const displayLabel = stateVal !== undefined ? `${label}: ${String(stateVal)}` : label;
     ctx.fillText(displayLabel.slice(0, 36), x + 12, y + Math.min(h - 8, fontSize + 12));
   }
-
-  ctx.filter = 'none';
 
   // ペン描きレイヤーを上に重ねる
   if (penCanvas && penCanvas.width > 0 && penCanvas.height > 0) {

@@ -34,7 +34,7 @@ export async function saveHumanDecision(
   }
 
   try {
-    const endpoint = `https://firestore.googleapis.com/v1/projects/${project}/databases/(default)/documents/decisions?documentId=${encodeURIComponent(decision.id)}`;
+    const endpoint = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(project ?? '')}/databases/(default)/documents/decisions?documentId=${encodeURIComponent(decision.id)}`;
     const res = await fetch(endpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

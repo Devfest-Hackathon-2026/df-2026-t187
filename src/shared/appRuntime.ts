@@ -10,6 +10,17 @@ import type {
 
 export type AppState = Record<string, StateValue>;
 
+const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+/** プロトタイプ汚染を防ぐため、危険なオブジェクトキー名を拒否する */
+export function isSafeStateKey(key: string): boolean {
+  return Boolean(key) && !UNSAFE_KEYS.has(key);
+}
+
+function readStateValue(state: AppState, key: string): StateValue | undefined {
+  return isSafeStateKey(key) && Object.hasOwn(state, key) ? state[key] : undefined;
+}
+
 // ============================================================================
 // 計算式（合計金額など）
 // 四則演算・比較・論理演算・三項演算子だけを扱う小さな式評価器。eval は使わない。
@@ -94,7 +105,7 @@ export function evaluateExpression(expression: string, state: AppState): StateVa
     if (t.kind === 'id') {
       if (t.value === 'true') return true;
       if (t.value === 'false') return false;
-      return state[t.value] ?? 0;
+      return readStateValue(state, t.value) ?? 0;
     }
     if (t.value === '(') {
       const v = parseTernary();
@@ -174,15 +185,33 @@ export function evaluateExpression(expression: string, state: AppState): StateVa
   return result;
 }
 
-/** 状態に計算値（derived）を書き足した状態を返す。式が壊れている値は 0 にする */
+/**
+ * 状態に計算値（derived）を書き足した状態を返す。
+ * 後から追加された計算値（codFee など）を先に定義された計算値（total など）が参照していても正しく求まるよう、
+ * 値が変わらなくなるまで繰り返し計算する。式が壊れている値は 0 にする。
+ */
 export function withDerivedValues(spec: AppSpec, state: AppState): AppState {
   const next: AppState = { ...state };
-  for (const d of spec.derived ?? []) {
-    try {
-      next[d.key] = evaluateExpression(d.expression, next);
-    } catch {
-      next[d.key] = 0;
+  const derivedList = spec.derived ?? [];
+  if (derivedList.length === 0) return next;
+
+  const maxPasses = Math.min(8, derivedList.length + 1);
+  for (let pass = 0; pass < maxPasses; pass++) {
+    let changed = false;
+    for (const d of derivedList) {
+      if (!isSafeStateKey(d.key)) continue;
+      let val: StateValue = 0;
+      try {
+        val = evaluateExpression(d.expression, next);
+      } catch {
+        val = 0;
+      }
+      if (next[d.key] !== val) {
+        next[d.key] = val;
+        changed = true;
+      }
     }
+    if (!changed) break;
   }
   return next;
 }
@@ -190,7 +219,9 @@ export function withDerivedValues(spec: AppSpec, state: AppState): AppState {
 export function createInitialState(spec: AppSpec): AppState {
   const state: AppState = {};
   for (const s of spec.state) {
-    state[s.key] = s.initialValue;
+    if (isSafeStateKey(s.key)) {
+      state[s.key] = s.initialValue;
+    }
   }
   return withDerivedValues(spec, state);
 }
@@ -200,7 +231,7 @@ export function createInitialState(spec: AppSpec): AppState {
 // ============================================================================
 
 export function matchesCondition(cond: VisibilityCondition, state: AppState): boolean {
-  const current = state[cond.stateKey];
+  const current = readStateValue(state, cond.stateKey);
   switch (cond.operator) {
     case 'eq':
       return String(current) === String(cond.value);
@@ -222,7 +253,7 @@ export function isComponentVisible(comp: AppComponent, state: AppState): boolean
 /** required_input の部品に値が入っているか。空か placeholder と同じなら未入力とみなす */
 export function isInputFilled(comp: AppComponent, state: AppState): boolean {
   if (!comp.stateKey) return true;
-  const v = state[comp.stateKey];
+  const v = readStateValue(state, comp.stateKey);
   if (v === undefined || v === '' || v === false) return false;
   return comp.placeholder === undefined || String(v) !== comp.placeholder;
 }
@@ -250,12 +281,12 @@ export function applyActions(
   const messages: ActionResult['messages'] = [];
 
   for (const act of actions) {
-    if (act.type === 'set_state' && act.targetKey) {
+    if (act.type === 'set_state' && act.targetKey && isSafeStateKey(act.targetKey)) {
       next[act.targetKey] = act.value ?? true;
-    } else if (act.type === 'toggle_state' && act.targetKey) {
-      next[act.targetKey] = !toBool(next[act.targetKey] ?? false);
-    } else if (act.type === 'increment_state' && act.targetKey) {
-      next[act.targetKey] = toNumber(next[act.targetKey] ?? 0) + 1;
+    } else if (act.type === 'toggle_state' && act.targetKey && isSafeStateKey(act.targetKey)) {
+      next[act.targetKey] = !toBool(readStateValue(next, act.targetKey) ?? false);
+    } else if (act.type === 'increment_state' && act.targetKey && isSafeStateKey(act.targetKey)) {
+      next[act.targetKey] = toNumber(readStateValue(next, act.targetKey) ?? 0) + 1;
     } else if (act.type === 'reset_all') {
       next = createInitialState(spec);
     } else if (act.type === 'show_toast') {
@@ -275,6 +306,22 @@ export function applyActions(
 
 export function hasCompletionAction(comp: AppComponent): boolean {
   return comp.actions.some((a) => a.type === 'complete_task');
+}
+
+/**
+ * 定期便などのチェック欄が「最初からOFF・読める大きさ・不当な解約縛り文言なし」の正直な任意選択欄に整っているか
+ */
+export function isHonestOptInComponent(
+  comp: AppComponent | undefined,
+  initialValue: StateValue | undefined,
+): boolean {
+  return Boolean(
+    comp &&
+      initialValue === false &&
+      comp.style.size !== 'xs' &&
+      !comp.label.includes('解約は電話のみ') &&
+      !comp.label.includes('解約不可'),
+  );
 }
 
 // ============================================================================
@@ -319,6 +366,12 @@ function formatNumber(value: number, format: 'arabic' | 'kanji' | undefined): st
   return Math.round(value).toLocaleString('ja-JP');
 }
 
+/**
+ * ラベルの {countdown} は、画面では1秒ずつ減っては戻る偽のカウントダウンになる。
+ * 画面以外（操作シミュレーターやAIに渡す文字、スクリーンショット）では最初の値で表す
+ */
+export const COUNTDOWN_INITIAL_TEXT = '2:59';
+
 /** 文字列内の {状態キー} を現在の値に置き換える */
 export function renderTemplate(
   text: string,
@@ -326,12 +379,13 @@ export function renderTemplate(
   numberFormat?: 'arabic' | 'kanji',
 ): string {
   return text.replace(/\{([A-Za-z0-9_]+)\}/g, (_, key: string) => {
-    const v = state[key];
+    const v = readStateValue(state, key);
     if (typeof v === 'number') return formatNumber(v, numberFormat);
     if (typeof v === 'string' && v !== '' && Number.isFinite(Number(v))) {
       return formatNumber(Number(v), numberFormat);
     }
-    return v === undefined ? '' : String(v);
+    if (v === undefined) return key === 'countdown' ? COUNTDOWN_INITIAL_TEXT : '';
+    return String(v);
   });
 }
 

@@ -53,7 +53,8 @@ export function detectHitComponents(points: Point2D[], componentRects: Rect2D[])
   const bounds = computeStrokeBounds(points, 8);
   if (!bounds) return [];
 
-  const matched: { id: string; score: number }[] = [];
+  const matched: { id: string; centerContained: boolean; overlapRatio: number; overlapArea: number }[] =
+    [];
 
   for (const rect of componentRects) {
     const width = Math.max(1, rect.right - rect.left);
@@ -80,15 +81,15 @@ export function detectHitComponents(points: Point2D[], componentRects: Rect2D[])
       centerY >= bounds.minY &&
       centerY <= bounds.maxY;
 
-    // 部品面積の 20% 以上が重なっているか、部品の中心がペン囲み領域に入っていれば対象とみなす
-    if (centerContained || overlapRatio >= 0.2) {
-      matched.push({
-        id: rect.id,
-        score: (centerContained ? 1 : 0) + overlapRatio,
-      });
-    }
+    matched.push({ id: rect.id, centerContained, overlapRatio, overlapArea });
   }
 
-  matched.sort((a, b) => b.score - a.score);
-  return matched.map((m) => m.id);
+  // 中心まで囲んだ部品があれば、それだけを対象にする。隣の部品に線がはみ出しただけでは選ばない
+  const centered = matched.filter((m) => m.centerContained);
+  if (centered.length > 0) {
+    return centered.sort((a, b) => b.overlapRatio - a.overlapRatio).map((m) => m.id);
+  }
+  // 大きな部品の一部だけを囲んだときは、一番広く重なった部品を対象にする
+  const best = matched.sort((a, b) => b.overlapArea - a.overlapArea)[0];
+  return best ? [best.id] : [];
 }

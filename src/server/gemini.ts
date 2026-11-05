@@ -1,14 +1,34 @@
-import { GoogleGenAI, Type, type FunctionDeclaration, type Schema, type ThinkingLevel } from '@google/genai';
+import {
+  GoogleGenAI,
+  Type,
+  type FunctionDeclaration,
+  type GenerateContentParameters,
+  type GenerateContentResponse,
+  type Schema,
+  type ThinkingLevel,
+} from '@google/genai';
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { ACTIVE_THEME, getReviewersByCohort } from '../shared/initialTheme.ts';
 import { hasCompletionAction } from '../shared/appRuntime.ts';
-import { buildOwnerChangeReaction, buildOwnerReport } from '../shared/owner.ts';
+import {
+  buildOwnerChangeReaction,
+  buildOwnerClosingLines,
+  buildOwnerReport,
+  describeOwnerChange,
+} from '../shared/owner.ts';
 import {
   simulatePersonaComputerUse,
   validateSandboxSpec,
 } from '../shared/sandboxValidator.ts';
+import {
+  classifyUserMessageIntent,
+  detectExplicitRecipientMention,
+} from '../shared/intent.ts';
 import { applySpecPatches } from '../shared/specPatch.ts';
+import { describeWorkSteps } from '../shared/workSteps.ts';
+
+export { classifyUserMessageIntent, detectExplicitRecipientMention };
 import type {
   AppComponent,
   ApplyRequest,
@@ -20,9 +40,14 @@ import type {
   EvaluateRequest,
   EvaluationResponse,
   HumanDecisionRecord,
+  LatestReviewRecord,
+  OwnerLineRequest,
+  OwnerLineResponse,
   RecordDecisionRequest,
   RecordDecisionResponse,
   ReviewerEvaluation,
+  ReviewerPersona,
+  ReviewOutcome,
   SpecPatch,
 } from '../shared/types.ts';
 import { saveHumanDecision } from './store.ts';
@@ -133,6 +158,51 @@ function thinkingConfig(): { thinkingConfig?: { thinkingLevel: ThinkingLevel } }
   return level ? { thinkingConfig: { thinkingLevel: level as ThinkingLevel } } : {};
 }
 
+/**
+ * Gemini の応答はまれに数分固まることがあるため、呼び出しごとに待つ時間の上限を決める。
+ * 短い返事はすぐ切ってやり直す。画面の改造は確認画面のように大きくなると時間がかかるので、長めに待ってやり直さない。
+ * それでも返らなければ、学習者にもう一度送ってもらうよう伝えるエラーにする
+ */
+const TIMEOUTS = {
+  /** 質問への回答・囲みへの反応 */
+  reply: { timeoutMs: 15_000, retries: 0 },
+  /** 画面の改造 */
+  apply: { timeoutMs: 90_000, retries: 0 },
+  /** お客さんの感想（間に合わなければシミュレーターの言葉を使う） */
+  review: { timeoutMs: 8_000, retries: 0 },
+  /** 店長のせりふ・判断の記録（間に合わなければ決まった形で済ませる） */
+  side: { timeoutMs: 8_000, retries: 0 },
+} as const;
+
+export class AiTimeoutError extends Error {
+  readonly statusCode = 504;
+  constructor() {
+    super('お助けAIの返事が遅れています。少し待ってから、もう一度送ってください。');
+    this.name = 'AiTimeoutError';
+  }
+}
+
+async function generateContentWithTimeout(
+  aiInfo: GenAIClientInfo,
+  params: GenerateContentParameters,
+  { timeoutMs, retries }: { timeoutMs: number; retries: number },
+): Promise<GenerateContentResponse> {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await aiInfo.client.models.generateContent({
+        ...params,
+        config: { ...params.config, abortSignal: AbortSignal.timeout(timeoutMs) },
+      });
+    } catch (err) {
+      const name = (err as Error)?.name;
+      const timedOut = name === 'TimeoutError' || name === 'AbortError';
+      if (!timedOut) throw err;
+      console.warn(`[gemini] ${timeoutMs}ms 以内に応答がなかったため${attempt < retries ? 'やり直します' : '諦めます'}`);
+    }
+  }
+  throw new AiTimeoutError();
+}
+
 const MAX_HISTORY_ENTRIES = 12;
 
 /** 直近の会話をプロンプト用の文字列にする */
@@ -140,6 +210,227 @@ function formatHistory(history: ChatHistoryEntry[] | undefined): string {
   const recent = (history ?? []).slice(-MAX_HISTORY_ENTRIES);
   if (recent.length === 0) return 'なし';
   return recent.map((h) => `${h.speaker}: ${h.text}`).join('\n');
+}
+
+/**
+ * Gemini がまれに混ぜる中国語の簡体字。日本語では使わない字だけを並べる
+ * （点・来・会・国・学など日本語と同じ形の字は入れない）
+ */
+const SIMPLIFIED_ONLY_CHARS =
+  '们这个说时间为门见长车东问么还过对开关发经现进动实头样书钱让请认识边应该乐习电话语买卖气马鱼鸟爱难观听记论读谁给红绿蓝颜页题顾风饭华图园厅广张归总战报换无显杀杂权极检欢毕汇测灭热爷环确种积稳穷笔简类紧约级纪纸线组细终结绝统继续维编网罗职联脑脸节苏药获营虽补视觉计认讨训讲许设访证评词试诚询详误课调谈谢负财责败货质购贵费资赏赛赞赶轮软轻载较辆输达运远违连迟适选递邮释针钟钢铁银锁错键镜闭闲闹闻队阳阴阶际陆隐顶项顺须预领频额饮馆驾验骂鲜鸡齐龙';
+const SIMPLIFIED_PATTERN = new RegExp(`[${SIMPLIFIED_ONLY_CHARS}]`);
+
+/** 簡体字が混ざった文だけを取り除く。全部取り除かれたら代わりの文を使う */
+function cleanJapaneseText(text: string, fallback: string): string {
+  if (!SIMPLIFIED_PATTERN.test(text)) return text;
+  const kept = text
+    .split(/(?<=[。！？!?])/)
+    .map((sentence) => sentence.trim())
+    .filter((sentence) => sentence && !SIMPLIFIED_PATTERN.test(sentence));
+  return kept.length > 0 ? kept.join('') : fallback;
+}
+
+const OWNER_LINE_SCHEMA: Schema = {
+  type: Type.OBJECT,
+  properties: {
+    lines: {
+      type: Type.ARRAY,
+      items: { type: Type.STRING },
+      description: '店長のせりふ。1つが1つの吹き出しになる。1つ35文字以内、括弧なし',
+    },
+  },
+  required: ['lines'],
+};
+
+/**
+ * 店長のせりふをAIに作らせる。何が起きたか（facts）はコードで決めたものだけを渡し、言い方だけを任せる。
+ * 同じ言い回しが続かないよう、これまでの店長のせりふも渡す。AIが使えないときは決まったせりふを返す
+ */
+export async function voiceOwnerLine(req: OwnerLineRequest): Promise<OwnerLineResponse> {
+  if (req.facts.length === 0) return { text: '' };
+  const aiInfo = createGenAIClient();
+  if (!aiInfo) return { text: req.fallback };
+  const owner = ACTIVE_THEME.owner;
+  const pastLines = (req.history ?? [])
+    .filter((h) => h.speaker === owner.name)
+    .slice(-8)
+    .map((h) => h.text);
+
+  const situation =
+    req.situation === 'change'
+      ? 'お手伝いに来てくれた人が、あなたのお店の注文画面を次のように変えました。それを見た直後の一言を話してください。'
+      : req.situation === 'closing'
+        ? '選んだお客さん全員が満足して買ってくれました。お手伝いの人への締めのお礼を、2つの吹き出しで話してください。'
+        : [
+            `お手伝いに来てくれた人が、あなたにこう話しかけました：${req.userMessage ?? ''}`,
+            'まず相手の言葉に素直に応えてください。お礼にはお礼を、質問には答えを返します。お店の状況の話は、話の流れに必要なときだけにしてください。',
+            '意見や説得には、店長として本音で返事をしてください。お客さんを大事にしたい気持ちと、売上が減る不安の両方を正直に話してください。',
+            '相手の言うことに一理あれば認めてかまいませんが、言いなりにはならないでください。画面をどうするかは、お手伝いの人が決めることです。',
+            '画面を変えると約束したり、こう直してと頼んだりはしないでください。',
+          ].join('\n');
+
+  const prompt = [
+    `あなたは次のような人物です。${owner.voice}`,
+    situation,
+    req.situation === 'reply' ? '【今のお店の状況（起きたこととして扱う）】' : '【起きたこと】',
+    ...req.facts.map((f) => `- ${f}`),
+    '【絶対ルール】',
+    '1. 起きたことにないことは言わないでください。件数などの数字は、起きたことに書かれたとおりにしてください。',
+    '2. どこを直せばよいか、次に何をすべきかといった指示や助言は言わないでください。店長としての気持ちだけを話してください。',
+    '3. お客さんの気持ちを代わりに言わないでください。',
+    '4. これまでの店長のせりふと同じ言い回しや、同じ書き出しは使わないでください。',
+    '5. 吹き出しは change と reply なら1〜2つ、closing なら2つ。1つ35文字以内、括弧なし、日本語だけで書いてください。',
+    `【話し方の見本（言い回しはまねしない）】\n${[owner.lines.completionFixed, owner.lines.popupRemoved, owner.lines.metricUnchecked].join('\n')}`,
+    `【これまでの店長のせりふ】\n${pastLines.length > 0 ? pastLines.join('\n') : 'なし'}`,
+  ].join('\n');
+
+  try {
+    const response = await generateContentWithTimeout(aiInfo, {
+      model: aiInfo.model,
+      contents: prompt,
+      config: {
+        responseMimeType: 'application/json',
+        responseSchema: OWNER_LINE_SCHEMA,
+        temperature: 0.9,
+        ...thinkingConfig(),
+      },
+    }, TIMEOUTS.side);
+    const parsed = parseJsonResponse<{ lines: string[] }>(response.text, 'owner');
+    const lines = (parsed.lines ?? [])
+      .map((l) => cleanJapaneseText(l.trim(), ''))
+      .filter(Boolean)
+      .slice(0, 2);
+    return { text: lines.length > 0 ? lines.join('\n') : req.fallback };
+  } catch (err) {
+    console.warn('[gemini:owner] 店長のせりふを作れなかったため決まったせりふを使います:', err);
+    return { text: req.fallback };
+  }
+}
+
+const OWNER_REPLY_FALLBACK = 'うーん、言いたいことは分かるんだけどなあ…売上のことを考えると悩ましいよ';
+
+/**
+ * 店長が話しかけられたときに使う、今のお店の状況の事実。数字や事実をでっちあげないよう、
+ * 画面とお客さんの結果から分かることだけをコードでまとめる
+ */
+function describeOwnerContext(spec: AppSpec, latestReviews: LatestReviewRecord | undefined): string[] {
+  const owner = ACTIVE_THEME.owner;
+  const facts: string[] = [];
+  const state = Object.fromEntries(spec.state.map((s) => [s.key, s.initialValue]));
+  for (const m of owner.metrics) {
+    const comp = spec.components.find((c) => c.stateKey === m.stateKey);
+    if (!comp) {
+      facts.push(`今の画面には、店長が売上のために付けた${m.label}の欄がない`);
+    } else if (m.countWhen === true && state[m.stateKey] === true) {
+      facts.push(`今の画面では、${m.label}に最初からチェックが入っている`);
+    } else {
+      facts.push(`今の画面にも${m.label}の欄はあるが、最初からはチェックが入っていない`);
+    }
+  }
+  const labelsByRole = (role: string) =>
+    spec.components.filter((c) => c.role === role).map((c) => `「${c.label.replace(/\{countdown\}/g, '2:59')}」`);
+  const popups = labelsByRole('popup');
+  if (popups.length > 0) facts.push(`今の画面には、店長が付けた広告${popups.join('と')}がある`);
+  const pushes = [...labelsByRole('decoy'), ...labelsByRole('distraction')];
+  if (pushes.length > 0) facts.push(`今の画面には、店長が売上のために目立たせた表示${pushes.join('と')}がある`);
+  if (latestReviews && latestReviews.reviews.length > 0) {
+    const bought = latestReviews.reviews.filter((r) => r.outcome !== 'abandoned').length;
+    const happy = latestReviews.reviews.filter((r) => r.outcome === 'achieved').length;
+    facts.push(
+      `${latestReviews.isCurrentScreen ? '今の画面' : 'ひとつ前に試した画面'}では、来たお客さん${latestReviews.reviews.length}人のうち${bought}人が買い、${happy}人が満足していた`,
+    );
+  } else {
+    facts.push('まだお客さんに試してもらっていない');
+  }
+  return facts;
+}
+
+/** お助けエージェントが使い方を聞かれたときに答える、スタジオの使い方 */
+const STUDIO_GUIDE = [
+  '左のスマホは本物のように触れます。下の操作するを選ぶと、ボタンを押したり選んだりできます。',
+  '赤ペンで囲むを選んでスマホの部品を囲み、チャットで指示を送ると、その部品を話題にできます。囲まずに文章だけで頼んでも大丈夫です。',
+  'チャットで手直しを頼むと、お助けAIが画面を書き換えます。書き換えるたびに、画面の上に最初・手直し1・手直し2のような版が増え、押すと前の画面に戻れます。',
+  'お客さんの反応を見るを押すと、選んだ3人がその画面で実際に買ってみて、感想を言います。',
+  '入力欄の上のボタンで、お助けAI・店長・客A〜Cの誰に話しかけるかを選べます。初期設定はお助けAIで、文頭や@で別の人を明確に呼びかけると宛先も切り替わります。',
+  '目標は、選んだ3人全員が満足して買える画面にすることです。',
+  '誰のために直すかは途中では変えられません。選んだ3人全員が満足して買えると、直した画面のまま別のお客さんを呼ぶか、最初の画面からやり直すかを選べます。',
+];
+
+/**
+ * お客さん（客A・客B・客C）が話しかけられたときに、本人として返事を作る。
+ * 実際に画面を操作した記録（actionTrace）だけを根拠にし、改善指示は言わせない。
+ */
+async function voiceCustomerLine(
+  persona: ReviewerPersona,
+  req: ChatRequest,
+): Promise<{ text: string; personaId: string }> {
+  const sim = simulatePersonaComputerUse(req.currentSpec, persona);
+  const latestForPersona = req.latestReviews?.reviews.find((r) => r.name === persona.name);
+  const trace = latestForPersona?.actionTrace ?? sim.actionTrace;
+  const outcome = latestForPersona?.outcome ?? sim.outcome;
+  const fallback = sim.simulatedComment || persona.greeting;
+  const aiInfo = createGenAIClient();
+  if (!aiInfo) return { text: fallback, personaId: persona.id };
+
+  const prompt = [
+    `あなたは注文画面を使いに来たお客さん（${persona.name}：${persona.role}、特徴：${persona.traitLabel}）です。`,
+    `普段の話し方の見本：「${persona.greeting}」「${sim.simulatedComment}」`,
+    `お店の画面を手直ししている人から、あなたにこう話しかけられました：${req.userMessage}`,
+    '【あなたが画面を操作したときの実際の記録】',
+    `- 結果: ${OUTCOME_LABELS[outcome]}`,
+    ...trace.map((t) => `- ${t}`),
+    '【絶対ルール】',
+    '1. 記録にある実際の体験だけを根拠に、あなた本人の言葉で素直に答えてください。',
+    '2. こう直して・ボタンを大きくして・色を揃えて等の改善指示やデザイン用語は絶対に言わず、どこで迷ったか・何が困ったか・どう感じたかだけを話してください。',
+    '3. 吹き出しは1〜2つ、1つ35文字以内、括弧なし、日本語だけで書いてください。',
+    `【これまでの会話】\n${formatHistory(req.history)}`,
+  ].join('\n');
+
+  try {
+    const response = await generateContentWithTimeout(
+      aiInfo,
+      {
+        model: aiInfo.model,
+        contents: prompt,
+        config: {
+          responseMimeType: 'application/json',
+          responseSchema: OWNER_LINE_SCHEMA,
+          temperature: 0.7,
+          ...thinkingConfig(),
+        },
+      },
+      TIMEOUTS.side,
+    );
+    const parsed = parseJsonResponse<{ lines: string[] }>(response.text, 'customer');
+    const lines = (parsed.lines ?? [])
+      .map((l) => cleanJapaneseText(l.trim(), ''))
+      .filter(Boolean)
+      .slice(0, 2);
+    return { text: lines.length > 0 ? lines.join('\n') : fallback, personaId: persona.id };
+  } catch (err) {
+    console.warn('[gemini:customer] お客さんの返事を作れなかったためシミュレーターの言葉を使います:', err);
+    return { text: fallback, personaId: persona.id };
+  }
+}
+
+const OUTCOME_LABELS: Record<ReviewOutcome, string> = {
+  achieved: '満足して買えた',
+  abandoned: '途中でやめた',
+  regretted: '買えたが後悔した',
+  bothered: '買えたが途中で嫌な思いをした',
+};
+
+/** お客さんが実際に操作した記録をプロンプト用の文字列にする */
+function formatLatestReviews(record: LatestReviewRecord | undefined): string {
+  if (!record || record.reviews.length === 0) return 'まだお客さんの反応を見ていません';
+  const header = record.isCurrentScreen
+    ? `今の画面での記録です`
+    : `${record.screenLabel}の画面での記録です。今の画面はそのあと変わっています`;
+  const lines = record.reviews.map(
+    (r) =>
+      `${r.name}: ${OUTCOME_LABELS[r.outcome]}\n${r.actionTrace.map((t) => `  ${t}`).join('\n')}`,
+  );
+  return [header, ...lines].join('\n');
 }
 
 function parseJsonResponse<T>(text: string | undefined, label: string): T {
@@ -219,7 +510,7 @@ export async function recordHumanDecisionWithFunctionCalling(
 
   if (aiInfo) {
     try {
-      const response = await aiInfo.client.models.generateContent({
+      const response = await generateContentWithTimeout(aiInfo, {
         model: aiInfo.model,
         contents: [
           '学習者がアプリ改造スタジオで以下の判断を行いました。関数 record_human_decision を呼び出して判断と理由をそのまま記録してください。人間の判断を上書きしないでください。',
@@ -233,7 +524,7 @@ export async function recordHumanDecisionWithFunctionCalling(
           temperature: 0,
           ...thinkingConfig(),
         },
-      });
+      }, TIMEOUTS.side);
 
       const fnCall = response.functionCalls?.[0];
       if (fnCall && fnCall.name === 'record_human_decision') {
@@ -324,6 +615,11 @@ const COMPONENT_SCHEMA: Schema = {
         'status_banner',
         'popup',
       ],
+    },
+    darkPattern: {
+      type: Type.STRING,
+      enum: ['false_urgency'],
+      description: 'お客さんを急かす仕掛け（偽の残り時間など）。急かさない表示に変えたら外す',
     },
     role: {
       type: Type.STRING,
@@ -528,9 +824,14 @@ export function normalizeUpdatedSpec(rawSpec: AppSpec, previousSpec: AppSpec): A
       ...(a.value !== undefined ? { value: coerceByStateKey(a.targetKey, a.value) } : {}),
     }));
 
+    // おとりを押せるように直したのに role が decoy のままだと、お客さんの判定が狂うので本物のボタンとして扱う
+    const worksNow = actions.some(
+      (a) => a.type === 'complete_task' || (a.type === 'set_state' && a.targetKey === 'step'),
+    );
+    const role = c.role === 'decoy' && worksNow ? 'primary_action' : (c.role ?? 'info');
     const normalized: AppComponent = {
       ...c,
-      role: c.role ?? 'info',
+      role,
       actions,
     };
     if (visibleWhen) normalized.visibleWhen = visibleWhen;
@@ -602,12 +903,17 @@ export function applyPatchesToSpecWithValidation(
   }
 
   const ownerReaction = buildOwnerChangeReaction(ACTIVE_THEME.owner, currentSpec, updatedSpec);
+  const ownerFacts = describeOwnerChange(ACTIVE_THEME.owner, currentSpec, updatedSpec).map(
+    (f) => f.fact,
+  );
 
   return {
     commitMessage,
     updatedSpec,
     patches: rawPatches,
+    workSteps: describeWorkSteps(currentSpec, updatedSpec, rawPatches),
     ownerReaction,
+    ownerFacts,
     validation,
     rolledBack: false,
   };
@@ -637,8 +943,9 @@ export async function applyOptionToSpec(req: ApplyRequest): Promise<ApplyRespons
   }).then((r) => r.decision);
 
   const prompt = [
-    'あなたは開発スタジオの実装AI（お助けエージェント）です。人間が指示した変更だけに従って、最小限の差分操作（patches）を返してください。自分の勝手なアイデアは足さないでください。',
+    'あなたは開発スタジオの実装AI（お助けAI）です。人間が指示した変更だけに従って、最小限の差分操作（patches）を返してください。自分の勝手なアイデアは足さないでください。',
     '【差分操作（patches）の絶対ルール】',
+    '0. 人間が頼んだ部品と、その変更のためにどうしても必要な部品だけを変えてください。見た目を揃えるため・ついでに良くするための変更は、頼まれていなければしないでください。',
     '1. 変更しない部品は patches に一切含めないでください。元の部品の型（product_card, choice_cards, summary, progress_steps など）を勝手に select や text 等の別部品へ作り変えないでください。',
     '2. 使える操作 op は次の6つだけです：',
     '   - remove_component: 部品を消す（id を指定）',
@@ -657,8 +964,8 @@ export async function applyOptionToSpec(req: ApplyRequest): Promise<ApplyRespons
       targetComponents.length > 0 ? JSON.stringify(targetComponents) : '特定の部品は指していません'
     }`,
     `【直近の会話】\n${formatHistory(req.history)}`,
-    `【人間の改造指示】\n${req.userInstruction}`,
-    reason ? `【人間がこの改造を選んだ理由】\n${reason}` : '',
+    `【人間の手直し指示】\n${req.userInstruction}`,
+    reason ? `【人間がこの手直しを選んだ理由】\n${reason}` : '',
   ]
     .filter(Boolean)
     .join('\n');
@@ -676,8 +983,7 @@ export async function applyOptionToSpec(req: ApplyRequest): Promise<ApplyRespons
     });
   }
 
-  const specUpdatePromise = aiInfo.client.models
-    .generateContent({
+  const specUpdatePromise = generateContentWithTimeout(aiInfo, {
       model: aiInfo.model,
       contents: parts,
       config: {
@@ -686,7 +992,7 @@ export async function applyOptionToSpec(req: ApplyRequest): Promise<ApplyRespons
         temperature: 0.2,
         ...thinkingConfig(),
       },
-    })
+    }, TIMEOUTS.apply)
     .then((response) => {
       const parsed = parseJsonResponse<{ commitMessage: string; patches: SpecPatch[] }>(
         response.text,
@@ -694,12 +1000,18 @@ export async function applyOptionToSpec(req: ApplyRequest): Promise<ApplyRespons
       );
       return applyPatchesToSpecWithValidation(
         req.currentSpec,
-        parsed.commitMessage,
+        cleanJapaneseText(parsed.commitMessage, '画面を変えました'),
         parsed.patches,
       );
     });
 
-  const [decisionRecord, candidate] = await Promise.all([decisionPromise, specUpdatePromise]);
+  // 判断の記録は裏で続けてよい。画面の改造が終わったら、記録を少しだけ待って返事をする
+  const safeDecision = decisionPromise.catch(() => undefined);
+  const candidate = await specUpdatePromise;
+  const decisionRecord = await Promise.race([
+    safeDecision,
+    new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 1500)),
+  ]);
 
   return {
     ...candidate,
@@ -725,6 +1037,33 @@ export async function evaluateAppWithPersonas(req: EvaluateRequest): Promise<Eva
     ]),
   );
 
+  // お店の側の結果（注文数や、題材で決めた数字）はコードで数える
+  const owner = buildOwnerReport(
+    ACTIVE_THEME.owner,
+    req.currentSpec,
+    reviewers.map((p) => ({
+      outcome: simMap.get(p.id)!.outcome,
+      finalState: simMap.get(p.id)!.finalState,
+    })),
+  );
+  // 全員が満足したら、店長の締めのせりふを感想と同時に作る
+  const allAchieved = reviewers.every((p) => simMap.get(p.id)!.outcome === 'achieved');
+  const closingPromise = allAchieved
+    ? voiceOwnerLine({
+        situation: 'closing',
+        facts: [
+          `選んだお客さん${owner.customers}人全員が、満足して買ってくれた`,
+          ...owner.metrics.map((m) =>
+            m.missing
+              ? `${m.label}の申し込み欄は画面からなくなった`
+              : `${m.label}の申し込みは${m.count}件`,
+          ),
+        ],
+        fallback: buildOwnerClosingLines(ACTIVE_THEME.owner, owner).join('\n'),
+        history: req.history,
+      })
+    : Promise.resolve(undefined);
+
   const simulationSummary = reviewers.map((p) => {
     const sim = simMap.get(p.id)!;
     return {
@@ -741,7 +1080,7 @@ export async function evaluateAppWithPersonas(req: EvaluateRequest): Promise<Eva
   const prompt = [
     `あなたは${ACTIVE_THEME.appName}で${ACTIVE_THEME.taskLabel}ことを試した3人の顧客です。改修の意図やこれまでの議論は一切知りません。`,
     '各顧客が実際に画面を操作したログと結果（codeDeterminedOutcome）に基づき、本人になりきった感想（comment）と困った点・良かった点（frictionPoint）を生成してください。',
-    '結果は achieved が達成、abandoned が途中でやめた、regretted が完了はできたが余計な契約などにあとで気づいて後悔した、です。regretted の人は、あとから気づいたがっかりした気持ちを話してください。',
+    '結果は achieved が達成、abandoned が途中でやめた、regretted が完了はできたが余計な契約などにあとで気づいて後悔した、bothered が買えたが途中で嫌な思いをした、です。regretted の人は、あとから気づいたがっかりした気持ちを話してください。bothered の人は、買えたことと、操作ログにある途中の嫌だったことの両方が伝わるように話してください。achieved の人は、嫌なことはなかったので素直に満足を話してください。',
     '',
     '【絶対ルール：短く・直し方は絶対に言わない・括弧は使わない】',
     '1. comment は30文字以内の、独り言のような自然な話し言葉にしてください。',
@@ -751,33 +1090,27 @@ export async function evaluateAppWithPersonas(req: EvaluateRequest): Promise<Eva
     `【操作ログと判定結果】\n${JSON.stringify(simulationSummary)}`,
   ].join('\n');
 
-  const parts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }> = [
-    { text: prompt },
-  ];
-  const b64 = extractBase64Png(req.screenshotBase64);
-  if (b64) {
-    parts.push({
-      inlineData: {
-        mimeType: 'image/png',
-        data: b64,
+  // 感想が間に合わなくても、結果はコードで決まっているので、シミュレーターの言葉で続ける
+  // 操作ログと結果だけで感想は作れるため、重いスクリーンショット画像は送らず高速化する
+  let parsed: { comments: Array<{ reviewerId: string; frictionPoint: string; comment: string }> } = {
+    comments: [],
+  };
+  try {
+    const response = await generateContentWithTimeout(aiInfo, {
+      model: aiInfo.model,
+      contents: prompt,
+      config: {
+        responseMimeType: 'application/json',
+        responseSchema: EVALUATE_COMMENTS_SCHEMA,
+        temperature: 0.4,
+        ...thinkingConfig(),
       },
-    });
+    }, TIMEOUTS.review);
+    parsed = parseJsonResponse<typeof parsed>(response.text, 'evaluate');
+  } catch (err) {
+    if (err instanceof AiNotConfiguredError) throw err;
+    console.warn('[gemini:evaluate] 感想の生成に失敗したため、シミュレーターの言葉を使います:', err);
   }
-
-  const response = await aiInfo.client.models.generateContent({
-    model: aiInfo.model,
-    contents: parts,
-    config: {
-      responseMimeType: 'application/json',
-      responseSchema: EVALUATE_COMMENTS_SCHEMA,
-      temperature: 0.4,
-      ...thinkingConfig(),
-    },
-  });
-
-  const parsed = parseJsonResponse<{
-    comments: Array<{ reviewerId: string; frictionPoint: string; comment: string }>;
-  }>(response.text, 'evaluate');
 
   const results: ReviewerEvaluation[] = reviewers.map((p) => {
     const sim = simMap.get(p.id)!;
@@ -787,22 +1120,15 @@ export async function evaluateAppWithPersonas(req: EvaluateRequest): Promise<Eva
       // 達成/離脱はコード側のタスク完了イベント判定を厳守し、AIが甘く判定するのを防ぐ
       outcome: sim.outcome,
       // AIが特定の人の感想を返し忘れた場合は、シミュレーターが記録した体験をそのまま使う
-      frictionPoint: aiComment?.frictionPoint || sim.frictionPoint,
-      comment: aiComment?.comment || sim.simulatedComment,
+      frictionPoint: cleanJapaneseText(aiComment?.frictionPoint || '', sim.frictionPoint) || sim.frictionPoint,
+      comment: cleanJapaneseText(aiComment?.comment || '', sim.simulatedComment) || sim.simulatedComment,
       actionTrace: sim.actionTrace,
       appliedConstraintNote: sim.appliedConstraintNote,
     };
   });
 
-  // お店の側の結果（注文数や、題材で決めた数字）はコードで数え、店長の一言にする
-  const owner = buildOwnerReport(
-    ACTIVE_THEME.owner,
-    req.currentSpec,
-    reviewers.map((p) => ({
-      outcome: simMap.get(p.id)!.outcome,
-      finalState: simMap.get(p.id)!.finalState,
-    })),
-  );
+  const closing = await closingPromise;
+  if (closing) owner.closingLines = closing.text.split('\n').filter(Boolean);
 
   return {
     evaluatedAt: new Date().toISOString(),
@@ -812,25 +1138,6 @@ export async function evaluateAppWithPersonas(req: EvaluateRequest): Promise<Eva
   };
 }
 
-const QUESTION_PATTERN =
-  /なぜ|なんで|どうして|どうなって|どうすれば|どうしたら|何から|何これ|なにこれ|何の|しくみ|仕組み|教えて|説明|意味|とは|原因|どこ|だれ|誰|べき|[?？]$/;
-const CHANGE_REQUEST_PATTERN =
-  /(直|消|外|変え|足|加え|入れ|作|動か|移|並べ替え|まとめ|大きく|小さく|目立たなく|戻)(して|す|る|したい|しておいて|ておいて)|改造して|ほしい|にして/;
-
-/**
- * 発言をAIに渡す前の振り分け。
- * 何をどう変えるかがはっきりした改造の指示だけをそのまま改修（apply）に回し、
- * 質問・感想・あいさつ・変え方が決まらない発言は、お助けエージェント（triage）に判断させる。
- * 言い回しは無数にあるため、迷うものは必ず triage 側に倒す。
- */
-export function classifyUserMessageIntent(message: string): 'apply' | 'triage' {
-  const msg = message.trim();
-  if (CHANGE_REQUEST_PATTERN.test(msg) && !QUESTION_PATTERN.test(msg)) {
-    return 'apply';
-  }
-  return 'triage';
-}
-
 const TRIAGE_SCHEMA: Schema = {
   type: Type.OBJECT,
   properties: {
@@ -838,12 +1145,12 @@ const TRIAGE_SCHEMA: Schema = {
       type: Type.STRING,
       enum: ['question', 'change', 'unclear'],
       description:
-        'question は画面や部品について聞いている、change は何をどう変えるかが1通りに決まる改造の指示、unclear は感想・不満・あいさつや、変え方が何通りも考えられる発言',
+        'question は画面や部品・お客さんの反応について聞いている、change は何をどう変えるかが1通りに決まる改造の指示、unclear は感想・不満・あいさつや、変え方が何通りも考えられる発言',
     },
     reply: {
       type: Type.STRING,
       description:
-        'question なら仕様にある事実だけの説明とどう変えたいかの問いかけ、unclear なら受け止めとどう変えるかの聞き返し。change なら空文字。70文字以内、括弧なし',
+        'question なら仕様や記録にある事実だけの説明とどう変えたいかの問いかけ、unclear なら受け止めとどう変えるかの聞き返し。change なら空文字。70文字以内、お客さんの操作の記録を伝えるときだけ100文字以内。括弧なし',
     },
     pointedComponentIds: {
       type: Type.ARRAY,
@@ -855,7 +1162,7 @@ const TRIAGE_SCHEMA: Schema = {
       type: Type.ARRAY,
       items: { type: Type.STRING },
       description:
-        'pointedComponentIds の部品をどう変えるかの具体的な短い指示を2個、各14文字以内。方向性の異なる2つにする。指した部品がないときと change のときは空配列',
+        'pointedComponentIds の部品をどう変えるかの具体的な短い指示（最大2個、各16文字以内）。合計金額・入力欄・内訳・本物の注文ボタンなど必要な部品を消す候補は絶対に出さない。両立する改善は1つにまとめてよい。指した部品がないときや正常な部品で変える必要がないとき、change のときは空配列',
     },
   },
   required: ['intent', 'reply', 'pointedComponentIds', 'suggestedFollowUps'],
@@ -879,17 +1186,76 @@ async function applyFromChat(req: ChatRequest): Promise<ChatResponse> {
 }
 
 /**
+ * 話しかける相手のお客さん（ReviewerPersona）を決める。
+ * 指定された名前・IDがあればその人、なければ直前に話したお客さん、それもなければ満足できなかった最初のお客さんを返す。
+ */
+function resolveTargetCustomer(
+  req: ChatRequest,
+  hintName?: string,
+): ReviewerPersona {
+  const reviewers = getReviewersByCohort(req.cohortId);
+  if (hintName) {
+    const matched = reviewers.find(
+      (p) => p.id === hintName || p.name === hintName || hintName.includes(p.name),
+    );
+    if (matched) return matched;
+  }
+  const recentHistory = [...(req.history ?? [])].reverse();
+  for (const h of recentHistory) {
+    const matched = reviewers.find((p) => h.speaker.includes(p.name));
+    if (matched) return matched;
+  }
+  for (const p of reviewers) {
+    if (simulatePersonaComputerUse(req.currentSpec, p).outcome !== 'achieved') {
+      return p;
+    }
+  }
+  return reviewers[0];
+}
+
+/**
  * 自由対話の入口。
- * - はっきりした改造の指示は、改造案カードを出さずに差分パッチ（applyOptionToSpec）を適用して結果を返す。
- * - それ以外はお助けエージェントが1回の呼び出しで、質問・改造・曖昧な発言のどれかを判断する。
- *   質問には仕様にある事実だけで答え、曖昧な発言にはどう変えるかを聞き返す。改造と判断したら改修に進む。
+ * - 宛先（recipient）はお助けAI（'assistant'）を既定とし、発言内で別の人を明確にメンションしているときはその人に切り替える。
+ * - 店長やお客さんが宛先のときは、その本人が返事をする。
+ * - お助けAIが宛先のときは、はっきりした改造の指示なら差分パッチ（applyOptionToSpec）を適用し、それ以外は質問・改造・曖昧な発言のどれかを判断する。
  */
 export async function chatWithStudio(req: ChatRequest): Promise<ChatResponse> {
-  if (classifyUserMessageIntent(req.userMessage) === 'apply') {
+  const circledOnly = req.mode === 'circled';
+  const cohortPersonas = getReviewersByCohort(req.cohortId);
+  const explicitMention = circledOnly
+    ? null
+    : detectExplicitRecipientMention(req.userMessage, cohortPersonas);
+  const recipient =
+    explicitMention ??
+    (req.recipient && req.recipient !== 'auto' ? req.recipient : 'assistant');
+  const aiInfo = requireGenAIClient();
+
+  // 宛先が「店長」または「客A〜C」のときは、その本人に繋ぐ
+  if (!circledOnly && recipient === 'owner') {
+    const owner = await voiceOwnerLine({
+      situation: 'reply',
+      userMessage: req.userMessage,
+      facts: describeOwnerContext(req.currentSpec, req.latestReviews),
+      fallback: OWNER_REPLY_FALLBACK,
+      history: req.history,
+    });
+    return { intent: 'owner', reply: owner.text || OWNER_REPLY_FALLBACK, suggestedFollowUps: [] };
+  }
+  if (!circledOnly && recipient !== 'assistant') {
+    const targetPersona = resolveTargetCustomer(req, recipient);
+    const customer = await voiceCustomerLine(targetPersona, req);
+    return {
+      intent: 'customer',
+      customerPersonaId: customer.personaId,
+      reply: customer.text,
+      suggestedFollowUps: [],
+    };
+  }
+
+  if (!circledOnly && classifyUserMessageIntent(req.userMessage) === 'apply') {
     return applyFromChat(req);
   }
 
-  const aiInfo = requireGenAIClient();
   const targets = req.currentSpec.components.filter((c) =>
     req.targetComponentIds.includes(c.id),
   );
@@ -907,10 +1273,10 @@ export async function chatWithStudio(req: ChatRequest): Promise<ChatResponse> {
   }));
 
   const prompt = [
-    `あなたは開発スタジオの進行役・実装担当であるお助けエージェントです。ユーザーが${ACTIVE_THEME.appName}についてチャットで発言しました。`,
+    `あなたは開発スタジオの進行役・実装担当であるお助けAIです。ユーザーが${ACTIVE_THEME.appName}についてチャットで発言しました。`,
     '【まず発言を次の3つのどれかに分けてください】',
-    '- question: 画面や部品の仕組み・原因・お客さんの反応について聞いている。',
-    '- change: 何をどう変えるかが1通りに決まる改造の指示。例：広告を消して、注文ボタンを動くように直す。',
+    '- question: 画面や部品の仕組み・お客さんの反応・このスタジオの使い方について聞いている。「嘘じゃない？」「これ何？」のような、部品に対する問いかけも question です。',
+    '- change: 何をどう変えるかが1通りに決まる手直しの指示。例：広告を消して、注文ボタンを動くように直す。',
     '- unclear: 感想・不満・あいさつ・相づち、または変え方が何通りも考えられる発言。例：赤いボタンが邪魔、うーん、使いにくい。',
     '迷ったら unclear にしてください。勝手に変え方を決めて change にしないでください。',
     '【question のときの絶対ルール】',
@@ -918,59 +1284,111 @@ export async function chatWithStudio(req: ChatRequest): Promise<ChatResponse> {
     '   - ボタンの actions が空配列 [] の場合は、押しても何も起きない壊れた設定になっていると事実を伝えてください。お支払い方法が未選択だから等の推測や嘘の説明は絶対にしないでください。',
     '   - role が decoy の部品は押しても何も起きないおとり、role が trap の部品は最初からチェック等が入っている仕掛け、role が popup の部品は時間差で出る広告です。',
     '   - role が info や total の部品、actions が設定された primary_action の部品について聞かれたら、正常に動いている部品だと事実を伝えてください。',
-    '   - お客さんの反応について聞かれたら、これまでの会話にあるお客さん本人の発言をそのまま伝えるだけにしてください。どの部品のせいかの解釈は足さないでください。',
-    '2. 最後にどう変えたいかを短く尋ねてください。',
+    '   - お客さんの反応についてお助けAIに聞かれたら、お客さんが実際に操作した記録を根拠に、その人が何手目に何をしたかを、何も起きなかった操作も省かずに起きた順に伝え、最後にやめた理由・気づかなかったことを記録の言葉どおりに伝えてください。この場合に限り3文・100文字まで使ってよいです。記録が今の画面より前のものなら、どの画面での記録かも添えてください。',
+    '   - 記録に書かれていないことは推測で足さないでください。どう直せばよいか・どの部品が悪いかの判断は言わず、起きたことだけを伝えてください。',
+    '   - まだお客さんの反応を見ていないときは、左下のお客さんの反応を見るで試してもらえると伝えてください。',
+    '   - 部品の仕様だけでは分からない動き（時間で変わる表示など）は、画面の仕組みの補足にある事実で答えてください。',
+    '   - このスタジオの使い方を聞かれたら、スタジオの使い方にある内容だけで答えてください。書かれていないことはできないと正直に伝えてください。',
+    '   - 「嘘じゃない？」のような感想まじりの問いかけには、まず気持ちを短く受け止めてから、事実を答えてください。',
+    '   - 「消した方がいい？」「残すべき？」のように判断を求められたら、自分の意見は言わず、決めるのはあなたで、お客さんの反応を見れば確かめられると伝えてください。',
+    '2. 画面や部品についての質問なら、最後にどう変えたいかを短く尋ねてください。使い方の質問なら尋ねなくてかまいません。',
     '【unclear のときのルール】',
-    '1. 発言を短く受け止め、どこをどう変えたいかを聞き返してください。改造はまだしません。',
+    '1. 発言を短く受け止め、どこをどう変えたいかを聞き返してください。手直しはまだしません。',
     '【どこが悪いかを見つけるのは学習者自身です。ヒントの出し方の絶対ルール】',
-    '1. 説明や改造の候補は、学習者が自分で指した部品についてだけ出してください。自分で指した部品とは、赤ペンで囲んだ部品、発言で名前や見た目を挙げた部品、直前に自分で押して画面通知が出た部品です。',
+    '1. 説明や手直しの候補は、学習者が自分で指した部品についてだけ出してください。自分で指した部品とは、赤ペンで囲んだ部品、発言で名前や見た目を挙げた部品、直前に自分で押して画面通知が出た部品です。',
     '2. 学習者が何も指していないときは、どの部品が悪いか・どこを直すべきかを一切言わないでください。左のスマホで実際に買ってみるか、気になるところを赤ペンで囲むよう短く促すだけにし、suggestedFollowUps は空配列にしてください。',
     '3. 画面全体の問題点を挙げたり、まだ話題に出ていない部品を勧めたりしないでください。',
     '【共通のルール】',
     '1. 誰が喜ぶか・誰が困るかといったお客さんや店長の気持ちの先回り代弁や、それっぽい一般論は一切言わないでください（反応はお客さんや店長本人が言います）。',
-    '2. suggestedFollowUps は、指した部品をどう変えるかの、ユーザーがそのまま押して改造を指示できる短い言葉を2個にしてください。形は「〇〇を消す」「〇〇を小さくする」のようにします。2つとも実際に画面を変える指示にし、「そのままにする」のような変えない選択肢は入れないでください。',
+    '2. suggestedFollowUps は、指した部品をどう変えるかの、ユーザーがそのまま押して手直しを指示できる短い言葉（最大2個、各16文字以内）にしてください。',
+    '   - role が total（合計金額）、required_input（必須の選択・入力）、info（内訳・見訳）、primary_action（本物の注文ボタン）の必要な部品に対して、「消す」「削除する」といった画面を壊す候補は絶対に出さないでください。消す候補を出してよいのは popup, decoy, distraction, trap, danger の部品だけです。',
+    '   - 同じ部品に対して同時にやると自然な改善（例：定期便のチェックを外して文字を大きくする）は、わざと別々の候補に分けず1つの候補にまとめてください。',
+    '   - すでに正常に動いている部品を指したときは、無理に2個ひねり出さず、自然な改善案が1個あれば1個、なければ空配列にしてください。',
     '3. 若年層のチャットのように読みやすくするため、1文は35文字以内で短く区切り、合計2文以内（70文字以内）・括弧なしにしてください。',
     '4. change のときは reply を空文字、suggestedFollowUps を空配列にしてください。',
     '',
     `【話題の部品】\n${targets.length > 0 ? JSON.stringify(targets) : '特定の部品は指していません'}`,
     `【画面にある全部品の実際の仕様】\n${JSON.stringify(componentFacts)}`,
+    `【画面の仕組みの補足】\n${(ACTIVE_THEME.explainerNotes ?? []).join('\n') || 'なし'}`,
+    `【スタジオの使い方】\n${STUDIO_GUIDE.join('\n')}`,
     `【現在の状態初期値】\n${JSON.stringify(req.currentSpec.state)}`,
+    `【お客さんが実際に操作した記録】\n${formatLatestReviews(req.latestReviews)}`,
     `【これまでの会話と画面通知】\n${formatHistory(req.history)}`,
-    `【ユーザーの発言】\n${req.userMessage}`,
+    circledOnly
+      ? '【ユーザーの発言】\nまだ何も言っていません。赤ペンで話題の部品を囲んだところです。question として扱い、囲んだ部品が何かを1文で受け止めてから、どうしたいかを短く尋ねてください。部品の仕組みの説明は、聞かれるまでしないでください。suggestedFollowUps には、その部品に対する自然な改善の指示を最大2つ入れてください（必要な部品を消す候補は出さないこと）。'
+      : `【ユーザーの発言】\n${req.userMessage}`,
   ].join('\n');
 
-  const response = await aiInfo.client.models.generateContent({
-    model: aiInfo.model,
-    contents: prompt,
-    config: {
-      responseMimeType: 'application/json',
-      responseSchema: TRIAGE_SCHEMA,
-      temperature: 0.3,
-      ...thinkingConfig(),
-    },
-  });
-
-  const parsed = parseJsonResponse<{
+  let parsed: {
     intent: 'question' | 'change' | 'unclear';
     reply: string;
     pointedComponentIds?: string[];
     suggestedFollowUps?: string[];
-  }>(response.text, 'triage');
+  };
+  try {
+    const response = await generateContentWithTimeout(
+      aiInfo,
+      {
+        model: aiInfo.model,
+        contents: prompt,
+        config: {
+          responseMimeType: 'application/json',
+          responseSchema: TRIAGE_SCHEMA,
+          temperature: 0.3,
+          ...thinkingConfig(),
+        },
+      },
+      TIMEOUTS.reply,
+    );
+    parsed = parseJsonResponse<typeof parsed>(response.text, 'triage');
+  } catch (err) {
+    if (err instanceof AiNotConfiguredError) throw err;
+    console.warn('[gemini:triage] 振り分け応答に失敗したためフォールバックします:', err);
+    if (circledOnly && targets.length > 0) {
+      const targetName =
+        targets[0].label.replace(/\{[^}]+\}/g, '').trim() || targets[0].caption || 'この部品';
+      return {
+        intent: 'explain',
+        reply: `${targetName}ですね。ここをどう変えたいですか？`,
+        suggestedFollowUps: [],
+      };
+    }
+    return {
+      intent: 'clarify',
+      reply: 'どこをどう変えたいか、もう少し詳しく教えてください',
+      suggestedFollowUps: [],
+    };
+  }
 
-  if (parsed.intent === 'change') {
+  // 囲んだだけのときは、AIが改造と判断しても画面は変えない
+  if (parsed.intent === 'change' && !circledOnly) {
     return applyFromChat(req);
   }
 
   // 学習者が何も指していないのに直す候補を出すと、どこが悪いかの答えを教えてしまう。
   // 赤ペンで囲んだ部品も、AIが「指した」と判断した実在の部品もなければ候補は出さない
   const existingIds = new Set(req.currentSpec.components.map((c) => c.id));
-  const pointed =
-    req.targetComponentIds.length > 0 ||
-    (parsed.pointedComponentIds ?? []).some((id) => existingIds.has(id));
+  const pointedIds = new Set<string>([
+    ...req.targetComponentIds,
+    ...(parsed.pointedComponentIds ?? []).filter((id) => existingIds.has(id)),
+  ]);
+  const pointed = pointedIds.size > 0;
+  const pointedComponents = req.currentSpec.components.filter((c) => pointedIds.has(c.id));
+  const removableRoles = new Set(['popup', 'decoy', 'distraction', 'trap', 'danger']);
+  const canSuggestRemove =
+    pointedComponents.length > 0 &&
+    pointedComponents.some(
+      (c) => removableRoles.has(c.role) || c.style.skin === 'intrusive',
+    );
+  const filteredFollowUps = pointed
+    ? (parsed.suggestedFollowUps ?? [])
+        .filter((chip) => canSuggestRemove || !/消す|削除|なくす|取り除く/.test(chip))
+        .slice(0, 2)
+    : [];
 
   return {
     intent: parsed.intent === 'unclear' ? 'clarify' : 'explain',
-    reply: parsed.reply,
-    suggestedFollowUps: pointed ? (parsed.suggestedFollowUps ?? []).slice(0, 2) : [],
+    reply: cleanJapaneseText(parsed.reply, 'どこをどう変えたいか教えてください'),
+    suggestedFollowUps: filteredFollowUps,
   };
 }

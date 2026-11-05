@@ -30,6 +30,11 @@ const server = createServer(async (req, res) => {
   if (handled) return;
 
   // Cloud Run 等での静的ファイル配信 (dist/)
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    res.writeHead(405, SECURITY_HEADERS);
+    res.end('Method Not Allowed');
+    return;
+  }
   const urlPath = (req.url ?? '/').split('?')[0];
   const safeRelPath = normalize(urlPath).replace(/^(\.\.(\/|\\|$))+/, '');
   let targetPath = resolve(DIST_DIR, safeRelPath === '/' ? 'index.html' : `.${safeRelPath}`);
