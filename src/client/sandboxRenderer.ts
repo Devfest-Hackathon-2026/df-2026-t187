@@ -1,58 +1,22 @@
-import { buildStandaloneSandboxHtml, escapeHtml } from '../shared/sandboxValidator.ts';
-import type {
-  AppComponent,
-  AppSpec,
-  ComponentAction,
-  StateValue,
-} from '../shared/types.ts';
+import {
+  applyActions,
+  createInitialState,
+  isComponentVisible,
+  renderLabel,
+  renderTemplate,
+  withDerivedValues,
+  type AppState,
+} from '../shared/appRuntime.ts';
+import { buildStandaloneSandboxHtml } from '../shared/sandboxValidator.ts';
+import type { AppComponent, AppSpec, ComponentAction, StateValue } from '../shared/types.ts';
 
 export interface SandboxCallbacks {
-  onStateChange: (newState: Record<string, StateValue>) => void;
-  onToast: (message: string, type: 'info' | 'success' | 'warning') => void;
-}
-
-/**
- * Web Speech API / Web Audio API を使って音声読み上げ（TTS）またはアラーム音を再生する。
- */
-export function speakTextWithTts(
-  text: string,
-  options: { pitch?: number; rate?: number } = {},
-): void {
-  if (typeof window === 'undefined') return;
-  try {
-    if ('speechSynthesis' in window) {
-      window.speechSynthesis.cancel();
-      const utter = new SpeechSynthesisUtterance(text);
-      utter.lang = 'ja-JP';
-      utter.pitch = options.pitch ?? 1.0;
-      utter.rate = options.rate ?? 1.05;
-      window.speechSynthesis.speak(utter);
-    }
-  } catch {
-    // Web Speech API 非対応環境では無視
-  }
-}
-
-export function playAlarmBeep(): void {
-  if (typeof window === 'undefined') return;
-  try {
-    const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-    if (!AudioCtx) return;
-    const ctx = new AudioCtx();
-    const osc = ctx.createOscillator();
-    const gain = ctx.createGain();
-    osc.type = 'triangle';
-    osc.frequency.setValueAtTime(880, ctx.currentTime);
-    osc.frequency.setValueAtTime(1174.66, ctx.currentTime + 0.12);
-    gain.gain.setValueAtTime(0.15, ctx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.32);
-    osc.connect(gain);
-    gain.connect(ctx.destination);
-    osc.start();
-    osc.stop(ctx.currentTime + 0.32);
-  } catch {
-    // AudioContext 非対応時は無視
-  }
+  /** 状態をまるごと置き換える */
+  onStateChange: (newState: AppState) => void;
+  /** 状態の一部だけを書き換える（時間差で動くポップアップなど、描画後に起きる変化用） */
+  onStatePatch: (patch: AppState) => void;
+  /** スマホの中で起きたことのお知らせ。画面を邪魔しないよう、画面の外（チャット）に出す */
+  onNotice: (message: string, type: 'info' | 'success' | 'warning') => void;
 }
 
 /**
@@ -66,41 +30,6 @@ export function querySandboxComponentElements(container: HTMLElement): HTMLEleme
   return Array.from(container.querySelectorAll<HTMLElement>('[data-component-id]'));
 }
 
-function shouldShowComponent(
-  comp: AppComponent,
-  state: Record<string, StateValue>,
-): boolean {
-  if (!comp.visibleWhen) return true;
-  const current = state[comp.visibleWhen.stateKey];
-  const target = comp.visibleWhen.value;
-  switch (comp.visibleWhen.operator) {
-    case 'eq':
-      return String(current) === String(target);
-    case 'neq':
-      return String(current) !== String(target);
-    case 'gt':
-      return Number(current) > Number(target);
-    case 'lt':
-      return Number(current) < Number(target);
-    default:
-      return true;
-  }
-}
-
-function adjustTimeString(current: string, deltaMinutes: number): string {
-  const match = current.match(/^(\d{1,2}):(\d{2})/);
-  let hours = match ? Number(match[1]) : 7;
-  let mins = match ? Number(match[2]) : 0;
-  if (!Number.isFinite(hours)) hours = 7;
-  if (!Number.isFinite(mins)) mins = 0;
-
-  let total = (hours * 60 + mins + deltaMinutes) % (24 * 60);
-  if (total < 0) total += 24 * 60;
-  const nextH = String(Math.floor(total / 60)).padStart(2, '0');
-  const nextM = String(total % 60).padStart(2, '0');
-  return `${nextH}:${nextM}`;
-}
-
 function syncStylesIntoIframe(iframeDoc: Document): void {
   const parentStyles = document.querySelectorAll('style, link[rel="stylesheet"]');
   iframeDoc.head.querySelectorAll('[data-synced-style]').forEach((n) => n.remove());
@@ -111,10 +40,381 @@ function syncStylesIntoIframe(iframeDoc: Document): void {
   }
 }
 
+/**
+ * 親ページのスタイルが変わったら（開発中のCSS差し替えなど）、iframe にもコピーし直す。
+ * iframe を作ったときに1回コピーするだけだと、再読み込みするまで古い見た目のままになるため。
+ */
+let styleObserver: MutationObserver | null = null;
+
+function watchParentStyles(iframe: HTMLIFrameElement): void {
+  styleObserver?.disconnect();
+  styleObserver = new MutationObserver(() => {
+    if (iframe.contentDocument) syncStylesIntoIframe(iframe.contentDocument);
+  });
+  styleObserver.observe(document.head, { childList: true, subtree: true, characterData: true });
+}
+
+/** 状態変数の型に合わせて入力値を変換する */
+function coerceStateValue(spec: AppSpec, key: string, raw: string): StateValue {
+  const def = spec.state.find((s) => s.key === key);
+  if (def?.type === 'number') {
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : 0;
+  }
+  if (def?.type === 'boolean') return raw === 'true';
+  return raw;
+}
+
+/**
+ * 購入完了・別ページへの移動の演出用の内部状態。
+ * お題アプリの状態とは別に、キー名の先頭を __ にして持つ（初期状態に戻すと消える）。
+ */
+const PAGE_KEY = '__page';
+const PAGE_TITLE_KEY = '__pageTitle';
+const PAGE_PHASE_KEY = '__pagePhase';
+/** 完了ページ・移動先ページを見せる時間と、読み込み中のスピナーを見せる時間（ミリ秒） */
+const PAGE_SHOW_MS = 2400;
+const PAGE_LOADING_MS = 1300;
+
+type PagePhase = 'show' | 'loading';
+let pageTimer: { phase: PagePhase; timer: number } | null = null;
+
+/** 完了ページ → 読み込み中 → 最初の画面、の順に進める */
+function schedulePageTransition(
+  spec: AppSpec,
+  liveState: AppState,
+  callbacks: SandboxCallbacks,
+): void {
+  const phase = liveState[PAGE_KEY] ? (liveState[PAGE_PHASE_KEY] as PagePhase) : undefined;
+  if (!phase) {
+    if (pageTimer) {
+      window.clearTimeout(pageTimer.timer);
+      pageTimer = null;
+    }
+    return;
+  }
+  if (pageTimer?.phase === phase) return;
+  if (pageTimer) window.clearTimeout(pageTimer.timer);
+  pageTimer = {
+    phase,
+    timer: window.setTimeout(
+      () => {
+        pageTimer = null;
+        if (phase === 'show') {
+          callbacks.onStatePatch({ [PAGE_PHASE_KEY]: 'loading' });
+        } else {
+          callbacks.onStateChange(createInitialState(spec));
+        }
+      },
+      phase === 'show' ? PAGE_SHOW_MS : PAGE_LOADING_MS,
+    ),
+  };
+}
+
+/** ポップアップを出すタイマー。描画し直しても二重に予約しないよう部品IDごとに持つ */
+const popupTimers = new Map<string, number>();
+
+function clearPopupTimers(): void {
+  for (const timer of popupTimers.values()) window.clearTimeout(timer);
+  popupTimers.clear();
+}
+
+function schedulePopups(spec: AppSpec, liveState: AppState, callbacks: SandboxCallbacks): void {
+  // 完了ページや移動先ページを見せている間は広告を出さない
+  if (liveState[PAGE_KEY]) {
+    clearPopupTimers();
+    return;
+  }
+  const popups = spec.components.filter((c) => c.type === 'popup' && c.stateKey);
+  const popupIds = new Set(popups.map((p) => p.id));
+  for (const [id, timer] of popupTimers) {
+    if (!popupIds.has(id)) {
+      window.clearTimeout(timer);
+      popupTimers.delete(id);
+    }
+  }
+  for (const popup of popups) {
+    const key = popup.stateKey!;
+    if (liveState[key] !== 'waiting') {
+      const timer = popupTimers.get(popup.id);
+      if (timer !== undefined) {
+        window.clearTimeout(timer);
+        popupTimers.delete(popup.id);
+      }
+      continue;
+    }
+    if (popupTimers.has(popup.id)) continue;
+    const range = popup.popupDelayMs ?? { min: 3000, max: 6000 };
+    const delay = range.min + Math.random() * Math.max(0, range.max - range.min);
+    popupTimers.set(
+      popup.id,
+      window.setTimeout(() => {
+        popupTimers.delete(popup.id);
+        callbacks.onStatePatch({ [key]: 'open' });
+      }, delay),
+    );
+  }
+}
+
+/** 購入完了ページ・移動先ページ・読み込み中のスピナー */
+function renderTransientPage(
+  doc: Document,
+  kind: 'complete' | 'away',
+  title: string,
+  loading: boolean,
+): HTMLElement {
+  const page = doc.createElement('div');
+  page.className = `transient-page is-${kind}`;
+
+  if (loading) {
+    page.classList.add('is-loading');
+    page.innerHTML = `
+      <span class="page-spinner" role="status" aria-label="読み込み中"></span>
+      <span class="page-loading-text">読み込み中</span>
+    `;
+    return page;
+  }
+
+  if (kind === 'complete') {
+    page.innerHTML = `
+      <span class="page-check" aria-hidden="true">
+        <svg viewBox="0 0 256 256" width="34" height="34" fill="currentColor"><path d="M229.66,77.66l-128,128a8,8,0,0,1-11.32,0l-56-56a8,8,0,0,1,11.32-11.32L96,188.69,218.34,66.34a8,8,0,0,1,11.32,11.32Z"/></svg>
+      </span>
+    `;
+    const heading = doc.createElement('div');
+    heading.className = 'page-title';
+    heading.textContent = title;
+    const sub = doc.createElement('div');
+    sub.className = 'page-sub';
+    sub.textContent = 'ご注文の内容をメールでお送りしました';
+    page.append(heading, sub);
+    return page;
+  }
+
+  // 別のページに飛ばされたときは、それらしいページの骨組みを見せる
+  const heading = doc.createElement('div');
+  heading.className = 'page-title';
+  heading.textContent = title;
+  const sub = doc.createElement('div');
+  sub.className = 'page-sub';
+  sub.textContent = '別のページに移動しました';
+  const skeleton = doc.createElement('div');
+  skeleton.className = 'page-skeleton';
+  skeleton.innerHTML = '<i></i><i></i><i></i><i></i>';
+  page.append(heading, sub, skeleton);
+  return page;
+}
+
+const CHEVRON_SVG =
+  '<svg viewBox="0 0 24 24" width="1em" height="1em"><path d="M15 5l-7 7 7 7" stroke="currentColor" stroke-width="2.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+const LOCK_SVG =
+  '<svg viewBox="0 0 24 24" width="1em" height="1em"><rect x="5" y="11" width="14" height="9" rx="2" fill="currentColor"/><path d="M8 11V8a4 4 0 0 1 8 0v3" stroke="currentColor" stroke-width="2" fill="none"/></svg>';
+/** クラフト紙のコーヒー袋のイラスト */
+const COFFEE_BAG_SVG =
+  '<svg viewBox="0 0 64 80" width="100%" height="100%" aria-hidden="true"><path d="M10 14 L14 6 L50 6 L54 14 Z" fill="#a9733f"/><path d="M10 14 h44 l3 58 a4 4 0 0 1 -4 4 H11 a4 4 0 0 1 -4 -4 Z" fill="#c8915a"/><path d="M10 14 h44 l1 10 H9 Z" fill="#b57d47"/><rect x="17" y="32" width="30" height="30" rx="3" fill="#fffaf2"/><g transform="rotate(-25 32 44)"><ellipse cx="32" cy="44" rx="6" ry="8.5" fill="#5b3a26"/><path d="M29 37 q5 7 0 14" stroke="#c8915a" stroke-width="1.6" fill="none"/></g><rect x="21" y="55" width="22" height="2.4" rx="1.2" fill="#c8915a"/></svg>';
+
+type SetValue = (key: string, raw: string | boolean) => void;
+
+/** 商品カード：絵・札・商品名・補足・値段と、数量の±ボタン */
+function renderProductCard(
+  doc: Document,
+  comp: AppComponent,
+  state: AppState,
+  label: string,
+  caption: string,
+  setValue: SetValue,
+): HTMLElement {
+  const card = doc.createElement('div');
+  card.className = 'comp-product-card';
+
+  const thumb = doc.createElement('div');
+  thumb.className = 'product-thumb';
+  if (comp.icon === 'coffee_bag') thumb.innerHTML = COFFEE_BAG_SVG;
+  else thumb.textContent = comp.icon ?? '🛍️';
+
+  const info = doc.createElement('div');
+  info.className = 'product-info';
+  if (comp.badge) {
+    const badge = doc.createElement('span');
+    badge.className = 'product-badge';
+    badge.textContent = comp.badge;
+    info.appendChild(badge);
+  }
+  const name = doc.createElement('div');
+  name.className = 'product-name';
+  name.textContent = label;
+  info.appendChild(name);
+  if (caption) {
+    const meta = doc.createElement('div');
+    meta.className = 'product-meta';
+    meta.textContent = caption;
+    info.appendChild(meta);
+  }
+
+  const row = doc.createElement('div');
+  row.className = 'product-row';
+  const price = doc.createElement('span');
+  price.className = 'product-price';
+  price.textContent = comp.priceLabel
+    ? renderTemplate(comp.priceLabel, state, comp.style.numberFormat)
+    : '';
+  row.appendChild(price);
+
+  if (comp.stateKey) {
+    const key = comp.stateKey;
+    const values = (comp.options ?? ['1', '2', '3', '4', '5'])
+      .map(Number)
+      .filter(Number.isFinite)
+      .sort((a, b) => a - b);
+    const current = Number(state[key] ?? values[0]);
+    const idx = values.indexOf(current);
+    const stepper = doc.createElement('span');
+    stepper.className = 'product-stepper';
+    const minus = doc.createElement('button');
+    minus.type = 'button';
+    minus.textContent = '−';
+    minus.setAttribute('aria-label', '数量を減らす');
+    minus.disabled = idx <= 0;
+    minus.addEventListener('click', () => {
+      if (idx > 0) setValue(key, String(values[idx - 1]));
+    });
+    const count = doc.createElement('span');
+    count.className = 'product-count';
+    count.textContent = String(current);
+    const plus = doc.createElement('button');
+    plus.type = 'button';
+    plus.textContent = '＋';
+    plus.setAttribute('aria-label', '数量を増やす');
+    plus.disabled = idx === -1 || idx >= values.length - 1;
+    plus.addEventListener('click', () => {
+      if (idx >= 0 && idx < values.length - 1) setValue(key, String(values[idx + 1]));
+    });
+    stepper.append(minus, count, plus);
+    row.appendChild(stepper);
+  }
+  info.appendChild(row);
+
+  card.append(thumb, info);
+  return card;
+}
+
+/** 手順の表示：今の手順より前は済み、今の手順を強調する */
+function renderProgressSteps(doc: Document, comp: AppComponent, current: string): HTMLElement {
+  const wrap = doc.createElement('div');
+  wrap.className = 'comp-progress';
+  const steps = comp.options ?? [];
+  const currentIdx = steps.indexOf(current);
+  steps.forEach((name, i) => {
+    if (i > 0) {
+      const rule = doc.createElement('span');
+      rule.className = 'progress-rule';
+      wrap.appendChild(rule);
+    }
+    const step = doc.createElement('span');
+    step.className = `progress-step ${i < currentIdx ? 'is-done' : i === currentIdx ? 'is-now' : ''}`;
+    const dot = doc.createElement('span');
+    dot.className = 'progress-dot';
+    dot.textContent = i < currentIdx ? '✓' : String(i + 1);
+    const text = doc.createElement('span');
+    text.textContent = name;
+    step.append(dot, text);
+    wrap.appendChild(step);
+  });
+  return wrap;
+}
+
+/** 選べるカード：選択肢ごとに丸印と補足を並べる */
+function renderChoiceCards(
+  doc: Document,
+  comp: AppComponent,
+  state: AppState,
+  setValue: SetValue,
+): HTMLElement {
+  const list = doc.createElement('div');
+  list.className = 'comp-choice-list';
+  list.setAttribute('role', 'radiogroup');
+  list.setAttribute('aria-label', comp.label);
+  const current = comp.stateKey ? String(state[comp.stateKey] ?? '') : '';
+  (comp.options ?? []).forEach((opt, i) => {
+    const item = doc.createElement('button');
+    item.type = 'button';
+    item.className = `choice-item ${opt === current ? 'is-selected' : ''}`;
+    item.setAttribute('role', 'radio');
+    item.setAttribute('aria-checked', String(opt === current));
+    const radio = doc.createElement('span');
+    radio.className = 'choice-radio';
+    const body = doc.createElement('span');
+    body.className = 'choice-body';
+    const main = doc.createElement('span');
+    main.className = 'choice-main';
+    main.textContent = opt;
+    body.appendChild(main);
+    const detail = comp.optionDetails?.[i];
+    if (detail) {
+      const sub = doc.createElement('span');
+      sub.className = 'choice-sub';
+      sub.textContent = renderTemplate(detail, state, comp.style.numberFormat);
+      body.appendChild(sub);
+    }
+    item.append(radio, body);
+    item.addEventListener('click', () => {
+      if (comp.stateKey) setValue(comp.stateKey, opt);
+    });
+    list.appendChild(item);
+  });
+  return list;
+}
+
+/**
+ * 文字の基準（スマホ画面の幅に対する割合）。中身が収まらないときは下限まで少しずつ小さくする。
+ * 合計と購入ボタンは画面下に固定されているため、下限まで縮めても収まらない分はスクロールにする。
+ */
+const ROOT_FONT_VW_MAX = 4.2;
+const ROOT_FONT_VW_MIN = 3.7;
+
+/** 下にまだ続きがあるときは本文の下端をぼかし、スクロールできることを示す */
+function updateScrollHint(scroller: HTMLElement): void {
+  const hasMore = scroller.scrollTop + scroller.clientHeight < scroller.scrollHeight - 2;
+  scroller.classList.toggle('has-more', hasMore);
+}
+
+function fitContentToScreen(doc: Document, scroller: HTMLElement): void {
+  if (!scroller.isConnected) return;
+  const root = doc.documentElement;
+  let vw = ROOT_FONT_VW_MAX;
+  root.style.fontSize = `${vw}vw`;
+  while (scroller.scrollHeight > scroller.clientHeight + 1 && vw > ROOT_FONT_VW_MIN) {
+    vw = Math.max(ROOT_FONT_VW_MIN, vw - 0.1);
+    root.style.fontSize = `${vw}vw`;
+  }
+  updateScrollHint(scroller);
+}
+
+/**
+ * 描画した直後はレイアウトが確定しておらず正しく測れないことがあるため、
+ * 次のフレームと、スマホの大きさが変わったときにも測り直す。
+ */
+let fitTarget: { doc: Document; scroller: HTMLElement } | null = null;
+let fitObserver: ResizeObserver | null = null;
+
+function scheduleFit(iframe: HTMLIFrameElement | null, doc: Document, scroller: HTMLElement): void {
+  fitTarget = { doc, scroller };
+  fitContentToScreen(doc, scroller);
+  window.requestAnimationFrame(() => {
+    if (fitTarget?.scroller === scroller) fitContentToScreen(doc, scroller);
+  });
+  if (iframe && !fitObserver) {
+    fitObserver = new ResizeObserver(() => {
+      if (fitTarget) fitContentToScreen(fitTarget.doc, fitTarget.scroller);
+    });
+    fitObserver.observe(iframe);
+  }
+}
+
 export function renderSandboxApp(
   container: HTMLElement,
   spec: AppSpec,
-  liveState: Record<string, StateValue>,
+  liveState: AppState,
   selectedComponentIds: Set<string>,
   callbacks: SandboxCallbacks,
 ): void {
@@ -125,7 +425,7 @@ export function renderSandboxApp(
     iframe = document.createElement('iframe');
     iframe.className = 'sandbox-iframe';
     iframe.setAttribute('sandbox', 'allow-scripts allow-same-origin');
-    iframe.title = spec.title || 'お題アプリサンドボックス';
+    iframe.title = spec.title || 'お題アプリ';
     container.appendChild(iframe);
   }
 
@@ -139,6 +439,7 @@ export function renderSandboxApp(
       iframeDoc.write(buildStandaloneSandboxHtml(spec));
       iframeDoc.close();
       syncStylesIntoIframe(iframeDoc);
+      watchParentStyles(iframe);
     }
     const specScript = iframeDoc.getElementById('ponkotsu-spec-data');
     if (specScript) {
@@ -150,27 +451,59 @@ export function renderSandboxApp(
     container.innerHTML = '';
   }
 
+  schedulePopups(spec, liveState, callbacks);
+  schedulePageTransition(spec, liveState, callbacks);
+
   const phoneScreen = targetDoc.createElement('div');
   phoneScreen.className = `phone-app-screen ${spec.theme.chaoticLayout ? 'is-chaotic' : 'is-clean'}`;
   phoneScreen.style.backgroundColor = spec.theme.bgColor || '#ffffff';
   phoneScreen.style.color = spec.theme.textColor || '#1c1917';
+  if (spec.theme.accentColor) {
+    phoneScreen.style.setProperty('--app-accent', spec.theme.accentColor);
+  }
 
   const statusBar = targetDoc.createElement('div');
   statusBar.className = 'phone-status-bar';
   statusBar.innerHTML = `
-    <span class="phone-status-time">22:30</span>
-    <span class="phone-status-pill"></span>
-    <span class="phone-status-state">${liveState.isAlarmSet ? '予約あり' : '未予約'}</span>
+    <span class="phone-status-time">12:30</span>
+    <span class="phone-status-island" aria-hidden="true"></span>
+    <span class="phone-status-icons" aria-hidden="true">
+      <span class="phone-signal"><i></i><i></i><i></i><i></i></span>
+      <span class="phone-battery"><i></i></span>
+    </span>
   `;
   phoneScreen.appendChild(statusBar);
 
+  // 購入完了・別ページへの移動中は、そのページだけを見せる
+  const page = liveState[PAGE_KEY];
+  if (page) {
+    targetDoc.documentElement.style.fontSize = `${ROOT_FONT_VW_MAX}vw`;
+    phoneScreen.appendChild(
+      renderTransientPage(
+        targetDoc,
+        page === 'complete' ? 'complete' : 'away',
+        String(liveState[PAGE_TITLE_KEY] ?? ''),
+        liveState[PAGE_PHASE_KEY] === 'loading',
+      ),
+    );
+    mountRoot.appendChild(phoneScreen);
+    return;
+  }
+
+  // 上部のナビゲーション（戻る・見出し・安全な接続の印）。見た目だけで操作はできない
   const header = targetDoc.createElement('div');
   header.className = 'sandbox-app-header';
-  const titleEl = targetDoc.createElement('h3');
-  titleEl.className = 'sandbox-app-title';
-  titleEl.textContent = spec.title;
-  header.appendChild(titleEl);
+  header.innerHTML = `
+    <span class="app-nav-back" aria-hidden="true">${CHEVRON_SVG}</span>
+    <h3 class="sandbox-app-title"></h3>
+    <span class="app-nav-lock" aria-hidden="true">${LOCK_SVG}</span>
+  `;
+  header.querySelector('.sandbox-app-title')!.textContent = spec.title;
   phoneScreen.appendChild(header);
+
+  // 画面下に固定するバー（合計金額と購入ボタンなど）
+  const stickyBar = targetDoc.createElement('div');
+  stickyBar.className = 'sandbox-sticky-bar';
 
   const overlaySlot = targetDoc.createElement('div');
   overlaySlot.className = 'phone-inapp-overlay-slot';
@@ -198,79 +531,37 @@ export function renderSandboxApp(
   };
 
   const executeActions = (actions: ComponentAction[]) => {
-    const nextState = { ...liveState };
-    let taskCompleted = false;
-    for (const act of actions) {
-      if (act.type === 'set_state' && act.targetKey) {
-        nextState[act.targetKey] = act.value ?? true;
-        if (act.targetKey === 'isAlarmSet' && (act.value === true || act.value === 'true')) {
-          taskCompleted = true;
-        }
-      } else if (act.type === 'toggle_state' && act.targetKey) {
-        nextState[act.targetKey] = !nextState[act.targetKey];
-      } else if (act.type === 'increment_state' && act.targetKey) {
-        nextState[act.targetKey] = Number(nextState[act.targetKey] ?? 0) + 1;
-      } else if (act.type === 'reset_all') {
-        for (const s of spec.state) {
-          nextState[s.key] = s.initialValue;
-        }
-      } else if (act.type === 'show_toast') {
-        callbacks.onToast(act.message || '実行しました', 'warning');
-      } else if (act.type === 'complete_task') {
-        taskCompleted = true;
-        callbacks.onToast(act.message || 'アラームを予約しました', 'success');
-      }
-    }
-    if (taskCompleted) {
+    const result = applyActions(spec, liveState, actions);
+    if (result.completed) {
       emitTaskCompletedEvent();
     }
-    callbacks.onStateChange(nextState);
+    // 購入完了・別ページへの移動はページとして見せ、少しすると最初の画面に戻る
+    if (result.completed || result.openedPage) {
+      if (result.openedPage) {
+        for (const m of result.messages) {
+          callbacks.onNotice(m.text, m.type);
+        }
+      }
+      const completion = actions.find((a) => a.type === 'complete_task');
+      callbacks.onStateChange({
+        ...result.state,
+        [PAGE_KEY]: result.completed ? 'complete' : 'away',
+        [PAGE_TITLE_KEY]: result.completed
+          ? completion?.message || '完了しました'
+          : (result.openedPage ?? ''),
+        [PAGE_PHASE_KEY]: 'show',
+      });
+      return;
+    }
+    for (const m of result.messages) {
+      callbacks.onNotice(m.text, m.type);
+    }
+    callbacks.onStateChange(result.state);
   };
 
-  const openMathQuizOverlay = (comp: AppComponent, onPass: () => void) => {
-    overlaySlot.innerHTML = '';
-    const sheet = targetDoc.createElement('div');
-    sheet.className = 'inapp-sheet';
-
-    const question = comp.behavior?.quizQuestion || '17 + 28 = ?';
-    const expected = (comp.behavior?.quizAnswer || '45').trim();
-    const expectedNum = Number(expected) || 45;
-    const choices = [String(expectedNum - 10), expected, String(expectedNum + 10)];
-
-    sheet.innerHTML = `
-      <div class="inapp-sheet-kicker">二度寝防止クイズ</div>
-      <div class="inapp-sheet-title">${escapeHtml(question)}</div>
-      <div class="inapp-sheet-sub">正解を押すと予約できます</div>
-    `;
-
-    const choiceGrid = targetDoc.createElement('div');
-    choiceGrid.className = 'inapp-quiz-choices';
-    for (const ch of choices) {
-      const cBtn = targetDoc.createElement('button');
-      cBtn.type = 'button';
-      cBtn.className = 'inapp-quiz-btn';
-      cBtn.textContent = ch;
-      cBtn.addEventListener('click', () => {
-        if (ch === expected) {
-          overlaySlot.innerHTML = '';
-          onPass();
-        } else {
-          callbacks.onToast('ちがいます。もう一度計算してみよう', 'warning');
-        }
-      });
-      choiceGrid.appendChild(cBtn);
-    }
-
-    const cancelBtn = targetDoc.createElement('button');
-    cancelBtn.type = 'button';
-    cancelBtn.className = 'inapp-sheet-cancel';
-    cancelBtn.textContent = 'とじる';
-    cancelBtn.addEventListener('click', () => {
-      overlaySlot.innerHTML = '';
-    });
-
-    sheet.append(choiceGrid, cancelBtn);
-    overlaySlot.appendChild(sheet);
+  const setValue = (key: string, raw: string | boolean) => {
+    const value = typeof raw === 'boolean' ? raw : coerceStateValue(spec, key, raw);
+    callbacks.onStateChange(withDerivedValues(spec, { ...liveState, [key]: value }));
   };
 
   const openConfirmOverlay = (comp: AppComponent, onConfirm: () => void) => {
@@ -279,7 +570,7 @@ export function renderSandboxApp(
     sheet.className = 'inapp-sheet';
     const titleDiv = targetDoc.createElement('div');
     titleDiv.className = 'inapp-sheet-title';
-    titleDiv.textContent = comp.behavior?.confirmText || 'ほんとうに消しますか？';
+    titleDiv.textContent = comp.behavior?.confirmText || 'この内容でよろしいですか？';
     sheet.appendChild(titleDiv);
     const row = targetDoc.createElement('div');
     row.className = 'inapp-confirm-row';
@@ -287,7 +578,7 @@ export function renderSandboxApp(
     const noBtn = targetDoc.createElement('button');
     noBtn.type = 'button';
     noBtn.className = 'inapp-sheet-cancel';
-    noBtn.textContent = 'やめる';
+    noBtn.textContent = 'もどる';
     noBtn.addEventListener('click', () => {
       overlaySlot.innerHTML = '';
     });
@@ -295,7 +586,7 @@ export function renderSandboxApp(
     const yesBtn = targetDoc.createElement('button');
     yesBtn.type = 'button';
     yesBtn.className = 'inapp-confirm-yes';
-    yesBtn.textContent = '消す';
+    yesBtn.textContent = 'はい';
     yesBtn.addEventListener('click', () => {
       overlaySlot.innerHTML = '';
       onConfirm();
@@ -306,8 +597,53 @@ export function renderSandboxApp(
     overlaySlot.appendChild(sheet);
   };
 
+  const renderPopup = (comp: AppComponent) => {
+    const backdrop = targetDoc.createElement('div');
+    backdrop.className = 'inapp-popup-backdrop';
+    backdrop.dataset.componentId = comp.id;
+
+    const card = targetDoc.createElement('div');
+    card.className = `inapp-popup-card variant-${comp.style.variant} ${comp.style.skin === 'intrusive' ? 'is-intrusive' : ''}`;
+
+    const closeBtn = targetDoc.createElement('button');
+    closeBtn.type = 'button';
+    closeBtn.className = `inapp-popup-close size-${comp.style.size}`;
+    closeBtn.setAttribute('aria-label', '閉じる');
+    closeBtn.textContent = '×';
+    closeBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (comp.stateKey) callbacks.onStatePatch({ [comp.stateKey]: 'closed' });
+    });
+
+    const text = targetDoc.createElement('div');
+    text.className = 'inapp-popup-text';
+    text.textContent = renderLabel(comp, liveState);
+    card.append(closeBtn, text);
+    if (comp.caption) {
+      const sub = targetDoc.createElement('div');
+      sub.className = 'inapp-popup-sub';
+      sub.textContent = renderTemplate(comp.caption, liveState, comp.style.numberFormat);
+      card.appendChild(sub);
+    }
+    if (comp.actions.some((a) => a.type === 'open_page')) {
+      const go = targetDoc.createElement('div');
+      go.className = 'inapp-popup-go';
+      go.textContent = '今すぐチェック ＞＞';
+      card.appendChild(go);
+    }
+    card.addEventListener('click', () => {
+      if (comp.actions.length > 0) executeActions(comp.actions);
+    });
+    backdrop.appendChild(card);
+    overlaySlot.appendChild(backdrop);
+  };
+
   for (const comp of spec.components) {
-    if (!shouldShowComponent(comp, liveState)) {
+    if (comp.type === 'popup') {
+      if (comp.stateKey && liveState[comp.stateKey] === 'open') renderPopup(comp);
+      continue;
+    }
+    if (!isComponentVisible(comp, liveState)) {
       continue;
     }
 
@@ -320,159 +656,155 @@ export function renderSandboxApp(
       `align-${comp.style.align || 'left'}`,
       comp.style.fullWidth ? 'is-full' : '',
       comp.style.noisyAnimation ? 'is-noisy' : '',
+      comp.style.skin === 'intrusive' ? 'is-intrusive' : '',
+      comp.style.sticky ? 'is-sticky' : '',
       selectedComponentIds.has(comp.id) ? 'is-circled-target' : '',
     ]
       .filter(Boolean)
       .join(' ');
     itemWrap.dataset.componentId = comp.id;
-
-    if (selectedComponentIds.has(comp.id)) {
-      const targetBadge = targetDoc.createElement('div');
-      targetBadge.className = 'circled-badge';
-      targetBadge.textContent = '選択中';
-      itemWrap.appendChild(targetBadge);
+    itemWrap.dataset.role = comp.role;
+    if (comp.style.rotateDeg) {
+      itemWrap.style.transform = `rotate(${comp.style.rotateDeg}deg)`;
     }
+    const label = renderLabel(comp, liveState);
 
-    if (comp.type === 'clock_display') {
-      const clockFace = targetDoc.createElement('div');
-      clockFace.className = `alarm-clock-face ${liveState.isAlarmSet ? 'is-set' : ''}`;
+    const caption = comp.caption
+      ? renderTemplate(comp.caption, liveState, comp.style.numberFormat)
+      : '';
 
-      const topRow = targetDoc.createElement('div');
-      topRow.className = 'alarm-clock-top';
-      const labelEl = targetDoc.createElement('span');
-      labelEl.className = 'comp-clock-label';
-      labelEl.textContent = comp.label;
-      const stateTag = targetDoc.createElement('span');
-      stateTag.className = `alarm-state-dot ${liveState.isAlarmSet ? 'on' : 'off'}`;
-      stateTag.textContent = liveState.isAlarmSet ? '予約中' : '未予約';
-      topRow.append(labelEl, stateTag);
-
-      const rawTime = comp.stateKey ? String(liveState[comp.stateKey] ?? '07:00') : '07:00';
-      const displayTime = rawTime.slice(0, 5);
-
-      const valueEl = targetDoc.createElement('div');
-      valueEl.className = 'comp-clock-value';
-      valueEl.textContent = displayTime;
-
-      clockFace.append(topRow, valueEl);
-      itemWrap.appendChild(clockFace);
-    } else if (comp.type === 'input' || comp.type === 'select') {
-      const isTimeControl = comp.stateKey === 'alarmTime' || comp.id.includes('time');
-      if (isTimeControl) {
-        const dialWrap = targetDoc.createElement('div');
-        dialWrap.className = 'alarm-time-dial';
-
-        const labelRow = targetDoc.createElement('div');
-        labelRow.className = 'comp-field-label';
-        labelRow.textContent = comp.label;
-        dialWrap.appendChild(labelRow);
-
-        const stepperRow = targetDoc.createElement('div');
-        stepperRow.className = 'time-stepper-row';
-        const steps = [
-          { label: '-1時間', delta: -60 },
-          { label: '-10分', delta: -10 },
-          { label: '+10分', delta: 10 },
-          { label: '+1時間', delta: 60 },
-        ];
-        for (const st of steps) {
-          const sBtn = targetDoc.createElement('button');
-          sBtn.type = 'button';
-          sBtn.className = 'time-step-btn';
-          sBtn.textContent = st.label;
-          sBtn.addEventListener('click', () => {
-            const cur = String(liveState.alarmTime ?? '07:00');
-            callbacks.onStateChange({
-              ...liveState,
-              alarmTime: adjustTimeString(cur, st.delta),
-            });
-          });
-          stepperRow.appendChild(sBtn);
-        }
-        dialWrap.appendChild(stepperRow);
-        itemWrap.appendChild(dialWrap);
-      } else {
-        const gaugeWrap = targetDoc.createElement('div');
-        gaugeWrap.className = 'clutter-gauge-widget';
-        const labelEl = targetDoc.createElement('div');
-        labelEl.className = 'comp-field-label';
-        labelEl.textContent = comp.label;
-
-        const levelRow = targetDoc.createElement('div');
-        levelRow.className = 'clutter-level-row';
-        for (const lv of ['低', 'やや低', '普通', '高', '最高']) {
-          const lvBtn = targetDoc.createElement('button');
-          lvBtn.type = 'button';
-          lvBtn.className = `clutter-level-btn ${liveState[comp.stateKey ?? ''] === lv ? 'active' : ''}`;
-          lvBtn.textContent = lv;
-          lvBtn.addEventListener('click', () => {
-            if (comp.stateKey) {
-              callbacks.onStateChange({ ...liveState, [comp.stateKey]: lv });
-            }
-          });
-          levelRow.appendChild(lvBtn);
-        }
-        gaugeWrap.append(labelEl, levelRow);
-        itemWrap.appendChild(gaugeWrap);
+    if (comp.type === 'product_card') {
+      itemWrap.appendChild(renderProductCard(targetDoc, comp, liveState, label, caption, setValue));
+    } else if (comp.type === 'progress_steps') {
+      itemWrap.appendChild(renderProgressSteps(targetDoc, comp, label));
+    } else if (comp.type === 'choice_cards') {
+      itemWrap.appendChild(renderChoiceCards(targetDoc, comp, liveState, setValue));
+    } else if (comp.type === 'summary') {
+      const list = targetDoc.createElement('div');
+      list.className = 'comp-summary';
+      for (const row of comp.rows ?? []) {
+        const line = targetDoc.createElement('div');
+        line.className = 'comp-summary-row';
+        const k = targetDoc.createElement('span');
+        k.textContent = renderTemplate(row.label, liveState, comp.style.numberFormat);
+        const v = targetDoc.createElement('span');
+        v.textContent = renderTemplate(row.value, liveState, comp.style.numberFormat);
+        line.append(k, v);
+        list.appendChild(line);
       }
+      itemWrap.appendChild(list);
+    } else if (comp.type === 'product_hero') {
+      const hero = targetDoc.createElement('div');
+      hero.className = 'comp-product-hero';
+      const icon = targetDoc.createElement('div');
+      icon.className = 'comp-product-icon';
+      icon.textContent = comp.icon ?? '🛍️';
+      const name = targetDoc.createElement('div');
+      name.className = 'comp-product-name';
+      name.textContent = label;
+      hero.append(icon, name);
+      itemWrap.appendChild(hero);
+    } else if (comp.type === 'select') {
+      const field = targetDoc.createElement('label');
+      field.className = 'comp-field';
+      const labelEl = targetDoc.createElement('span');
+      labelEl.className = 'comp-field-label';
+      labelEl.textContent = label;
+      const select = targetDoc.createElement('select');
+      select.className = 'comp-select';
+      const current = comp.stateKey ? String(liveState[comp.stateKey] ?? '') : '';
+      for (const opt of comp.options ?? []) {
+        const option = targetDoc.createElement('option');
+        option.value = opt;
+        option.textContent = opt;
+        option.selected = opt === current;
+        select.appendChild(option);
+      }
+      select.addEventListener('change', () => {
+        if (comp.stateKey) setValue(comp.stateKey, select.value);
+      });
+      field.append(labelEl, select);
+      itemWrap.appendChild(field);
+    } else if (comp.type === 'input') {
+      const field = targetDoc.createElement('label');
+      field.className = 'comp-field';
+      const labelEl = targetDoc.createElement('span');
+      labelEl.className = 'comp-field-label';
+      labelEl.textContent = label;
+      const input = targetDoc.createElement('input');
+      input.type = 'text';
+      input.className = 'comp-input';
+      input.placeholder = comp.placeholder ?? '';
+      input.value = comp.stateKey ? String(liveState[comp.stateKey] ?? '') : '';
+      // 入力のたびに画面を描き直すと入力中の文字が消えるため、確定時（フォーカスが外れたとき）に反映する
+      input.addEventListener('change', () => {
+        if (comp.stateKey) setValue(comp.stateKey, input.value);
+      });
+      field.append(labelEl, input);
+      if (caption) {
+        const note = targetDoc.createElement('span');
+        note.className = 'comp-field-note';
+        note.textContent = caption;
+        field.appendChild(note);
+      }
+      itemWrap.appendChild(field);
+    } else if (comp.type === 'checkbox' || comp.type === 'toggle') {
+      const isChecked = comp.stateKey ? Boolean(liveState[comp.stateKey]) : false;
+      const row = targetDoc.createElement('label');
+      row.className = comp.type === 'checkbox' ? 'comp-checkbox-row' : 'ios-toggle-row';
+      if (comp.type === 'checkbox') {
+        const box = targetDoc.createElement('input');
+        box.type = 'checkbox';
+        box.className = 'comp-checkbox';
+        box.checked = isChecked;
+        box.addEventListener('change', () => {
+          if (comp.stateKey) setValue(comp.stateKey, box.checked);
+        });
+        const text = targetDoc.createElement('span');
+        text.textContent = label;
+        row.append(box, text);
+      } else {
+        const text = targetDoc.createElement('span');
+        text.className = 'ios-toggle-label';
+        text.textContent = label;
+        const pill = targetDoc.createElement('button');
+        pill.type = 'button';
+        pill.className = `ios-switch ${isChecked ? 'is-on' : ''}`;
+        pill.innerHTML = '<span class="ios-switch-knob"></span>';
+        pill.addEventListener('click', () => {
+          if (comp.stateKey) setValue(comp.stateKey, !isChecked);
+        });
+        row.append(text, pill);
+      }
+      itemWrap.appendChild(row);
     } else if (comp.type === 'slider') {
-      const sliderWrap = targetDoc.createElement('div');
-      sliderWrap.className = 'clutter-slider-widget';
-      const currentVal = Number(comp.stateKey ? liveState[comp.stateKey] : 20) || 20;
-      const headRow = targetDoc.createElement('div');
-      headRow.className = 'slider-head-row';
-      headRow.innerHTML = `<span class="comp-field-label">${escapeHtml(comp.label)}</span><span class="slider-val">${currentVal}%</span>`;
-
+      const field = targetDoc.createElement('label');
+      field.className = 'comp-field';
+      const current = Number(comp.stateKey ? liveState[comp.stateKey] : 0) || 0;
+      const head = targetDoc.createElement('span');
+      head.className = 'comp-field-label';
+      head.textContent = `${label} ${current}`;
       const range = targetDoc.createElement('input');
       range.type = 'range';
       range.min = '0';
       range.max = '100';
-      range.step = '20';
-      range.value = String(currentVal);
+      range.value = String(current);
       range.className = 'comp-range-slider';
       range.addEventListener('change', () => {
-        if (comp.stateKey) {
-          callbacks.onStateChange({
-            ...liveState,
-            [comp.stateKey]: Number(range.value),
-          });
-        }
+        if (comp.stateKey) setValue(comp.stateKey, range.value);
       });
-      sliderWrap.append(headRow, range);
-      itemWrap.appendChild(sliderWrap);
-    } else if (comp.type === 'toggle') {
-      const isChecked = comp.stateKey ? Boolean(liveState[comp.stateKey]) : false;
-      const row = targetDoc.createElement('div');
-      row.className = 'ios-toggle-row';
-      const labelSpan = targetDoc.createElement('span');
-      labelSpan.className = 'ios-toggle-label';
-      labelSpan.textContent = comp.label;
-
-      const pill = targetDoc.createElement('button');
-      pill.type = 'button';
-      pill.className = `ios-switch ${isChecked ? 'is-on' : ''}`;
-      pill.innerHTML = `<span class="ios-switch-knob"></span>`;
-      pill.addEventListener('click', () => {
-        if (comp.stateKey) {
-          callbacks.onStateChange({
-            ...liveState,
-            [comp.stateKey]: !isChecked,
-          });
-        }
-      });
-
-      row.append(labelSpan, pill);
-      itemWrap.appendChild(row);
+      field.append(head, range);
+      itemWrap.appendChild(field);
     } else if (comp.type === 'status_banner') {
       const banner = targetDoc.createElement('div');
       banner.className = 'comp-status-banner';
-      banner.textContent = comp.label;
+      banner.textContent = label;
       itemWrap.appendChild(banner);
     } else if (comp.type === 'button') {
       const btn = targetDoc.createElement('button');
       btn.type = 'button';
       btn.className = 'comp-button';
-      btn.textContent = comp.label;
+      btn.textContent = label;
 
       let clickCount = 0;
       let escapedOnce = false;
@@ -482,10 +814,10 @@ export function renderSandboxApp(
 
         if (effect === 'escape_on_hover' && !escapedOnce) {
           escapedOnce = true;
-          const offsetX = (Math.random() > 0.5 ? 1 : -1) * 42;
-          const offsetY = -10;
-          btn.style.transform = `translate(${offsetX}px, ${offsetY}px)`;
-          callbacks.onToast('ボタンが逃げた！もう一度押して捕まえよう', 'info');
+          // スマホの大きさに合わせて逃げる距離も変わるよう rem で動かす
+          const offsetX = (Math.random() > 0.5 ? 1 : -1) * 2.6;
+          btn.style.transform = `translate(${offsetX}rem, -0.6rem)`;
+          callbacks.onNotice('ボタンが逃げました。もう一度押してください', 'info');
           return;
         }
         btn.style.transform = '';
@@ -493,36 +825,20 @@ export function renderSandboxApp(
         if (effect === 'require_3_clicks') {
           clickCount++;
           if (clickCount < 3) {
-            btn.textContent = `${comp.label} あと${3 - clickCount}回`;
-            callbacks.onToast(`あと ${3 - clickCount} 回押すとロック解除`, 'info');
+            btn.textContent = `${label} あと${3 - clickCount}回`;
             return;
           }
           clickCount = 0;
-          btn.textContent = comp.label;
+          btn.textContent = label;
         }
 
-        if (effect === 'tts_voice_alarm') {
-          playAlarmBeep();
-          speakTextWithTts(
-            comp.behavior?.voiceText || '朝ですよ！起きてください！アラームを予約しました！',
-            { pitch: 1.1, rate: 1.05 },
-          );
-        } else if (effect === 'play_alarm_sound') {
-          playAlarmBeep();
+        if (comp.actions.length === 0) {
+          callbacks.onNotice(`${label}を押しても反応がありません`, 'warning');
+          return;
         }
 
         if (effect === 'confirm_dialog') {
           openConfirmOverlay(comp, () => executeActions(comp.actions));
-          return;
-        }
-
-        if (effect === 'math_quiz_gate') {
-          openMathQuizOverlay(comp, () => executeActions(comp.actions));
-          return;
-        }
-
-        if (comp.actions.length === 0) {
-          callbacks.onToast('押しても反応がありません', 'warning');
           return;
         }
 
@@ -531,15 +847,25 @@ export function renderSandboxApp(
 
       itemWrap.appendChild(btn);
     } else {
+      if (caption) {
+        const cap = targetDoc.createElement('div');
+        cap.className = 'comp-caption';
+        cap.textContent = caption;
+        itemWrap.appendChild(cap);
+      }
       const txt = targetDoc.createElement('div');
-      txt.className = 'comp-text';
-      txt.textContent = comp.label;
+      txt.className = comp.type === 'heading' ? 'comp-heading' : 'comp-text';
+      txt.textContent = label;
       itemWrap.appendChild(txt);
     }
 
-    body.appendChild(itemWrap);
+    (comp.style.sticky ? stickyBar : body).appendChild(itemWrap);
   }
 
-  phoneScreen.append(body, overlaySlot);
+  phoneScreen.append(body);
+  if (stickyBar.childElementCount > 0) phoneScreen.append(stickyBar);
+  phoneScreen.append(overlaySlot);
   mountRoot.appendChild(phoneScreen);
+  body.addEventListener('scroll', () => updateScrollHint(body), { passive: true });
+  scheduleFit(iframeDoc ? iframe : null, targetDoc, body);
 }

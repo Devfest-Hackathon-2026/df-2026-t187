@@ -1,3 +1,4 @@
+import { renderLabel } from '../shared/appRuntime.ts';
 import type { AppSpec, StateValue } from '../shared/types.ts';
 import { querySandboxComponentElements } from './sandboxRenderer.ts';
 
@@ -95,9 +96,11 @@ export function captureSandboxSnapshot(
     const fontSize = fontSizes[comp.style.size] ?? 14;
     ctx.fillStyle = palette.fg;
     ctx.font = `bold ${fontSize}px sans-serif`;
-    const stateVal = comp.stateKey ? liveState[comp.stateKey] : undefined;
-    const displayLabel =
-      stateVal !== undefined ? `${comp.label}: ${String(stateVal)}` : comp.label;
+    // 入力欄は選ばれている値も一緒に描く。ラベル内の {状態キー} は現在の値に置き換える
+    const label = renderLabel(comp, liveState);
+    const isField = ['select', 'input', 'checkbox', 'toggle', 'slider'].includes(comp.type);
+    const stateVal = isField && comp.stateKey ? liveState[comp.stateKey] : undefined;
+    const displayLabel = stateVal !== undefined ? `${label}: ${String(stateVal)}` : label;
     ctx.fillText(displayLabel.slice(0, 36), x + 12, y + Math.min(h - 8, fontSize + 12));
   }
 

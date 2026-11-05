@@ -12,17 +12,28 @@ export interface AppStateVar {
   initialValue: StateValue;
 }
 
+/**
+ * - progress_steps: 手順の表示。options が手順名、label が今の手順
+ * - product_card: 商品カード。label が商品名、badge・caption・priceLabel を添え、stateKey の数量を±ボタンで変える
+ * - choice_cards: 選べるカード。options が選択肢、optionDetails が各選択肢の補足
+ * - summary: 金額の内訳。rows に行を並べる
+ */
 export type ComponentType =
   | 'heading'
   | 'text'
-  | 'clock_display'
+  | 'product_hero'
+  | 'product_card'
+  | 'progress_steps'
+  | 'choice_cards'
+  | 'summary'
   | 'input'
   | 'select'
+  | 'checkbox'
   | 'toggle'
   | 'slider'
   | 'button'
-  | 'quiz_box'
-  | 'status_banner';
+  | 'status_banner'
+  | 'popup';
 
 export type ComponentSize = 'xs' | 'sm' | 'md' | 'lg' | 'xl';
 export type ComponentVariant = 'default' | 'primary' | 'danger' | 'warning' | 'success' | 'muted';
@@ -33,24 +44,24 @@ export interface ComponentStyle {
   align?: 'left' | 'center' | 'right';
   fullWidth?: boolean;
   noisyAnimation?: boolean;
+  /** 部品を傾ける角度（度）。0 または未指定でまっすぐ */
+  rotateDeg?: number;
+  /** ラベル内の {状態キー} に差し込む数値の表記。kanji で漢数字にする */
+  numberFormat?: 'arabic' | 'kanji';
+  /** true なら画面下に固定したバーに置く（合計金額と購入ボタンなど） */
+  sticky?: boolean;
+  /**
+   * 見た目の系統。native は元のデザインに揃える。
+   * intrusive は後から付け足されたように、元のデザインの決まりを無視した見た目で描く
+   */
+  skin?: 'native' | 'intrusive';
 }
 
-export type BehaviorEffect =
-  | 'none'
-  | 'escape_on_hover'
-  | 'require_3_clicks'
-  | 'math_quiz_gate'
-  | 'confirm_dialog'
-  | 'play_alarm_sound'
-  | 'tts_voice_alarm'
-  | 'vibrate_shake';
+export type BehaviorEffect = 'none' | 'escape_on_hover' | 'require_3_clicks' | 'confirm_dialog';
 
 export interface ComponentBehavior {
   effect: BehaviorEffect;
-  quizQuestion?: string;
-  quizAnswer?: string;
   confirmText?: string;
-  voiceText?: string;
 }
 
 export type ActionType =
@@ -59,8 +70,13 @@ export type ActionType =
   | 'increment_state'
   | 'reset_all'
   | 'show_toast'
+  | 'open_page'
   | 'complete_task';
 
+/**
+ * - open_page: 別のページに飛ばす。message がそのページの見出しになり、少しすると最初の画面に戻る
+ * - complete_task: タスク完了。message が完了ページの見出しになり、少しすると最初の画面に戻る
+ */
 export interface ComponentAction {
   type: ActionType;
   targetKey?: string;
@@ -74,16 +90,58 @@ export interface VisibilityCondition {
   value: StateValue;
 }
 
+/**
+ * 部品が画面の中で果たす役割。操作シミュレーターは部品のIDではなく役割を見て判定する。
+ * - primary_action: タスクを先へ進める本物のボタン（complete_task を持つもの、確認画面へ進むもの）
+ * - decoy: 本物らしく見えるが押しても何も起きないおとり
+ * - danger: 押すと入力が消えるなど、誤って押すと離脱につながるボタン
+ * - required_input: タスク完了までに入力が必要な欄。値が空か placeholder と同じなら未入力
+ * - distraction: タスクと関係ない項目や煽り表示
+ * - trap: 気づかずに完了すると後悔につながる項目（最初からチェックの入った定期便など）
+ * - total: 支払う合計金額などタスクの結果を示す表示
+ * - popup: 時間差で画面を覆う広告など
+ * - info: 上記以外の説明表示
+ */
+export type ComponentRole =
+  | 'primary_action'
+  | 'decoy'
+  | 'danger'
+  | 'required_input'
+  | 'distraction'
+  | 'trap'
+  | 'total'
+  | 'popup'
+  | 'info';
+
 export interface AppComponent {
   id: string;
   type: ComponentType;
+  role: ComponentRole;
   label: string;
+  /** product_hero・product_card に表示する絵。coffee_bag ならコーヒー袋のイラスト、それ以外は絵文字として描く */
+  icon?: string;
+  /** product_card の上に添える小さな札（例: 深煎り・ブラジル） */
+  badge?: string;
+  /** label の下に添える補足。{状態キー} を差し込める */
+  caption?: string;
+  /** product_card の値段。{状態キー} を差し込める（例: ¥{unitPrice}） */
+  priceLabel?: string;
+  /** choice_cards の各選択肢の補足（options と同じ順番） */
+  optionDetails?: string[];
+  /** summary の行。label と value に {状態キー} を差し込める */
+  rows?: Array<{ label: string; value: string }>;
   placeholder?: string;
   options?: string[];
   stateKey?: string;
   style: ComponentStyle;
   behavior?: ComponentBehavior;
   visibleWhen?: VisibilityCondition;
+  /** role が trap のとき、この条件が成り立ったまま完了すると後悔につながる */
+  trapWhen?: VisibilityCondition;
+  /** role が trap のとき、気づいた人が直す値。未指定なら気づいても直せない（承知のうえで進む） */
+  trapSafeValue?: StateValue;
+  /** popup が現れるまでの時間の範囲（ミリ秒）。この範囲でランダムに現れる */
+  popupDelayMs?: { min: number; max: number };
   actions: ComponentAction[];
 }
 
@@ -95,6 +153,12 @@ export interface AppTheme {
   chaoticLayout: boolean;
 }
 
+/** 状態から計算して求める値（合計金額など）。式は四則演算・比較・三項演算子のみ */
+export interface DerivedValue {
+  key: string;
+  expression: string;
+}
+
 export interface AppSpec {
   id: string;
   title: string;
@@ -102,11 +166,12 @@ export interface AppSpec {
   taskDescription: string;
   theme: AppTheme;
   state: AppStateVar[];
+  derived?: DerivedValue[];
   components: AppComponent[];
 }
 
-// 顧客層 (3層) と 9人のペルソナ＋制約変数 (企画書 2章: 層の中の3人と制約変数 / 選択9・10)
-export type TargetCohortId = 'elderly' | 'office_worker' | 'student';
+// 顧客層とペルソナ＋制約変数（題材ごとに定義する）
+export type TargetCohortId = string;
 
 export interface TargetCohortInfo {
   id: TargetCohortId;
@@ -126,13 +191,15 @@ export interface PersonaConstraints {
   /** 待てる時間(ms): 操作完了までに許容する最大時間 */
   patienceMs: number;
   /** 使用環境タグ */
-  environment: 'normal' | 'one_hand' | 'moving_train' | 'dark_room';
-  /** 二度寝防止の仕掛け（クイズ・逃げるボタン・連打・声アラーム等）が必須か */
-  requiresWakeGimmick?: boolean;
-  /** TTS読み上げ時の声の高さ (0.5 - 1.5) */
-  voicePitch: number;
-  /** TTS読み上げ時の話す速さ (0.7 - 1.4) */
-  voiceRate: number;
+  environment: 'normal' | 'one_hand' | 'moving_train';
+  /** 関係ない項目・煽り表示・広告をいくつまで無視できるか */
+  clutterTolerance: number;
+  /** 細かい文字やチェック欄まで読む。読める大きさなら罠に気づける */
+  readsFinePrint: boolean;
+  /** 完了前に確認の機会がないと不安で押せない */
+  wantsConfirmation: boolean;
+  /** 合計金額がすぐ読めないと完了しない */
+  needsReadableTotal: boolean;
 }
 
 export interface ReviewerPersona {
@@ -144,6 +211,8 @@ export interface ReviewerPersona {
   role: string;
   icon: string;
   goal: string;
+  /** 来店時にお客さん本人が話す一言（口語） */
+  greeting: string;
   focusPoint: string;
   constraints: PersonaConstraints;
 }
@@ -157,9 +226,12 @@ export interface ReviewerDispositionRecord {
   decidedAt: string;
 }
 
+/** 達成・離脱に加え、完了はできたが罠に気づかず後悔したケースを区別する */
+export type ReviewOutcome = 'achieved' | 'abandoned' | 'regretted';
+
 export interface ReviewerEvaluation {
   reviewerId: string;
-  outcome: 'achieved' | 'abandoned';
+  outcome: ReviewOutcome;
   frictionPoint: string;
   comment: string;
   /** Computer Use 実操作シミュレーションの軌跡ログ */
@@ -168,15 +240,25 @@ export interface ReviewerEvaluation {
   appliedConstraintNote?: string;
 }
 
+/** 店長が採点のたびに見る、お店の側の結果 */
+export interface OwnerReport {
+  /** 注文してくれた人数（後悔した人も注文は入っている） */
+  orders: number;
+  customers: number;
+  metrics: Array<{ label: string; count: number; missing: boolean }>;
+  /** 店長の一言 */
+  comment: string;
+}
+
 export interface EvaluationResponse {
   evaluatedAt: string;
-  source: 'gemini' | 'fallback';
   cohortId?: TargetCohortId;
   results: ReviewerEvaluation[];
+  owner?: OwnerReport;
 }
 
 // 人間の判断記録 (Own the Why / Function Calling で構造化記録)
-export type DecisionStage = 'select_cohort' | 'select_tradeoff' | 'review_disposition';
+export type DecisionStage = 'select_cohort' | 'apply_change' | 'review_disposition';
 
 export interface HumanDecisionRecord {
   id: string;
@@ -206,33 +288,31 @@ export interface SandboxValidationResult {
   valid: boolean;
   canRenderHtml: boolean;
   hasTaskCompletionEvent: boolean;
+  untouchedComponentsIntact?: boolean;
   errors: string[];
 }
 
-// 壁打ち(選択肢提示) API の入出力
-export interface TradeoffOption {
-  id: string;
-  title: string;
-  summary: string;
-  uiChange: string;
-  logicChange: string;
-  pros: string;
-  tradeoff: string;
-}
+// 差分パッチ操作（案B: 変更箇所だけを適用し、触っていない部品を保護する）
+export type SpecPatchOp =
+  | 'remove_component'
+  | 'replace_component'
+  | 'insert_component'
+  | 'move_component'
+  | 'upsert_state'
+  | 'upsert_derived';
 
-export interface ProposeRequest {
-  currentSpec: AppSpec;
-  targetComponentIds: string[];
-  userInstruction: string;
-  cohortId?: TargetCohortId;
-  annotatedImageBase64?: string;
-}
+export type SpecPatch =
+  | { op: 'remove_component'; id: string }
+  | { op: 'replace_component'; component: AppComponent }
+  | { op: 'insert_component'; afterId?: string | null; component: AppComponent }
+  | { op: 'move_component'; id: string; afterId?: string | null }
+  | { op: 'upsert_state'; variable: AppStateVar }
+  | { op: 'upsert_derived'; key: string; expression: string };
 
-export interface ProposeResponse {
-  source: 'gemini' | 'fallback';
-  analysis: string;
-  question: string;
-  options: TradeoffOption[];
+/** AIに渡す直近の会話（発言者名と本文） */
+export interface ChatHistoryEntry {
+  speaker: string;
+  text: string;
 }
 
 // 改修反映 API の入出力
@@ -240,18 +320,17 @@ export interface ApplyRequest {
   currentSpec: AppSpec;
   targetComponentIds: string[];
   userInstruction: string;
-  selectedOption: TradeoffOption;
   selectionReason?: string;
   cohortId?: TargetCohortId;
-  customNote?: string;
   annotatedImageBase64?: string;
+  history?: ChatHistoryEntry[];
 }
 
 export interface ApplyResponse {
-  source: 'gemini' | 'fallback';
   commitMessage: string;
-  changeHighlights: string[];
   updatedSpec: AppSpec;
+  patches?: SpecPatch[];
+  ownerReaction?: string;
   validation?: SandboxValidationResult;
   rolledBack?: boolean;
   decisionRecord?: HumanDecisionRecord;
@@ -272,21 +351,14 @@ export interface Checkpoint {
   id: string;
   stepNumber: number;
   commitMessage: string;
-  changeHighlights: string[];
   createdAt: string;
   spec: AppSpec;
   evaluation?: EvaluationResponse;
 }
 
 // 自由対話タイムライン型ハイブリッド壁打ち API
-export type ChatIntent = 'explain' | 'direct_apply' | 'tradeoff_propose';
-
-export interface InspectedComponentInfo {
-  id: string;
-  label: string;
-  howItWorks: string;
-  issueOrHint: string;
-}
+/** explain は質問への回答、clarify は曖昧な発言への聞き返し、apply は改修の実行 */
+export type ChatIntent = 'explain' | 'clarify' | 'apply';
 
 export interface ChatRequest {
   currentSpec: AppSpec;
@@ -294,20 +366,12 @@ export interface ChatRequest {
   userMessage: string;
   cohortId?: TargetCohortId;
   annotatedImageBase64?: string;
+  history?: ChatHistoryEntry[];
 }
 
 export interface ChatResponse {
-  source: 'gemini' | 'fallback';
   intent: ChatIntent;
   reply: string;
   suggestedFollowUps: string[];
-  inspectedComponents?: InspectedComponentInfo[];
-  appliedResult?: {
-    commitMessage: string;
-    changeHighlights: string[];
-    updatedSpec: AppSpec;
-    validation?: SandboxValidationResult;
-    rolledBack?: boolean;
-  };
-  options?: TradeoffOption[];
+  applied?: ApplyResponse;
 }

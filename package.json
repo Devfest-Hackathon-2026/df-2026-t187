@@ -9,7 +9,7 @@
     "start": "node src/server/index.ts",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
-    "test": "PONKOTSU_FORCE_FALLBACK=1 node --test \"test/**/*.test.ts\"",
+    "test": "GEMINI_API_KEY= GOOGLE_CLOUD_PROJECT= node --test \"test/**/*.test.ts\"",
     "check:hygiene": "node scripts/check-hygiene.mjs",
     "setup:gcp": "bash scripts/setup-gcp.sh",
     "prepare": "git config core.hooksPath .githooks || true"

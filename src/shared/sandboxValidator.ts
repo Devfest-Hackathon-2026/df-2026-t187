@@ -1,8 +1,20 @@
+import {
+  applyActions,
+  createInitialState,
+  evaluateExpression,
+  hasCompletionAction,
+  isComponentVisible,
+  isInputFilled,
+  matchesCondition,
+  type AppState,
+} from './appRuntime.ts';
 import type {
   AppComponent,
   AppSpec,
   ComponentBoundsInput,
+  ComponentSize,
   ReviewerPersona,
+  ReviewOutcome,
   SandboxValidationResult,
 } from './types.ts';
 
@@ -20,7 +32,7 @@ export function escapeHtml(raw: string): string {
  * タスク完了時には window.parent.postMessage({ type: 'PONKOTSU_TASK_COMPLETED' }, '*') を発火する。
  */
 export function buildStandaloneSandboxHtml(spec: AppSpec): string {
-  const safeTitle = escapeHtml(spec.title || '目覚まし時計');
+  const safeTitle = escapeHtml(spec.title || 'お題アプリ');
   const bg = escapeHtml(spec.theme?.bgColor || '#ffffff');
   const fg = escapeHtml(spec.theme?.textColor || '#1c1917');
   const serializedSpec = JSON.stringify(spec).replace(/</g, '\\u003c');
@@ -33,6 +45,8 @@ export function buildStandaloneSandboxHtml(spec: AppSpec): string {
   <title>${safeTitle}</title>
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
+    /* スマホ画面の幅に合わせて文字の基準を伸び縮みさせ、端末が大きく表示されたら中身も大きくする */
+    html { font-size: 4.2vw; }
     html, body {
       width: 100%;
       height: 100%;
@@ -54,12 +68,19 @@ export function buildStandaloneSandboxHtml(spec: AppSpec): string {
 </html>`;
 }
 
+export interface ValidateSandboxOptions {
+  requireTaskCompletionEvent?: boolean;
+  previousSpec?: AppSpec;
+  touchedComponentIds?: ReadonlySet<string>;
+}
+
 /**
- * 改修後の AppSpec が単一HTMLとして描画可能か、またタスク完了イベントが発火可能かを検証する。
+ * 改修後の AppSpec が単一HTMLとして描画可能か、タスク完了イベントが残っているか、
+ * またパッチ対象外の部品が勝手に書き換わっていないかを検証する。
  */
 export function validateSandboxSpec(
   spec: AppSpec,
-  options: { requireTaskCompletionEvent?: boolean } = {},
+  options: ValidateSandboxOptions = {},
 ): SandboxValidationResult {
   const errors: string[] = [];
 
@@ -68,6 +89,7 @@ export function validateSandboxSpec(
       valid: false,
       canRenderHtml: false,
       hasTaskCompletionEvent: false,
+      untouchedComponentsIntact: false,
       errors: ['アプリ仕様データが空または不正です'],
     };
   }
@@ -90,40 +112,74 @@ export function validateSandboxSpec(
     errors.push('単一HTMLの組み立てに失敗しました');
   }
 
-  // タスク完了イベント（アラーム予約完了アクション）が存在するかチェック
+  // タスク完了イベント（complete_task を持つボタン）が存在するかチェック
   const hasTaskCompletionEvent = Array.isArray(spec.components)
     ? spec.components.some(
-        (c) =>
-          c.type === 'button' &&
-          Array.isArray(c.actions) &&
-          c.actions.some(
-            (a) =>
-              a.type === 'complete_task' ||
-              (a.type === 'set_state' &&
-                a.targetKey === 'isAlarmSet' &&
-                (a.value === true || a.value === 'true')),
-          ),
+        (c) => c.type === 'button' && Array.isArray(c.actions) && hasCompletionAction(c),
       )
     : false;
 
   if (options.requireTaskCompletionEvent && !hasTaskCompletionEvent) {
-    errors.push('タスク完了イベント（アラーム予約完了処理）が見つかりません');
+    errors.push('タスク完了イベント complete_task を持つボタンが見つかりません');
+  }
+
+  // 計算式が読めるか・部品が参照している状態キーが存在するか
+  if (Array.isArray(spec.state)) {
+    const state = Object.fromEntries(spec.state.map((v) => [v.key, v.initialValue]));
+    const knownKeys = new Set<string>(spec.state.map((v) => v.key));
+    for (const d of spec.derived ?? []) {
+      knownKeys.add(d.key);
+      try {
+        evaluateExpression(d.expression, state);
+      } catch {
+        errors.push(`計算式 ${d.key} を読めません`);
+      }
+    }
+    for (const comp of spec.components ?? []) {
+      if (comp.stateKey && !knownKeys.has(comp.stateKey)) {
+        errors.push(`部品 ${comp.id} が参照する状態キー ${comp.stateKey} が定義されていません`);
+      }
+      if (comp.visibleWhen?.stateKey && !knownKeys.has(comp.visibleWhen.stateKey)) {
+        errors.push(`部品 ${comp.id} の表示条件キー ${comp.visibleWhen.stateKey} が定義されていません`);
+      }
+    }
+  }
+
+  // パッチ対象外の部品が変わっていないかチェック
+  let untouchedComponentsIntact = true;
+  if (options.previousSpec && options.touchedComponentIds && Array.isArray(spec.components)) {
+    for (const prevComp of options.previousSpec.components) {
+      if (options.touchedComponentIds.has(prevComp.id)) continue;
+      const nextComp = spec.components.find((c) => c.id === prevComp.id);
+      if (!nextComp || JSON.stringify(nextComp) !== JSON.stringify(prevComp)) {
+        untouchedComponentsIntact = false;
+        errors.push(`変更対象外の部品 ${prevComp.id} が書き換わっています`);
+      }
+    }
   }
 
   return {
     valid: errors.length === 0 && canRenderHtml,
     canRenderHtml,
     hasTaskCompletionEvent,
+    untouchedComponentsIntact,
     errors,
   };
 }
 
+
+// ============================================================================
+// 操作シミュレーター
+// ============================================================================
+
 export interface ComputerUseSimulationResult {
-  outcome: 'achieved' | 'abandoned';
+  outcome: ReviewOutcome;
   frictionPoint: string;
-  fallbackComment: string;
+  simulatedComment: string;
   actionTrace: string[];
   appliedConstraintNote: string;
+  /** 完了したときの状態（定期便に入ったままか等、お店の側の集計に使う） */
+  finalState?: AppState;
 }
 
 interface SimulatedBox {
@@ -138,75 +194,105 @@ interface SimulatedBox {
   height: number;
 }
 
+const SCREEN_WIDTH = 320;
+const HEIGHT_BY_SIZE: Record<ComponentSize, number> = { xs: 26, sm: 34, md: 44, lg: 56, xl: 68 };
+const SIZE_RANK: Record<ComponentSize, number> = { xs: 0, sm: 1, md: 2, lg: 3, xl: 4 };
+/** 片手の親指が届く横位置の上限 */
+const ONE_HAND_REACH_X = 230;
+/** 1手あたりの操作時間・邪魔な表示1つあたり・漢数字を読む時間・ポップアップを閉じる時間（ミリ秒） */
+const MS_PER_STEP = 1200;
+const MS_PER_DISTRACTION = 700;
+const MS_KANJI_READING = 2000;
+const MS_POPUP = 1500;
+const MAX_SCREENS = 6;
+
+/** 部品の種類ごとの高さの見積もり（px）。種類で決まらないものは文字サイズで決める */
+function estimateHeight(comp: AppComponent): number {
+  switch (comp.type) {
+    case 'product_card':
+      return 128;
+    case 'choice_cards':
+      return 16 + 60 * Math.max(1, comp.options?.length ?? 1);
+    case 'summary':
+      return 24 + 26 * Math.max(1, comp.rows?.length ?? 1);
+    case 'progress_steps':
+      return 28;
+    default:
+      return HEIGHT_BY_SIZE[comp.style.size] ?? 42;
+  }
+}
+
 /**
  * 画面上の各部品の擬似バウンディングボックスを算出する（実DOM座標があればそれを使用）。
+ * ポップアップは画面に重なるため並びには含めない。sticky の部品は画面下のバーに横並びで置く。
  */
 function layoutComponentBoxes(
-  spec: AppSpec,
+  components: AppComponent[],
   customBounds?: ComponentBoundsInput[],
 ): SimulatedBox[] {
   const customMap = new Map((customBounds ?? []).map((b) => [b.id, b]));
   const boxes: SimulatedBox[] = [];
+  const toBox = (comp: AppComponent, left: number, top: number, w: number, h: number): SimulatedBox => ({
+    comp,
+    left,
+    top,
+    right: left + w,
+    bottom: top + h,
+    centerX: left + w / 2,
+    centerY: top + h / 2,
+    width: w,
+    height: h,
+  });
   let cursorY = 58;
-  const screenWidth = 320;
 
-  const heightBySize: Record<string, number> = {
-    xs: 26,
-    sm: 34,
-    md: 44,
-    lg: 56,
-    xl: 68,
-  };
+  const flow = components.filter((c) => c.type !== 'popup' && !c.style.sticky);
+  const sticky = components.filter((c) => c.type !== 'popup' && c.style.sticky);
 
-  for (const comp of spec.components) {
-    if (comp.visibleWhen && comp.visibleWhen.stateKey === 'isAlarmSet') {
-      continue;
-    }
+  for (const comp of [...flow, ...sticky]) {
     const existing = customMap.get(comp.id);
     if (existing && existing.right > existing.left && existing.bottom > existing.top) {
-      const width = existing.right - existing.left;
-      const height = existing.bottom - existing.top;
-      boxes.push({
-        comp,
-        left: existing.left,
-        top: existing.top,
-        right: existing.right,
-        bottom: existing.bottom,
-        centerX: existing.left + width / 2,
-        centerY: existing.top + height / 2,
-        width,
-        height,
-      });
+      boxes.push(
+        toBox(comp, existing.left, existing.top, existing.right - existing.left, existing.bottom - existing.top),
+      );
       continue;
     }
+    if (comp.style.sticky) continue;
 
-    const h = heightBySize[comp.style.size] ?? 42;
+    const h = estimateHeight(comp);
     const isFull =
-      comp.style.fullWidth || comp.style.size === 'lg' || comp.style.size === 'xl';
-    const w = isFull ? screenWidth - 32 : comp.style.size === 'xs' ? 92 : 160;
+      comp.style.fullWidth ||
+      comp.style.size === 'lg' ||
+      comp.style.size === 'xl' ||
+      ['product_card', 'choice_cards', 'summary', 'progress_steps'].includes(comp.type);
+    const w = isFull ? SCREEN_WIDTH - 32 : comp.style.size === 'xs' ? 92 : 160;
     let left = 16;
     if (!isFull) {
       if (comp.style.align === 'right') {
-        left = screenWidth - 16 - w;
+        left = SCREEN_WIDTH - 16 - w;
       } else if (comp.style.align === 'center') {
-        left = (screenWidth - w) / 2;
+        left = (SCREEN_WIDTH - w) / 2;
       }
     }
-    const top = cursorY;
-    const right = left + w;
-    const bottom = top + h;
-    cursorY = bottom + 8;
+    boxes.push(toBox(comp, left, cursorY, w, h));
+    cursorY += h + 8;
+  }
 
-    boxes.push({
-      comp,
-      left,
-      top,
-      right,
-      bottom,
-      centerX: left + w / 2,
-      centerY: top + h / 2,
-      width: w,
-      height: h,
+  // 画面下に固定したバー：合計などの表示を左に、ボタンを右に並べる
+  const stickyWithoutBounds = sticky.filter((c) => !customMap.has(c.id));
+  if (stickyWithoutBounds.length > 0) {
+    const barTop = cursorY + 8;
+    const buttons = stickyWithoutBounds.filter((c) => c.type === 'button');
+    const others = stickyWithoutBounds.filter((c) => c.type !== 'button');
+    const othersWidth = others.length > 0 ? 110 : 0;
+    others.forEach((comp, i) => {
+      const w = othersWidth / others.length;
+      boxes.push(toBox(comp, 16 + i * w, barTop, w, 56));
+    });
+    const buttonsLeft = 16 + othersWidth + (others.length > 0 ? 12 : 0);
+    const buttonsWidth = SCREEN_WIDTH - 16 - buttonsLeft;
+    buttons.forEach((comp, i) => {
+      const w = buttonsWidth / buttons.length;
+      boxes.push(toBox(comp, buttonsLeft + i * w, barTop, w, 54));
     });
   }
 
@@ -214,8 +300,8 @@ function layoutComponentBoxes(
 }
 
 /**
- * ペルソナIDとステップ番号から決定論的なズレ量（-jitterPx 〜 +jitterPx）を算出する。
- * これによりテスト再現性を保ちつつ、指の震え・片手操作・電車の揺れによる誤タップを忠実に再現する。
+ * ペルソナIDと手数から決定論的なズレ量（-jitterPx 〜 +jitterPx）を算出する。
+ * テストの再現性を保ちつつ、指の震え・片手操作・電車の揺れによる誤タップを再現する。
  */
 function computeDeterministicJitter(
   personaId: string,
@@ -226,27 +312,140 @@ function computeDeterministicJitter(
   for (let i = 0; i < personaId.length; i++) {
     hash = (hash * 33 + personaId.charCodeAt(i)) % 997;
   }
-  const normX = ((hash % 200) - 100) / 100; // -1.0 .. 1.0
+  const normX = ((hash % 200) - 100) / 100;
   const normY = (((hash * 7) % 200) - 100) / 100;
   // 指のズレが大きいペルソナほど端方向にズレが出るように最低65%の振幅を持たせる
-  const signX = normX >= 0 ? 1 : -1;
-  const signY = normY >= 0 ? 1 : -1;
-  const magX = Math.max(0.65, Math.abs(normX)) * jitterPx * signX;
-  const magY = Math.max(0.65, Math.abs(normY)) * jitterPx * signY;
-  return {
-    dx: Math.round(magX),
-    dy: Math.round(magY),
-  };
+  const magX = Math.max(0.65, Math.abs(normX)) * jitterPx * (normX >= 0 ? 1 : -1);
+  const magY = Math.max(0.65, Math.abs(normY)) * jitterPx * (normY >= 0 ? 1 : -1);
+  return { dx: Math.round(magX), dy: Math.round(magY) };
+}
+
+/** 視力制約から、読み取れる最小の文字サイズを決める */
+function minReadableRank(persona: ReviewerPersona): number {
+  const blur = persona.constraints.blurPx;
+  if (blur >= 3) return SIZE_RANK.lg;
+  if (blur >= 2) return SIZE_RANK.md;
+  if (blur >= 1.2) return SIZE_RANK.sm;
+  return SIZE_RANK.xs;
+}
+
+function canRead(comp: AppComponent, persona: ReviewerPersona): boolean {
+  let rank = SIZE_RANK[comp.style.size] ?? SIZE_RANK.md;
+  // 薄い色の文字は、コントラストが落ちている人には一段小さく見える
+  if (comp.style.variant === 'muted' && persona.constraints.contrast < 0.8) rank -= 1;
+  return rank >= minReadableRank(persona);
+}
+
+/** 目立ち具合。読めないときや細かく読まない人は、一番目立つボタンを押す */
+function prominence(comp: AppComponent): number {
+  const s = comp.style;
+  return (
+    (SIZE_RANK[s.size] ?? 2) * 10 +
+    (['primary', 'danger', 'warning'].includes(s.variant) ? 4 : 0) +
+    (s.fullWidth ? 2 : 0) +
+    (s.noisyAnimation ? 3 : 0)
+  );
+}
+
+type FailureReason =
+  | 'popup_unclosable'
+  | 'popup_tapped'
+  | 'clutter'
+  | 'unreadable_input'
+  | 'unreachable'
+  | 'hit_danger'
+  | 'left_page'
+  | 'decoy_only'
+  | 'no_response'
+  | 'no_target'
+  | 'too_many_steps'
+  | 'timeout'
+  | 'no_confirmation'
+  | 'total_unreadable';
+
+const FAILURE_TEXT: Record<FailureReason, { friction: string; comment: string }> = {
+  popup_unclosable: {
+    friction: '広告の閉じるボタンが見えない',
+    comment: '広告の閉じるボタンが見えなくて、先に進めなかった',
+  },
+  popup_tapped: {
+    friction: '広告を閉じようとして押してしまった',
+    comment: '広告を閉じようとしたら、広告のほうを押してしまった',
+  },
+  clutter: {
+    friction: '関係ない表示が多くて迷った',
+    comment: '関係ない表示が多すぎて、どこを見ればいいのか分からなかった',
+  },
+  unreadable_input: {
+    friction: '入力欄の文字が読めない',
+    comment: '入力欄の文字が小さくて、何を選べばいいのか読めなかった',
+  },
+  unreachable: {
+    friction: 'ボタンに指が届かない',
+    comment: '片手だとボタンに指が届かなかった',
+  },
+  hit_danger: {
+    friction: '押し間違えて入力が消えた',
+    comment: '押し間違えて、入力した内容が全部消えてしまった',
+  },
+  left_page: {
+    friction: '別のページに飛ばされた',
+    comment: 'ボタンを押したら別のページに飛ばされて、注文が途中で終わった',
+  },
+  decoy_only: {
+    friction: 'それらしいボタンが反応しない',
+    comment: '目立つボタンを押しても何も起きなくて、あきらめた',
+  },
+  no_response: {
+    friction: '注文ボタンが反応しない',
+    comment: '注文ボタンを押しても何も起きなかった',
+  },
+  no_target: {
+    friction: '注文するボタンが見つからない',
+    comment: '注文するボタンがどこにあるのか分からなかった',
+  },
+  too_many_steps: {
+    friction: '手順が多すぎる',
+    comment: 'やることが多すぎて、途中で面倒になった',
+  },
+  timeout: {
+    friction: '時間がかかりすぎる',
+    comment: '時間がかかりすぎて、途中でやめてしまった',
+  },
+  no_confirmation: {
+    friction: '注文前に確認できない',
+    comment: '確かめられないまま注文するのが怖くて、押せなかった',
+  },
+  total_unreadable: {
+    friction: '合計金額がすぐ分からない',
+    comment: '結局いくら払うのかすぐ分からなくて、買うのをやめた',
+  },
+};
+
+function describeConstraints(persona: ReviewerPersona): string {
+  const c = persona.constraints;
+  return [
+    c.blurPx >= 2.0 ? `視力ぼかし${c.blurPx}px` : '',
+    c.contrast <= 0.7 ? `低コントラスト${Math.round(c.contrast * 100)}%` : '',
+    c.jitterPx >= 15 ? `指のズレ±${c.jitterPx}px` : '',
+    `手数上限${c.maxSteps}手`,
+    c.environment === 'one_hand' ? '片手親指操作' : c.environment === 'moving_train' ? '揺れる車内' : '',
+    c.readsFinePrint ? '細かい字も読む' : '細かい字は読み飛ばす',
+    c.wantsConfirmation ? '確認したい' : '',
+    c.needsReadableTotal ? '合計金額を確かめたい' : '',
+  ]
+    .filter(Boolean)
+    .join('・');
 }
 
 /**
- * 企画書 2章「層の中の3人と制約変数」「選択9：Computer Use＋AIの外側での数値制約」に基づく
- * 実操作シミュレーションエンジン。
+ * 操作シミュレーター。部品の役割（role）だけを見て、ペルソナの制約のもとで画面を最後まで操作してみる。
  *
- * - 視力制約 (blurPx / contrast): 小さい文字 (xs/sm) や低コントラスト配色を見落とす
- * - 指の正確さ制約 (jitterPx): 狙った座標にズレ (dx, dy) を加算して当たり判定を実行する
- * - 手数上限 (maxSteps) / 待てる時間 (patienceMs): 手数超過や邪魔な項目による時間切れで離脱
- * - タスク完了イベント判定: コード側で complete_task / isAlarmSet=true の発火を判定する
+ * - 視力制約: 小さい文字・薄い文字を読めず、読めないときは一番目立つボタンを押す
+ * - 指の正確さ: 押す位置にズレを加え、外れた先が危険なボタンなら離脱
+ * - 手数と時間: 手数上限・待てる時間を超えたら離脱
+ * - 罠: 細かい字を読む人だけが気づいて直す。気づかずに完了したら後悔
+ * - 完了判定: complete_task が実行されたかどうかをコードで判定する
  */
 export function simulatePersonaComputerUse(
   spec: AppSpec,
@@ -254,285 +453,301 @@ export function simulatePersonaComputerUse(
   customBounds?: ComponentBoundsInput[],
 ): ComputerUseSimulationResult {
   const c = persona.constraints;
-  const boxes = layoutComponentBoxes(spec, customBounds);
   const actionTrace: string[] = [];
+  const appliedConstraintNote = describeConstraints(persona);
 
-  const appliedConstraintNote = [
-    c.blurPx >= 2.0 ? `視力ぼかし(${c.blurPx}px)` : '',
-    c.contrast <= 0.7 ? `低コントラスト(${Math.round(c.contrast * 100)}%)` : '',
-    c.jitterPx >= 15 ? `指のズレ(±${c.jitterPx}px)` : '',
-    `手数上限(${c.maxSteps}手)`,
-    c.environment === 'one_hand'
-      ? '片手親指操作'
-      : c.environment === 'moving_train'
-        ? '揺れる車内'
-        : c.environment === 'dark_room'
-          ? '暗い部屋'
-          : '',
-  ]
-    .filter(Boolean)
-    .join('・');
+  let state: AppState = createInitialState(spec);
+  let steps = 0;
+  let elapsedMs = 0;
+  let confirmedOnEarlierScreen = false;
+  let kanjiPenaltyApplied = false;
+  const closedPopups = new Set<string>();
+  const noticedTrapIds = new Set<string>();
+  const triedDecoyIds = new Set<string>();
 
-  const hasClutter = spec.components.some(
-    (comp) => comp.id === 'input-motto' || comp.id === 'toggle-poem',
-  );
-  const giantDangerBtn = boxes.find(
-    (b) =>
-      b.comp.id === 'btn-cancel-all' &&
-      (b.comp.style.size === 'xl' || b.comp.style.variant === 'danger'),
-  );
-  const clockComp = spec.components.find((comp) => comp.id === 'clock-display');
-  const setBtnBox = boxes.find((b) => b.comp.id === 'btn-set-alarm');
-  const wakeBtnBox = boxes.find(
-    (b) => b.comp.id === 'btn-wake-plus' || b.comp.id === 'btn-mystery',
-  );
-
-  // 1. 視力・画面環境の数値制約チェック
-  if (c.blurPx >= 2.5 && clockComp && (clockComp.style.size === 'xs' || clockComp.style.size === 'sm')) {
-    actionTrace.push(
-      `画面確認: 視力制約(ぼかし${c.blurPx}px)により、小さい時刻表示(${clockComp.style.size})が判読不能`,
-    );
-    if (giantDangerBtn) {
-      actionTrace.push(
-        `1手目: 一番目立つ赤いボタン(${giantDangerBtn.comp.label})を予約と誤認してタップ → 設定が全消去され離脱`,
-      );
-      return {
-        outcome: 'abandoned',
-        frictionPoint: '文字が小さすぎて読めず赤ボタンを誤タップ',
-        fallbackComment:
-          '文字がぼやけて読めないし、一番目立つ赤いボタンを押したら全部消えてしまったわ。',
-        actionTrace,
-        appliedConstraintNote,
-      };
-    }
-    return {
-      outcome: 'abandoned',
-      frictionPoint: '時刻やボタンの文字が小さすぎて見えない',
-      fallbackComment: '文字が豆粒みたいに小さくて、どこを押せばいいか見えないよ。',
-      actionTrace,
-      appliedConstraintNote,
-    };
-  }
-
-  // 暗い部屋環境の制約チェック（散らかった眩しい初期画面だと目がくらむ）
-  if (c.environment === 'dark_room' && spec.theme.chaoticLayout) {
-    actionTrace.push(
-      '画面確認: 暗い部屋で散らかった眩しい画面を見たためコントラスト低下で見分けがつかず離脱',
-    );
-    return {
-      outcome: 'abandoned',
-      frictionPoint: '暗い部屋だと眩しくて画面が散らかっている',
-      fallbackComment: '暗い部屋で見ると画面がゴチャゴチャで眩しすぎて目が痛いよ。',
-      actionTrace,
-      appliedConstraintNote,
-    };
-  }
-
-  // 2. 迷いやすさ・待てる時間の制約チェック（不要な項目が残っている場合）
-  if (hasClutter && (c.patienceMs <= 2500 || persona.traitLabel === 'スマホに不慣れ')) {
-    actionTrace.push(
-      `1手目: 気合い度メーターやポエム通知に目を奪われ、制限時間(${c.patienceMs}ms)内に予約ボタンを見つけられず離脱`,
-    );
-    return {
-      outcome: 'abandoned',
-      frictionPoint: '無関係な項目が多くて迷い時間切れ',
-      fallbackComment:
-        persona.cohortId === 'elderly'
-          ? '気合い度とかポエムとか難しい項目がいっぱいで、どこを押すのか分からないわ。'
-          : 'すぐ寝たいのに余計なメーターや項目ばかりでイライラするよ。',
-      actionTrace,
-      appliedConstraintNote,
-    };
-  }
-
-  // 3. 狙うターゲットボタンの決定
-  const targetBox =
-    c.requiresWakeGimmick && wakeBtnBox ? wakeBtnBox : (setBtnBox ?? wakeBtnBox);
-
-  if (!targetBox) {
-    actionTrace.push('1手目: 予約ボタンが画面上に見つからず離脱');
-    return {
-      outcome: 'abandoned',
-      frictionPoint: '予約ボタンが見当たらない',
-      fallbackComment: 'アラームを予約するボタンがどこにもないよ。',
-      actionTrace,
-      appliedConstraintNote,
-    };
-  }
-
-  // 4. 片手操作制約チェック（画面右端に小さいボタンがあると親指が届かない）
-  if (
-    c.environment === 'one_hand' &&
-    !targetBox.comp.style.fullWidth &&
-    (targetBox.comp.style.size === 'xs' || targetBox.comp.style.size === 'sm')
-  ) {
-    actionTrace.push(
-      `1手目: 片手親指で端の小さいボタン(${targetBox.comp.label})を狙ったが指が届かずタップ失敗 → 離脱`,
-    );
-    return {
-      outcome: 'abandoned',
-      frictionPoint: 'ボタンが端にあって小さく片手で届かない',
-      fallbackComment: '片手だと端っこの小さいボタンに親指が届かなくて押しづらいわ。',
-      actionTrace,
-      appliedConstraintNote,
-    };
-  }
-
-  // 5. 指の正確さ制約（クリック座標にランダムなズレ dx, dy を加算して実行）
-  const { dx, dy } = computeDeterministicJitter(persona.id, 1, c.jitterPx);
-  const clickX = Math.round(targetBox.centerX + dx);
-  const clickY = Math.round(targetBox.centerY + dy);
-
-  const missedSmallButton =
-    c.jitterPx >= 18 &&
-    (targetBox.comp.style.size === 'xs' || targetBox.comp.style.size === 'sm');
-
-  if (missedSmallButton || giantDangerBtn) {
-    if (giantDangerBtn && (c.jitterPx >= 10 || targetBox.comp.style.size === 'xs')) {
-      actionTrace.push(
-        `1手目: (${Math.round(targetBox.centerX)}, ${Math.round(targetBox.centerY)})を狙ったが指のズレ(${dx >= 0 ? `+${dx}` : dx}, ${dy >= 0 ? `+${dy}` : dy})で巨大な赤ボタンを誤タップ → 全消去され離脱`,
-      );
-      return {
-        outcome: 'abandoned',
-        frictionPoint: '指がズレて巨大な赤ボタンを誤タップ',
-        fallbackComment:
-          persona.cohortId === 'elderly'
-            ? '予約しようとしたら指が震えて、隣のでっかい赤いボタンを押して全部消えちゃったよ。'
-            : '電車が揺れて指がズレたら、でっかい赤ボタンに当たって設定が全部消えた！',
-        actionTrace,
-        appliedConstraintNote,
-      };
-    }
-    if (missedSmallButton) {
-      actionTrace.push(
-        `1手目: (${clickX}, ${clickY})をタップしたが、ボタンが小さすぎて指のズレ(±${c.jitterPx}px)により外れて離脱`,
-      );
-      return {
-        outcome: 'abandoned',
-        frictionPoint: 'ボタンが小さく指がズレて押せない',
-        fallbackComment: 'ボタンが小さすぎて、指が少しズレただけで押せないよ。',
-        actionTrace,
-        appliedConstraintNote,
-      };
-    }
-  }
-
-  // 6. ボタン押下時の必要手数とギミック検証
-  const effect =
-    targetBox.comp.behavior?.effect ??
-    wakeBtnBox?.comp.behavior?.effect ??
-    setBtnBox?.comp.behavior?.effect ??
-    'none';
-  const requiredSteps =
-    effect === 'math_quiz_gate'
-      ? 2
-      : effect === 'escape_on_hover'
-        ? 2
-        : effect === 'require_3_clicks'
-          ? 3
-          : 1;
-
-  // 時間がない会社員（maxSteps: 1）なのに毎回クイズ等を強制される場合
-  const hasQuickOneTapButton = Boolean(
-    setBtnBox &&
-      (!setBtnBox.comp.behavior?.effect || setBtnBox.comp.behavior.effect === 'none') &&
-      setBtnBox.comp.actions.some(
-        (a) =>
-          a.type === 'complete_task' ||
-          (a.type === 'set_state' && a.targetKey === 'isAlarmSet'),
-      ),
-  );
-
-  if (requiredSteps > c.maxSteps && !hasQuickOneTapButton) {
-    actionTrace.push(
-      `1手目: ${targetBox.comp.label}をタップ → 追加操作(${requiredSteps}手)が必要だが手数上限(${c.maxSteps}手)を超えたため離脱`,
-    );
-    return {
-      outcome: 'abandoned',
-      frictionPoint: '予約完了までの手数が多すぎて時間切れ',
-      fallbackComment: '疲れてすぐ寝たいのに、1回押すだけで予約できないのは面倒すぎるよ。',
-      actionTrace,
-      appliedConstraintNote,
-    };
-  }
-
-  // 7. タスク完了イベント発火チェック（コード判定）
-  const activeButtons = [targetBox.comp, setBtnBox?.comp, wakeBtnBox?.comp].filter(
-    (b): b is AppComponent => Boolean(b),
-  );
-  const firesTaskCompletion = activeButtons.some((btn) =>
-    btn.actions.some(
-      (a) =>
-        a.type === 'complete_task' ||
-        (a.type === 'set_state' &&
-          a.targetKey === 'isAlarmSet' &&
-          (a.value === true || a.value === 'true')),
-    ),
-  );
-
-  if (!firesTaskCompletion) {
-    actionTrace.push(
-      `1手目: ${targetBox.comp.label}(${clickX}, ${clickY})をタップ → タスク完了イベントが発火せず無反応のため離脱`,
-    );
-    return {
-      outcome: 'abandoned',
-      frictionPoint: 'ボタンを押しても予約完了にならない',
-      fallbackComment: '予約ボタンを押してもウンともスンとも言わないよ。壊れてるみたいだ。',
-      actionTrace,
-      appliedConstraintNote,
-    };
-  }
-
-  // 8. 二度寝防止ギミック必須ペルソナ（朝が弱い学生層）のチェック
-  const hasWakeGimmick = spec.components.some(
-    (comp) =>
-      comp.behavior?.effect === 'math_quiz_gate' ||
-      comp.behavior?.effect === 'escape_on_hover' ||
-      comp.behavior?.effect === 'require_3_clicks' ||
-      comp.behavior?.effect === 'tts_voice_alarm' ||
-      comp.behavior?.effect === 'play_alarm_sound',
-  );
-
-  if (c.requiresWakeGimmick && !hasWakeGimmick) {
-    actionTrace.push(
-      `1手目: ${targetBox.comp.label}をタップして予約完了したが、二度寝を防ぐ仕掛けがないため翌朝二度寝して離脱`,
-    );
-    return {
-      outcome: 'abandoned',
-      frictionPoint: '二度寝を防ぐ仕掛けがなく起きられない',
-      fallbackComment:
-        '見た目はキレイになったけど、普通のアラームだと無意識に止めて二度寝しちゃうよ。',
-      actionTrace,
-      appliedConstraintNote,
-    };
-  }
-
-  // 9. 全制約をクリアし、タスク完了イベントをコード検知 → 達成 (achieved)！
-  if (hasWakeGimmick && c.requiresWakeGimmick) {
-    actionTrace.push(
-      `1〜2手目: ${targetBox.comp.label}(${clickX}, ${clickY})で二度寝防止ギミックをクリア → タスク完了イベント検知（達成）`,
-    );
-    return {
-      outcome: 'achieved',
-      frictionPoint: '二度寝防止ギミックで確実に予約完了',
-      fallbackComment:
-        '頭と指を使わないと進めない仕掛けがあるから、これなら寝ぼけてても絶対起きられる！',
-      actionTrace,
-      appliedConstraintNote,
-    };
-  }
-
-  actionTrace.push(
-    `1手目: ${targetBox.comp.label}(${clickX}, ${clickY})をタップ → タスク完了イベント検知（達成）`,
-  );
-  return {
-    outcome: 'achieved',
-    frictionPoint: '迷わず1手で予約完了イベントに到達',
-    fallbackComment:
-      persona.cohortId === 'elderly'
-        ? '文字もボタンも大きくて、指が少し震えても迷わず1回で予約できたよ。'
-        : '邪魔な項目がなくて、親指1回でサッとアラームをセットできた！助かる！',
+  const fail = (reason: FailureReason): ComputerUseSimulationResult => ({
+    outcome: 'abandoned',
+    frictionPoint: FAILURE_TEXT[reason].friction,
+    simulatedComment: FAILURE_TEXT[reason].comment,
     actionTrace,
     appliedConstraintNote,
+  });
+
+  const overBudget = (): FailureReason | null => {
+    if (steps > c.maxSteps) return 'too_many_steps';
+    if (elapsedMs > c.patienceMs) return 'timeout';
+    return null;
   };
+
+  /**
+   * 部品を1回押す。外れた先も判定する。
+   * 戻り値: hit=狙いどおり / miss=空振り / danger=危険な部品に当たった / unreachable=届かない
+   */
+  const tap = (
+    box: SimulatedBox,
+    boxes: SimulatedBox[],
+  ): 'hit' | 'miss' | 'danger' | 'unreachable' => {
+    steps++;
+    elapsedMs += MS_PER_STEP;
+    if (c.environment === 'one_hand' && !box.comp.style.fullWidth && box.centerX > ONE_HAND_REACH_X) {
+      actionTrace.push(`${steps}手目: 右端の${box.comp.label}に親指が届かない`);
+      return 'unreachable';
+    }
+    const { dx, dy } = computeDeterministicJitter(persona.id, steps, c.jitterPx);
+    // 傾いた部品は当たり判定が狭くなる
+    const tilt = Math.abs(box.comp.style.rotateDeg ?? 0) > 5 ? 0.6 : 1;
+    const hit = Math.abs(dx) <= (box.width / 2) * tilt && Math.abs(dy) <= (box.height / 2) * tilt;
+    if (hit) return 'hit';
+
+    const x = box.centerX + dx;
+    const y = box.centerY + dy;
+    const other = boxes.find(
+      (b) => b !== box && x >= b.left && x <= b.right && y >= b.top && y <= b.bottom,
+    );
+    if (other?.comp.role === 'danger' && other.comp.type === 'button') {
+      actionTrace.push(`${steps}手目: 指がズレて${other.comp.label}を押してしまった`);
+      return 'danger';
+    }
+    actionTrace.push(`${steps}手目: ${box.comp.label}を狙ったが指がズレて外れた`);
+    return 'miss';
+  };
+
+  /**
+   * 出現時間を過ぎたポップアップを閉じる。ポップアップは操作の途中で時間差に現れるため、
+   * 手早く終える人は出る前に完了できることがある。
+   */
+  const closeDuePopups = (): FailureReason | null => {
+    const due = spec.components.filter(
+      (comp) =>
+        comp.role === 'popup' &&
+        !closedPopups.has(comp.id) &&
+        (!comp.stateKey || state[comp.stateKey] !== 'closed') &&
+        elapsedMs >= (comp.popupDelayMs?.min ?? 0),
+    );
+    for (const popup of due) {
+      closedPopups.add(popup.id);
+      steps++;
+      elapsedMs += MS_POPUP;
+      if (!canRead(popup, persona)) {
+        actionTrace.push(`${steps}手目: ${popup.label}が画面を覆い、閉じるボタンが見えない`);
+        return 'popup_unclosable';
+      }
+      const closeHalf = HEIGHT_BY_SIZE[popup.style.size] / 2;
+      const { dx, dy } = computeDeterministicJitter(persona.id, steps, c.jitterPx);
+      if (Math.abs(dx) > closeHalf || Math.abs(dy) > closeHalf) {
+        actionTrace.push(`${steps}手目: 広告の小さな閉じるボタンを外し、広告を押してしまった`);
+        return 'popup_tapped';
+      }
+      actionTrace.push(`${steps}手目: ${popup.label}を閉じた`);
+    }
+    return null;
+  };
+
+  /** 外れたら手数の許す限り押し直す */
+  const tapUntilHit = (
+    box: SimulatedBox,
+    boxes: SimulatedBox[],
+  ): 'hit' | FailureReason => {
+    for (;;) {
+      const popupFailure = closeDuePopups();
+      if (popupFailure) return popupFailure;
+      const result = tap(box, boxes);
+      if (result === 'hit') return 'hit';
+      if (result === 'danger') return 'hit_danger';
+      if (result === 'unreachable') return 'unreachable';
+      const budget = overBudget();
+      if (budget) return budget;
+    }
+  };
+
+  for (let screen = 0; screen < MAX_SCREENS; screen++) {
+    const visible = spec.components.filter((comp) => isComponentVisible(comp, state));
+    const boxes = layoutComponentBoxes(visible, customBounds);
+    const boxOf = (comp: AppComponent) => boxes.find((b) => b.comp === comp);
+
+    // 1. すでに出ているポップアップを閉じる
+    const popupFailure = closeDuePopups();
+    if (popupFailure) return fail(popupFailure);
+
+    // 2. 関係ない表示が多すぎると迷う
+    const distractions = visible.filter((comp) => comp.role === 'distraction').length;
+    if (distractions > c.clutterTolerance) {
+      actionTrace.push(`画面確認: 関係ない表示が${distractions}個あり、どこを見ればいいか迷って離脱`);
+      return fail('clutter');
+    }
+    elapsedMs += distractions * MS_PER_DISTRACTION;
+
+    // 漢数字の値段は読むのに時間がかかる
+    if (!kanjiPenaltyApplied && visible.some((comp) => comp.style.numberFormat === 'kanji')) {
+      kanjiPenaltyApplied = true;
+      elapsedMs += MS_KANJI_READING;
+      actionTrace.push('画面確認: 漢数字の値段を読むのに時間がかかった');
+    }
+
+    // 3. 必須の入力欄を埋める
+    for (const comp of visible.filter((v) => v.role === 'required_input')) {
+      if (isInputFilled(comp, state)) continue;
+      if (!canRead(comp, persona)) {
+        actionTrace.push(`画面確認: ${comp.label}の文字が小さくて読めず離脱`);
+        return fail('unreadable_input');
+      }
+      const box = boxOf(comp);
+      if (!box) continue;
+      const result = tapUntilHit(box, boxes);
+      if (result !== 'hit') return fail(result);
+      if (comp.stateKey) {
+        const option = comp.options?.find((o) => o !== comp.placeholder);
+        state = { ...state, [comp.stateKey]: option ?? '入力済み' };
+      }
+      actionTrace.push(`${steps}手目: ${comp.label}を入力した`);
+      const budget = overBudget();
+      if (budget) return fail(budget);
+    }
+
+    // 4. 罠に気づけば直す（細かい字を読む人が、読める大きさの場合だけ）
+    for (const comp of visible.filter((v) => v.role === 'trap' && v.trapWhen)) {
+      if (!matchesCondition(comp.trapWhen!, state)) continue;
+      if (!c.readsFinePrint || !canRead(comp, persona)) continue;
+      noticedTrapIds.add(comp.id);
+      if (comp.trapSafeValue === undefined || !comp.stateKey) {
+        actionTrace.push(`画面確認: ${comp.label}に気づいたうえで進む`);
+        continue;
+      }
+      const box = boxOf(comp);
+      if (!box) continue;
+      const result = tapUntilHit(box, boxes);
+      if (result !== 'hit') return fail(result);
+      state = { ...state, [comp.stateKey]: comp.trapSafeValue };
+      actionTrace.push(`${steps}手目: ${comp.label}に気づいて直した`);
+      const budget = overBudget();
+      if (budget) return fail(budget);
+    }
+
+    // 5. 押すボタンを決める
+    const buttons = boxes.filter((b) => b.comp.type === 'button');
+    const candidates = buttons.filter(
+      (b) =>
+        (b.comp.role === 'primary_action' || b.comp.role === 'decoy') &&
+        !triedDecoyIds.has(b.comp.id),
+    );
+    const readable = candidates.filter((b) => canRead(b.comp, persona));
+    const pool = readable.length > 0 ? readable : buttons;
+    if (pool.length === 0) {
+      actionTrace.push('画面確認: 進むためのボタンが見つからず離脱');
+      return fail('no_target');
+    }
+    const preferred =
+      c.readsFinePrint && readable.length > 0
+        ? readable.filter((b) => b.comp.role === 'primary_action')
+        : [];
+    const target = (preferred.length > 0 ? preferred : pool).reduce((best, b) =>
+      prominence(b.comp) > prominence(best.comp) ? b : best,
+    );
+
+    // 完了ボタンを押す前の確認
+    const isCompletion = hasCompletionAction(target.comp);
+    if (isCompletion && c.needsReadableTotal) {
+      const totals = visible.filter((comp) => comp.role === 'total');
+      const readableTotal = totals.some(
+        (comp) => canRead(comp, persona) && comp.style.numberFormat !== 'kanji',
+      );
+      if (!readableTotal) {
+        actionTrace.push('画面確認: 合計金額がすぐに読み取れず、買うのをやめた');
+        return fail('total_unreadable');
+      }
+    }
+    const confirmsOnTap = target.comp.behavior?.effect === 'confirm_dialog';
+    if (isCompletion && c.wantsConfirmation && !confirmedOnEarlierScreen && !confirmsOnTap) {
+      actionTrace.push(`画面確認: 確認なしで${target.comp.label}を押すのが怖くて離脱`);
+      return fail('no_confirmation');
+    }
+
+    // 6. 押す
+    const tapResult = tapUntilHit(target, boxes);
+    if (tapResult !== 'hit') {
+      if (tapResult === 'hit_danger' && target.comp.role === 'danger') return fail('hit_danger');
+      return fail(tapResult);
+    }
+    if (target.comp.role === 'danger') {
+      actionTrace.push(`${steps}手目: 一番目立つ${target.comp.label}を押してしまい、入力が消えた`);
+      return fail('hit_danger');
+    }
+
+    const effect = target.comp.behavior?.effect ?? 'none';
+    if (effect === 'require_3_clicks') {
+      steps += 2;
+      elapsedMs += MS_PER_STEP * 2;
+    } else if (effect === 'escape_on_hover') {
+      steps += 1;
+      elapsedMs += MS_PER_STEP;
+    } else if (confirmsOnTap) {
+      steps += 1;
+      elapsedMs += MS_PER_STEP;
+    }
+    const budget = overBudget();
+    if (budget) {
+      actionTrace.push(`${steps}手目: ${target.comp.label}を押したが、手順が多すぎて離脱`);
+      return fail(budget);
+    }
+
+    if (target.comp.actions.length === 0) {
+      if (target.comp.role === 'decoy') {
+        actionTrace.push(`${steps}手目: 目立つ${target.comp.label}を押したが何も起きない`);
+        triedDecoyIds.add(target.comp.id);
+        screen--;
+        if (triedDecoyIds.size >= 3) return fail('decoy_only');
+        continue;
+      }
+      actionTrace.push(`${steps}手目: ${target.comp.label}を押したが何も起きず離脱`);
+      return fail('no_response');
+    }
+
+    const result = applyActions(spec, state, target.comp.actions);
+    state = result.state;
+
+    if (result.openedPage && !result.completed) {
+      actionTrace.push(`${steps}手目: ${target.comp.label}を押したら${result.openedPage}のページに飛ばされた`);
+      return fail('left_page');
+    }
+
+    if (result.completed) {
+      // 7. 完了。気づかなかった罠が残っていれば後悔
+      const activeTraps = spec.components.filter(
+        (comp) =>
+          comp.role === 'trap' &&
+          comp.trapWhen &&
+          matchesCondition(comp.trapWhen, state) &&
+          !noticedTrapIds.has(comp.id),
+      );
+      if (activeTraps.length > 0) {
+        actionTrace.push(
+          `${steps}手目: ${target.comp.label}で完了したが、${activeTraps.map((t) => t.label).join('と')}に気づかなかった`,
+        );
+        return {
+          outcome: 'regretted',
+          frictionPoint: '気づかないまま余計な契約をした',
+          simulatedComment: `注文はできたけど、あとで${activeTraps[0].label}になっていたと気づいた`,
+          actionTrace,
+          appliedConstraintNote,
+          finalState: state,
+        };
+      }
+      actionTrace.push(`${steps}手目: ${target.comp.label}を押してタスク完了イベントを検知`);
+      return {
+        outcome: 'achieved',
+        frictionPoint: `${steps}手で迷わず完了`,
+        simulatedComment: '迷わずに最後まで注文できた',
+        actionTrace,
+        appliedConstraintNote,
+        finalState: state,
+      };
+    }
+
+    // 完了しなかった場合は次の画面へ（確認画面など）
+    actionTrace.push(`${steps}手目: ${target.comp.label}を押して次の画面へ`);
+    confirmedOnEarlierScreen = true;
+  }
+
+  actionTrace.push('画面を行き来するだけで完了にたどり着けず離脱');
+  return fail('too_many_steps');
 }

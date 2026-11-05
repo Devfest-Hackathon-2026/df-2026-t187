@@ -3,15 +3,14 @@ import type {
   ApplyRequest,
   ChatRequest,
   EvaluateRequest,
-  ProposeRequest,
   RecordDecisionRequest,
 } from '../shared/types.ts';
 import {
+  AiNotConfiguredError,
   applyOptionToSpec,
   chatWithStudio,
   evaluateAppWithPersonas,
   getAiConnectionStatus,
-  proposeTradeoffs,
   recordHumanDecisionWithFunctionCalling,
 } from './gemini.ts';
 import { listHumanDecisions, verifyAppCheckHeader } from './store.ts';
@@ -107,21 +106,10 @@ export async function handleApiRequest(
       return true;
     }
 
-    if (req.method === 'POST' && url === '/api/propose') {
-      const body = await readJsonBody<ProposeRequest>(req);
-      if (!body?.currentSpec || typeof body.userInstruction !== 'string') {
-        sendJson(res, 400, { error: 'currentSpec と userInstruction が必要です' });
-        return true;
-      }
-      const result = await proposeTradeoffs(body);
-      sendJson(res, 200, result);
-      return true;
-    }
-
     if (req.method === 'POST' && url === '/api/apply') {
       const body = await readJsonBody<ApplyRequest>(req);
-      if (!body?.currentSpec || !body?.selectedOption) {
-        sendJson(res, 400, { error: 'currentSpec と selectedOption が必要です' });
+      if (!body?.currentSpec || !body?.userInstruction?.trim()) {
+        sendJson(res, 400, { error: 'currentSpec と改造内容が必要です' });
         return true;
       }
       const result = await applyOptionToSpec(body);
@@ -143,6 +131,11 @@ export async function handleApiRequest(
     sendJson(res, 404, { error: `未対応のAPIエンドポイントです: ${req.method} ${url}` });
     return true;
   } catch (err) {
+    if (err instanceof AiNotConfiguredError) {
+      sendJson(res, err.statusCode, { error: err.message });
+      return true;
+    }
+    console.error('[api] リクエスト処理に失敗しました:', err);
     const message = err instanceof Error ? err.message : 'サーバー内部エラーが発生しました';
     sendJson(res, 500, { error: message });
     return true;

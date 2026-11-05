@@ -1,0 +1,341 @@
+// お題アプリの実行ロジック。画面描画（ブラウザ）と操作シミュレーター（サーバー）で同じ規則を共有する。
+
+import type {
+  AppComponent,
+  AppSpec,
+  ComponentAction,
+  StateValue,
+  VisibilityCondition,
+} from './types.ts';
+
+export type AppState = Record<string, StateValue>;
+
+// ============================================================================
+// 計算式（合計金額など）
+// 四則演算・比較・論理演算・三項演算子だけを扱う小さな式評価器。eval は使わない。
+// ============================================================================
+
+type Token =
+  | { kind: 'num'; value: number }
+  | { kind: 'str'; value: string }
+  | { kind: 'id'; value: string }
+  | { kind: 'op'; value: string };
+
+const OPERATORS = ['>=', '<=', '==', '!=', '&&', '||', '+', '-', '*', '/', '>', '<', '?', ':', '(', ')', '!'];
+
+function tokenize(expression: string): Token[] {
+  const tokens: Token[] = [];
+  let i = 0;
+  while (i < expression.length) {
+    const ch = expression[i];
+    if (/\s/.test(ch)) {
+      i++;
+      continue;
+    }
+    if (/[0-9.]/.test(ch)) {
+      let j = i;
+      while (j < expression.length && /[0-9.]/.test(expression[j])) j++;
+      tokens.push({ kind: 'num', value: Number(expression.slice(i, j)) });
+      i = j;
+      continue;
+    }
+    if (/[A-Za-z_]/.test(ch)) {
+      let j = i;
+      while (j < expression.length && /[A-Za-z0-9_]/.test(expression[j])) j++;
+      tokens.push({ kind: 'id', value: expression.slice(i, j) });
+      i = j;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      const end = expression.indexOf(ch, i + 1);
+      if (end === -1) throw new Error(`文字列が閉じていません: ${expression}`);
+      tokens.push({ kind: 'str', value: expression.slice(i + 1, end) });
+      i = end + 1;
+      continue;
+    }
+    const op = OPERATORS.find((o) => expression.startsWith(o, i));
+    if (!op) throw new Error(`計算式に使えない文字があります: ${ch}`);
+    tokens.push({ kind: 'op', value: op });
+    i += op.length;
+  }
+  return tokens;
+}
+
+function toNumber(v: StateValue): number {
+  if (typeof v === 'boolean') return v ? 1 : 0;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function toBool(v: StateValue): boolean {
+  if (typeof v === 'string') return v !== '' && v !== 'false' && v !== '0';
+  return Boolean(v);
+}
+
+/** 計算式を評価する。未知の状態キーは 0 として扱う */
+export function evaluateExpression(expression: string, state: AppState): StateValue {
+  const tokens = tokenize(expression);
+  let pos = 0;
+
+  const peek = (): Token | undefined => tokens[pos];
+  const takeOp = (value: string): boolean => {
+    const t = tokens[pos];
+    if (t?.kind === 'op' && t.value === value) {
+      pos++;
+      return true;
+    }
+    return false;
+  };
+
+  const parsePrimary = (): StateValue => {
+    const t = tokens[pos++];
+    if (!t) throw new Error(`計算式が途中で終わっています: ${expression}`);
+    if (t.kind === 'num' || t.kind === 'str') return t.value;
+    if (t.kind === 'id') {
+      if (t.value === 'true') return true;
+      if (t.value === 'false') return false;
+      return state[t.value] ?? 0;
+    }
+    if (t.value === '(') {
+      const v = parseTernary();
+      if (!takeOp(')')) throw new Error(`括弧が閉じていません: ${expression}`);
+      return v;
+    }
+    if (t.value === '-') return -toNumber(parsePrimary());
+    if (t.value === '!') return !toBool(parsePrimary());
+    throw new Error(`計算式を読めません: ${expression}`);
+  };
+
+  const parseMul = (): StateValue => {
+    let left = parsePrimary();
+    for (;;) {
+      if (takeOp('*')) left = toNumber(left) * toNumber(parsePrimary());
+      else if (takeOp('/')) {
+        const right = toNumber(parsePrimary());
+        left = right === 0 ? 0 : toNumber(left) / right;
+      } else return left;
+    }
+  };
+
+  const parseAdd = (): StateValue => {
+    let left = parseMul();
+    for (;;) {
+      if (takeOp('+')) left = toNumber(left) + toNumber(parseMul());
+      else if (takeOp('-')) left = toNumber(left) - toNumber(parseMul());
+      else return left;
+    }
+  };
+
+  const parseCompare = (): StateValue => {
+    const left = parseAdd();
+    const t = peek();
+    if (t?.kind !== 'op') return left;
+    if (['>=', '<=', '>', '<'].includes(t.value)) {
+      pos++;
+      const a = toNumber(left);
+      const b = toNumber(parseAdd());
+      if (t.value === '>=') return a >= b;
+      if (t.value === '<=') return a <= b;
+      if (t.value === '>') return a > b;
+      return a < b;
+    }
+    if (t.value === '==' || t.value === '!=') {
+      pos++;
+      const right = parseAdd();
+      const equal = String(left) === String(right);
+      return t.value === '==' ? equal : !equal;
+    }
+    return left;
+  };
+
+  const parseAnd = (): StateValue => {
+    let left = parseCompare();
+    while (takeOp('&&')) left = toBool(left) && toBool(parseCompare());
+    return left;
+  };
+
+  const parseOr = (): StateValue => {
+    let left = parseAnd();
+    while (takeOp('||')) left = toBool(left) || toBool(parseAnd());
+    return left;
+  };
+
+  const parseTernary = (): StateValue => {
+    const cond = parseOr();
+    if (!takeOp('?')) return cond;
+    const whenTrue = parseTernary();
+    if (!takeOp(':')) throw new Error(`三項演算子の : がありません: ${expression}`);
+    const whenFalse = parseTernary();
+    return toBool(cond) ? whenTrue : whenFalse;
+  };
+
+  const result = parseTernary();
+  if (pos !== tokens.length) throw new Error(`計算式の末尾を読めません: ${expression}`);
+  return result;
+}
+
+/** 状態に計算値（derived）を書き足した状態を返す。式が壊れている値は 0 にする */
+export function withDerivedValues(spec: AppSpec, state: AppState): AppState {
+  const next: AppState = { ...state };
+  for (const d of spec.derived ?? []) {
+    try {
+      next[d.key] = evaluateExpression(d.expression, next);
+    } catch {
+      next[d.key] = 0;
+    }
+  }
+  return next;
+}
+
+export function createInitialState(spec: AppSpec): AppState {
+  const state: AppState = {};
+  for (const s of spec.state) {
+    state[s.key] = s.initialValue;
+  }
+  return withDerivedValues(spec, state);
+}
+
+// ============================================================================
+// 表示条件・入力判定
+// ============================================================================
+
+export function matchesCondition(cond: VisibilityCondition, state: AppState): boolean {
+  const current = state[cond.stateKey];
+  switch (cond.operator) {
+    case 'eq':
+      return String(current) === String(cond.value);
+    case 'neq':
+      return String(current) !== String(cond.value);
+    case 'gt':
+      return Number(current) > Number(cond.value);
+    case 'lt':
+      return Number(current) < Number(cond.value);
+    default:
+      return true;
+  }
+}
+
+export function isComponentVisible(comp: AppComponent, state: AppState): boolean {
+  return comp.visibleWhen ? matchesCondition(comp.visibleWhen, state) : true;
+}
+
+/** required_input の部品に値が入っているか。空か placeholder と同じなら未入力とみなす */
+export function isInputFilled(comp: AppComponent, state: AppState): boolean {
+  if (!comp.stateKey) return true;
+  const v = state[comp.stateKey];
+  if (v === undefined || v === '' || v === false) return false;
+  return comp.placeholder === undefined || String(v) !== comp.placeholder;
+}
+
+// ============================================================================
+// アクション
+// ============================================================================
+
+export interface ActionResult {
+  state: AppState;
+  completed: boolean;
+  /** open_page で飛ばされた先のページの見出し */
+  openedPage?: string;
+  messages: Array<{ text: string; type: 'info' | 'success' | 'warning' }>;
+}
+
+export function applyActions(
+  spec: AppSpec,
+  state: AppState,
+  actions: ComponentAction[],
+): ActionResult {
+  let next: AppState = { ...state };
+  let completed = false;
+  let openedPage: string | undefined;
+  const messages: ActionResult['messages'] = [];
+
+  for (const act of actions) {
+    if (act.type === 'set_state' && act.targetKey) {
+      next[act.targetKey] = act.value ?? true;
+    } else if (act.type === 'toggle_state' && act.targetKey) {
+      next[act.targetKey] = !toBool(next[act.targetKey] ?? false);
+    } else if (act.type === 'increment_state' && act.targetKey) {
+      next[act.targetKey] = toNumber(next[act.targetKey] ?? 0) + 1;
+    } else if (act.type === 'reset_all') {
+      next = createInitialState(spec);
+    } else if (act.type === 'show_toast') {
+      messages.push({ text: act.message || '実行しました', type: 'warning' });
+    } else if (act.type === 'open_page') {
+      openedPage = act.message || '別のページ';
+      const pageLabel = openedPage.endsWith('ページ') ? openedPage : `${openedPage}のページ`;
+      messages.push({ text: `${pageLabel}に移動してしまいました`, type: 'warning' });
+    } else if (act.type === 'complete_task') {
+      completed = true;
+      messages.push({ text: act.message || '完了しました', type: 'success' });
+    }
+  }
+
+  return { state: withDerivedValues(spec, next), completed, openedPage, messages };
+}
+
+export function hasCompletionAction(comp: AppComponent): boolean {
+  return comp.actions.some((a) => a.type === 'complete_task');
+}
+
+// ============================================================================
+// 表示用の文字
+// ============================================================================
+
+const KANJI_DIGITS = ['', '一', '二', '三', '四', '五', '六', '七', '八', '九'];
+const KANJI_SMALL_UNITS = ['', '十', '百', '千'];
+const KANJI_LARGE_UNITS = ['', '万', '億', '兆'];
+
+/** 整数を漢数字にする（例: 3960 → 三千九百六十、12000 → 一万二千） */
+export function toKanjiNumber(value: number): string {
+  let n = Math.round(Math.abs(value));
+  if (n === 0) return '零';
+  const prefix = value < 0 ? 'マイナス' : '';
+  let result = '';
+  let groupIndex = 0;
+  while (n > 0 && groupIndex < KANJI_LARGE_UNITS.length) {
+    const group = n % 10000;
+    if (group > 0) {
+      let groupText = '';
+      let g = group;
+      for (let unit = 0; unit < 4 && g > 0; unit++) {
+        const digit = g % 10;
+        if (digit > 0) {
+          // 十・百・千の位の「一」は省く（一千ではなく千）
+          const digitText = digit === 1 && unit > 0 ? '' : KANJI_DIGITS[digit];
+          groupText = digitText + KANJI_SMALL_UNITS[unit] + groupText;
+        }
+        g = Math.floor(g / 10);
+      }
+      result = groupText + KANJI_LARGE_UNITS[groupIndex] + result;
+    }
+    n = Math.floor(n / 10000);
+    groupIndex++;
+  }
+  return prefix + result;
+}
+
+function formatNumber(value: number, format: 'arabic' | 'kanji' | undefined): string {
+  if (format === 'kanji') return toKanjiNumber(value);
+  return Math.round(value).toLocaleString('ja-JP');
+}
+
+/** 文字列内の {状態キー} を現在の値に置き換える */
+export function renderTemplate(
+  text: string,
+  state: AppState,
+  numberFormat?: 'arabic' | 'kanji',
+): string {
+  return text.replace(/\{([A-Za-z0-9_]+)\}/g, (_, key: string) => {
+    const v = state[key];
+    if (typeof v === 'number') return formatNumber(v, numberFormat);
+    if (typeof v === 'string' && v !== '' && Number.isFinite(Number(v))) {
+      return formatNumber(Number(v), numberFormat);
+    }
+    return v === undefined ? '' : String(v);
+  });
+}
+
+/** 部品のラベル内の {状態キー} を現在の値に置き換える */
+export function renderLabel(comp: AppComponent, state: AppState): string {
+  return renderTemplate(comp.label, state, comp.style.numberFormat);
+}
