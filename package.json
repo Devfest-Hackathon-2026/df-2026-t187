@@ -1,0 +1,25 @@
+{
+  "name": "yukid-df-hack",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "start": "node src/server/index.ts",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "test": "PONKOTSU_FORCE_FALLBACK=1 node --test \"test/**/*.test.ts\"",
+    "check:hygiene": "node scripts/check-hygiene.mjs",
+    "setup:gcp": "bash scripts/setup-gcp.sh",
+    "prepare": "git config core.hooksPath .githooks || true"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.5"
+  },
+  "dependencies": {
+    "@google/genai": "^2.32.0"
+  }
+}

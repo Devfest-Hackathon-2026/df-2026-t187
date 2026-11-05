@@ -1,0 +1,1347 @@
+:root {
+  --ink: oklch(22% 0.012 55);
+  --ink-80: oklch(22% 0.012 55 / 0.8);
+  --ink-60: oklch(22% 0.012 55 / 0.6);
+  --ink-40: oklch(22% 0.012 55 / 0.4);
+  --ink-15: oklch(22% 0.012 55 / 0.15);
+  --ink-10: oklch(22% 0.012 55 / 0.1);
+  --ink-05: oklch(22% 0.012 55 / 0.05);
+
+  --paper-bg: #f3efe6;
+  --paper-card: #ffffff;
+  --paper-subtle: #faf8f4;
+
+  --accent-red: #dc2626;
+  --accent-blue: #2563eb;
+  --accent-green: #15803d;
+  --accent-amber: #d97706;
+
+  --shadow-soft: 0 2px 6px var(--ink-05), 0 12px 32px var(--ink-05);
+  --shadow-phone: 0 4px 12px rgba(28, 25, 23, 0.08), 0 24px 48px rgba(28, 25, 23, 0.12);
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+input,
+textarea {
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+body {
+  font-family: "Hiragino Kaku Gothic ProN", "Hiragino Sans", "Noto Sans JP", system-ui, sans-serif;
+  background-color: var(--paper-bg);
+  background-image: radial-gradient(var(--ink-15) 1px, transparent 1px);
+  background-size: 22px 22px;
+  color: var(--ink);
+  min-height: 100dvh;
+  -webkit-font-smoothing: antialiased;
+}
+
+.studio-shell {
+  display: flex;
+  flex-direction: column;
+  height: 100dvh;
+  overflow: hidden;
+}
+
+/* ==================== 下部中央の透過タイトル ==================== */
+.studio-watermark {
+  text-align: center;
+  font-size: 0.85rem;
+  font-weight: 800;
+  letter-spacing: 0.14em;
+  color: var(--ink);
+  opacity: 0.26;
+  padding: 6px 0 24px;
+  pointer-events: none;
+}
+
+.studio-header-slot:empty {
+  display: none;
+}
+
+.chat-column-slot {
+  width: 100%;
+  min-width: 0;
+}
+
+.studio-header {
+  background: transparent;
+  border-bottom: none;
+  max-width: 1440px;
+  width: 100%;
+  margin: 0 auto;
+  padding: 10px clamp(20px, 3vw, 40px) 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+}
+
+.checkpoint-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.checkpoint-pill {
+  background: var(--paper-subtle);
+  color: var(--ink-60);
+  border: 1px solid var(--ink-15);
+  border-radius: 999px;
+  padding: 8px 15px;
+  font-size: 0.82rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 140ms ease;
+}
+
+.checkpoint-pill.is-active {
+  background: var(--ink);
+  border-color: var(--ink);
+  color: #ffffff;
+}
+
+.device-bottom-bar {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+}
+
+.bottom-mode-switch {
+  display: inline-flex;
+  background: var(--paper-card);
+  border: 1px solid var(--ink-15);
+  box-shadow: var(--shadow-soft);
+  padding: 5px;
+  border-radius: 999px;
+  gap: 4px;
+}
+
+.header-mode-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: transparent;
+  color: var(--ink-60);
+  border: none;
+  border-radius: 999px;
+  padding: 10px 18px;
+  font-size: 0.85rem;
+  font-weight: 800;
+  cursor: pointer;
+  transition: all 140ms ease;
+  white-space: nowrap;
+}
+
+.header-mode-btn.is-active {
+  background: var(--ink);
+  color: #ffffff;
+}
+
+.header-mode-btn.is-pen.is-active {
+  background: var(--accent-red);
+  color: #ffffff;
+}
+
+.btn-bottom-evaluate {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--accent-blue);
+  color: #ffffff;
+  border: none;
+  border-radius: 999px;
+  padding: 15px 22px;
+  font-size: 0.85rem;
+  font-weight: 800;
+  cursor: pointer;
+  box-shadow: var(--shadow-soft);
+  white-space: nowrap;
+  transition: opacity 140ms ease;
+}
+
+.btn-bottom-evaluate:hover {
+  opacity: 0.9;
+}
+
+/* ==================== メインゲームステージ（比率を保ちながら大きく表示） ==================== */
+.game-stage {
+  flex: 1;
+  min-height: 0;
+  max-width: 1440px;
+  width: 100%;
+  margin: auto;
+  padding: 8px clamp(20px, 3vw, 40px) 16px;
+  display: grid;
+  grid-template-columns: auto minmax(420px, 840px);
+  justify-content: center;
+  gap: clamp(24px, 3.5vw, 48px);
+  align-items: center;
+}
+
+@media (max-width: 860px) {
+  .studio-shell {
+    height: auto;
+    min-height: 100dvh;
+    overflow: visible;
+  }
+
+  .game-stage {
+    grid-template-columns: 1fr;
+    justify-items: center;
+  }
+}
+
+/* ==================== 左：スマホ筐体（9:16比率を維持して大きく伸縮） ==================== */
+.device-column {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  height: clamp(540px, 82dvh, 860px);
+}
+
+.smartphone-bezel {
+  height: calc(100% - 58px);
+  aspect-ratio: 9 / 16;
+  width: auto;
+  background: #1c1917;
+  padding: 11px;
+  border-radius: 36px;
+  box-shadow: var(--shadow-phone);
+  transition: box-shadow 160ms ease;
+  display: flex;
+  flex-direction: column;
+}
+
+.smartphone-bezel.is-pen-active {
+  box-shadow:
+    0 0 0 4px rgba(220, 38, 38, 0.28),
+    var(--shadow-phone);
+}
+
+.sandbox-viewport {
+  position: relative;
+  border-radius: 26px;
+  overflow: hidden;
+  background: #ffffff;
+  width: 100%;
+  height: 100%;
+  flex: 1;
+  min-height: 0;
+}
+
+.sandbox-app-mount {
+  width: 100%;
+  height: 100%;
+}
+
+.sandbox-iframe {
+  width: 100%;
+  height: 100%;
+  border: none;
+  display: block;
+}
+
+.pen-overlay-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  touch-action: none;
+  z-index: 15;
+}
+
+.smartphone-bezel.is-pen-active .pen-overlay-canvas {
+  pointer-events: auto;
+  cursor: crosshair;
+}
+
+/* スマホ内の目覚まし時計UI（筐体サイズを完全固定） */
+.phone-app-screen {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  padding: 14px 16px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  overflow: hidden;
+}
+
+.phone-status-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 0.72rem;
+  font-weight: 700;
+  padding: 0 4px 6px;
+  color: var(--ink-60);
+}
+
+.phone-status-pill {
+  width: 68px;
+  height: 16px;
+  border-radius: 999px;
+  background: #1c1917;
+}
+
+.sandbox-app-header {
+  text-align: center;
+  padding-bottom: 4px;
+}
+
+.sandbox-app-title {
+  font-size: 0.88rem;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+}
+
+.sandbox-app-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+.sandbox-comp-item {
+  position: relative;
+  border-radius: 14px;
+  padding: 10px 12px;
+  background: rgba(255, 255, 255, 0.92);
+  border: 1px solid var(--ink-10);
+  transition: all 140ms ease;
+}
+
+.sandbox-comp-item.is-circled-target {
+  outline: 2.5px solid var(--accent-red);
+  background: #fff5f5;
+}
+
+.circled-badge {
+  position: absolute;
+  top: -9px;
+  right: 10px;
+  background: var(--accent-red);
+  color: #ffffff;
+  font-size: 0.65rem;
+  font-weight: 800;
+  padding: 1px 8px;
+  border-radius: 999px;
+}
+
+/* デジタル目覚まし文字盤 */
+.alarm-clock-face {
+  background: #18181b;
+  color: #f4f4f5;
+  border-radius: 16px;
+  padding: 12px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.alarm-clock-face.is-set {
+  background: #0f172a;
+  box-shadow: inset 0 0 0 2px #3b82f6;
+}
+
+.alarm-clock-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 0.7rem;
+  color: #a1a1aa;
+}
+
+.alarm-state-dot {
+  font-weight: 800;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 0.65rem;
+}
+
+.alarm-state-dot.on {
+  background: #1d4ed8;
+  color: #ffffff;
+}
+
+.alarm-state-dot.off {
+  background: #27272a;
+  color: #a1a1aa;
+}
+
+.comp-clock-value {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-weight: 900;
+  letter-spacing: 0.04em;
+  line-height: 1.1;
+}
+
+.size-xs .comp-clock-value {
+  font-size: 1.05rem;
+  color: #71717a;
+  text-align: right;
+}
+
+.size-sm .comp-clock-value,
+.size-md .comp-clock-value {
+  font-size: 2rem;
+  text-align: center;
+}
+
+.size-lg .comp-clock-value,
+.size-xl .comp-clock-value {
+  font-size: 3.1rem;
+  text-align: center;
+  color: #ffffff;
+}
+
+/* 時刻調整ステッパー（テキストボックスの代替） */
+.alarm-time-dial {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.comp-field-label {
+  font-size: 0.74rem;
+  font-weight: 700;
+  color: var(--ink-80);
+}
+
+.time-stepper-row {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+}
+
+.time-step-btn {
+  background: var(--paper-subtle);
+  border: 1px solid var(--ink-15);
+  border-radius: 8px;
+  padding: 7px 4px;
+  font-size: 0.76rem;
+  font-weight: 700;
+  color: var(--ink);
+  cursor: pointer;
+}
+
+.time-step-btn:hover {
+  background: #e7e5e4;
+}
+
+/* 邪魔な気合い度スライダー・5段階ゲージ */
+.slider-head-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.74rem;
+  margin-bottom: 4px;
+}
+
+.slider-val {
+  font-weight: 800;
+  color: var(--accent-amber);
+}
+
+.comp-range-slider {
+  width: 100%;
+  accent-color: var(--accent-amber);
+}
+
+.clutter-level-row {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 4px;
+  margin-top: 4px;
+}
+
+.clutter-level-btn {
+  background: var(--paper-subtle);
+  border: 1px solid var(--ink-15);
+  border-radius: 6px;
+  padding: 4px;
+  font-size: 0.7rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.clutter-level-btn.active {
+  background: var(--accent-amber);
+  color: #ffffff;
+  border-color: var(--accent-amber);
+}
+
+/* iOS風トグルスイッチ */
+.ios-toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.ios-toggle-label {
+  font-size: 0.76rem;
+  font-weight: 600;
+}
+
+.ios-switch {
+  width: 44px;
+  height: 24px;
+  border-radius: 999px;
+  background: #d6d3d1;
+  border: none;
+  padding: 2px;
+  cursor: pointer;
+  position: relative;
+  transition: background 140ms ease;
+  flex: none;
+}
+
+.ios-switch.is-on {
+  background: #16a34a;
+}
+
+.ios-switch-knob {
+  display: block;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: #ffffff;
+  transition: transform 140ms ease;
+}
+
+.ios-switch.is-on .ios-switch-knob {
+  transform: translateX(20px);
+}
+
+/* アクションボタン */
+.comp-button {
+  width: 100%;
+  border: none;
+  border-radius: 12px;
+  font-weight: 800;
+  cursor: pointer;
+  transition: transform 140ms ease;
+}
+
+.size-xs .comp-button {
+  padding: 6px 10px;
+  font-size: 0.72rem;
+  width: auto;
+}
+
+.size-sm .comp-button {
+  padding: 8px 12px;
+  font-size: 0.8rem;
+}
+
+.size-md .comp-button {
+  padding: 10px 14px;
+  font-size: 0.9rem;
+}
+
+.size-lg .comp-button {
+  padding: 13px 16px;
+  font-size: 1rem;
+}
+
+.size-xl .comp-button {
+  padding: 16px 18px;
+  font-size: 1.12rem;
+}
+
+.variant-primary .comp-button {
+  background: var(--accent-blue);
+  color: #ffffff;
+}
+
+.variant-danger .comp-button {
+  background: var(--accent-red);
+  color: #ffffff;
+}
+
+.variant-warning .comp-button {
+  background: #fef3c7;
+  color: #92400e;
+  border: 1.5px solid #f59e0b;
+}
+
+.variant-muted .comp-button {
+  background: #e7e5e4;
+  color: #78716c;
+}
+
+.comp-status-banner {
+  background: #dcfce7;
+  color: #166534;
+  border-radius: 10px;
+  padding: 10px 12px;
+  font-size: 0.82rem;
+  font-weight: 800;
+  text-align: center;
+}
+
+/* スマホ内モーダルシート（暗算ロック・確認シート） */
+.inapp-sheet {
+  position: absolute;
+  inset: auto 10px 12px 10px;
+  z-index: 22;
+  background: #18181b;
+  color: #ffffff;
+  border-radius: 20px;
+  padding: 16px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  text-align: center;
+}
+
+.inapp-sheet-kicker {
+  font-size: 0.68rem;
+  font-weight: 800;
+  color: #fbbf24;
+  letter-spacing: 0.06em;
+}
+
+.inapp-sheet-title {
+  font-size: 1.15rem;
+  font-weight: 900;
+}
+
+.inapp-sheet-sub {
+  font-size: 0.74rem;
+  color: #a1a1aa;
+}
+
+.inapp-quiz-choices {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+}
+
+.inapp-quiz-btn {
+  background: #2563eb;
+  color: #ffffff;
+  border: none;
+  border-radius: 10px;
+  padding: 10px;
+  font-size: 1.05rem;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.inapp-confirm-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.inapp-sheet-cancel {
+  background: #27272a;
+  color: #d4d4d8;
+  border: none;
+  border-radius: 10px;
+  padding: 8px;
+  font-size: 0.8rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.inapp-confirm-yes {
+  background: var(--accent-red);
+  color: #ffffff;
+  border: none;
+  border-radius: 10px;
+  padding: 8px;
+  font-size: 0.8rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.sandbox-toast {
+  position: absolute;
+  bottom: 12px;
+  left: 12px;
+  right: 12px;
+  z-index: 25;
+  padding: 10px 12px;
+  border-radius: 12px;
+  font-size: 0.78rem;
+  font-weight: 700;
+  text-align: center;
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.18);
+}
+
+.sandbox-toast.toast-info {
+  background: #1c1917;
+  color: #ffffff;
+}
+
+.sandbox-toast.toast-success {
+  background: var(--accent-green);
+  color: #ffffff;
+}
+
+.sandbox-toast.toast-warning {
+  background: #fef3c7;
+  color: #92400e;
+  border: 1px solid #f59e0b;
+}
+
+/* ==================== チャット内のお客さんレビュー ==================== */
+.chat-review-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.customer-mini-card {
+  border-radius: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--ink-10);
+  background: #ffffff;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.customer-mini-card.is-achieved {
+  background: #f0fdf4;
+  border-color: #86efac;
+}
+
+.customer-mini-card.is-abandoned {
+  background: #fffafa;
+  border-color: #fecaca;
+}
+
+.customer-mini-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 4px;
+}
+
+.customer-mini-who {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.78rem;
+  min-width: 0;
+}
+
+.customer-mini-who small {
+  color: var(--ink-60);
+  font-size: 0.68rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.customer-mini-avatar {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: var(--ink);
+  color: #ffffff;
+  font-size: 0.7rem;
+  font-weight: 800;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+}
+
+.customer-mini-comment {
+  font-size: 0.76rem;
+  line-height: 1.4;
+  color: var(--ink-80);
+  font-weight: 600;
+}
+
+.stamp-badge {
+  font-size: 0.68rem;
+  font-weight: 800;
+  padding: 2px 8px;
+  border-radius: 999px;
+  flex: none;
+}
+
+.stamp-badge.achieved {
+  background: var(--accent-green);
+  color: #ffffff;
+}
+
+.stamp-badge.abandoned {
+  background: #dc2626;
+  color: #ffffff;
+}
+
+/* 右：相棒AIとの自由対話＆バイブコーディングカード */
+.vibe-chat-card {
+  width: 100%;
+  height: clamp(540px, 82dvh, 860px);
+  min-height: 0;
+  background: var(--paper-card);
+  border: 1px solid var(--ink-15);
+  border-radius: 24px;
+  box-shadow: var(--shadow-soft);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.vibe-chat-stream {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 18px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.chat-bubble-row {
+  display: flex;
+  width: 100%;
+}
+
+.chat-bubble-row.is-user {
+  justify-content: flex-end;
+}
+
+.chat-bubble-row.is-assistant {
+  justify-content: flex-start;
+}
+
+.chat-bubble {
+  max-width: 92%;
+  border-radius: 16px;
+  padding: 12px 15px;
+  font-size: 0.85rem;
+  line-height: 1.5;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.chat-bubble.is-entering {
+  animation: bubblePop 180ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.chat-bubble.is-user {
+  background: var(--ink);
+  color: #ffffff;
+  border-bottom-right-radius: 4px;
+}
+
+.chat-bubble.is-assistant {
+  background: var(--paper-subtle);
+  color: var(--ink);
+  border: 1px solid var(--ink-10);
+  border-bottom-left-radius: 4px;
+}
+
+.chat-bubble.is-loading {
+  flex-direction: row;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 16px;
+  color: var(--ink-60);
+  font-weight: 700;
+}
+
+.loading-status-text {
+  font-size: 0.8rem;
+  color: var(--ink-60);
+}
+
+.typing-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 16px;
+}
+
+.typing-dots span {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--ink-60);
+  animation: typingBounce 1.2s infinite ease-in-out;
+}
+
+.typing-dots span:nth-child(2) {
+  animation-delay: 0.16s;
+}
+
+.typing-dots span:nth-child(3) {
+  animation-delay: 0.32s;
+}
+
+@keyframes typingBounce {
+  0%,
+  60%,
+  100% {
+    transform: translateY(0);
+    opacity: 0.38;
+  }
+  30% {
+    transform: translateY(-4px);
+    opacity: 1;
+  }
+}
+
+@keyframes bubblePop {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.bubble-target-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.bubble-target-pill {
+  background: rgba(255, 255, 255, 0.18);
+  color: #fecaca;
+  font-size: 0.7rem;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 999px;
+}
+
+/* しくみ解説カード（質問時） */
+.inspect-card-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.inspect-info-card {
+  background: #ffffff;
+  border: 1px solid var(--ink-15);
+  border-left: 4px solid var(--accent-amber);
+  border-radius: 10px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.inspect-info-title {
+  font-size: 0.78rem;
+  font-weight: 800;
+  color: var(--ink);
+}
+
+.inspect-info-how {
+  font-size: 0.78rem;
+  color: var(--ink-80);
+}
+
+.inspect-info-hint {
+  font-size: 0.74rem;
+  font-weight: 700;
+  color: var(--accent-blue);
+}
+
+/* 改造完了サマリーボックス */
+.applied-summary-box {
+  background: #f0fdf4;
+  border: 1px solid #86efac;
+  border-radius: 10px;
+  padding: 8px 12px;
+  font-size: 0.76rem;
+  font-weight: 700;
+  color: #166534;
+}
+
+.applied-summary-box.is-rollback {
+  background: #fef3c7;
+  border-color: #f59e0b;
+  color: #92400e;
+}
+
+/* 顧客層の選択カード・3人の紹介・インライン理由入力 */
+.cohort-selector-box {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.cohort-pill-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.cohort-pill-btn {
+  width: 100%;
+  text-align: left;
+  background: #ffffff;
+  border: 1.5px solid var(--ink-15);
+  border-radius: 10px;
+  padding: 8px 11px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 0.78rem;
+  color: var(--ink);
+  transition: all 130ms ease;
+}
+
+.cohort-pill-btn span {
+  font-size: 0.7rem;
+  color: var(--ink-60);
+  font-weight: 600;
+}
+
+.cohort-pill-btn.is-selected {
+  border-color: var(--accent-blue);
+  background: #eff6ff;
+}
+
+.cohort-persona-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.cohort-persona-chip {
+  background: #ffffff;
+  border: 1px solid var(--ink-10);
+  border-radius: 10px;
+  padding: 7px 10px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.76rem;
+  flex-wrap: wrap;
+}
+
+.cohort-persona-chip small {
+  color: var(--ink-60);
+  font-size: 0.7rem;
+}
+
+.persona-trait-tag {
+  background: var(--paper-subtle);
+  border: 1px solid var(--ink-15);
+  border-radius: 999px;
+  padding: 1px 7px;
+  font-size: 0.66rem;
+  font-weight: 800;
+  color: var(--ink-80);
+}
+
+.inline-reason-row {
+  display: flex;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.inline-reason-input {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--ink-15);
+  background: #ffffff;
+  font-size: 0.76rem;
+  color: var(--ink);
+}
+
+.inline-reason-input:focus {
+  outline: none;
+  border-color: var(--accent-blue);
+}
+
+.btn-inline-decide {
+  background: var(--ink);
+  color: #ffffff;
+  border: none;
+  border-radius: 8px;
+  padding: 6px 12px;
+  font-size: 0.74rem;
+  font-weight: 800;
+  cursor: pointer;
+  flex: none;
+}
+
+.decision-recorded-line {
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: var(--accent-blue);
+  background: #eff6ff;
+  border-radius: 8px;
+  padding: 5px 9px;
+}
+
+.customer-mini-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.btn-persona-tts {
+  background: var(--paper-subtle);
+  border: 1px solid var(--ink-15);
+  border-radius: 999px;
+  padding: 2px 8px;
+  font-size: 0.68rem;
+  font-weight: 700;
+  color: var(--ink-80);
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  cursor: pointer;
+}
+
+.btn-persona-tts:hover {
+  background: #e7e5e4;
+}
+
+.customer-action-trace {
+  font-size: 0.69rem;
+  color: var(--ink-60);
+  background: var(--paper-subtle);
+  border-radius: 6px;
+  padding: 4px 8px;
+}
+
+.disposition-choice-row {
+  display: flex;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.btn-disposition-pill {
+  flex: 1;
+  background: var(--paper-subtle);
+  border: 1px solid var(--ink-15);
+  border-radius: 8px;
+  padding: 4px 8px;
+  font-size: 0.7rem;
+  font-weight: 800;
+  color: var(--ink-80);
+  cursor: pointer;
+  transition: all 120ms ease;
+}
+
+.btn-disposition-pill.is-active {
+  background: var(--ink);
+  color: #ffffff;
+  border-color: var(--ink);
+}
+
+/* チャット内の3つの作戦カード */
+.inline-choice-deck {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.inline-choice-card {
+  width: 100%;
+  text-align: left;
+  background: #ffffff;
+  border: 1.5px solid var(--ink-15);
+  border-radius: 12px;
+  padding: 10px 12px;
+  transition: all 140ms ease;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.inline-choice-card.is-draft {
+  border-color: var(--accent-blue);
+}
+
+.inline-choice-trigger {
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.inline-choice-card:hover {
+  border-color: var(--accent-blue);
+  box-shadow: 0 2px 8px rgba(37, 99, 235, 0.12);
+}
+
+.inline-choice-card.is-picked {
+  border-color: var(--accent-green);
+  background: #f0fdf4;
+}
+
+.inline-choice-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.choice-letter {
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  background: var(--ink);
+  color: #ffffff;
+  font-size: 0.72rem;
+  font-weight: 800;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+}
+
+.choice-title {
+  font-size: 0.84rem;
+  font-weight: 800;
+  color: var(--ink);
+  flex: 1;
+}
+
+.inline-choice-cta {
+  font-size: 0.72rem;
+  font-weight: 800;
+  color: var(--accent-blue);
+  white-space: nowrap;
+}
+
+.choice-tradeoff-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 0.74rem;
+  color: var(--ink-80);
+}
+
+.tradeoff-line {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.tradeoff-badge {
+  font-size: 0.65rem;
+  font-weight: 800;
+  padding: 1px 6px;
+  border-radius: 4px;
+  flex: none;
+}
+
+.tradeoff-line.is-plus .tradeoff-badge {
+  background: #dcfce7;
+  color: var(--accent-green);
+}
+
+.tradeoff-line.is-minus .tradeoff-badge {
+  background: #fee2e2;
+  color: #b91c1c;
+}
+
+/* 下部コンポーザー（赤ペン選択バー ＋ 質問/改造チップ ＋ 自由入力） */
+.vibe-composer {
+  border-top: 1px solid var(--ink-10);
+  background: var(--paper-subtle);
+  padding: 10px 14px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.composer-selection-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.target-tag {
+  background: #fef2f2;
+  color: var(--accent-red);
+  border: 1px solid #fecaca;
+  border-radius: 999px;
+  padding: 2px 10px;
+  font-size: 0.73rem;
+  font-weight: 800;
+}
+
+.btn-text-link {
+  background: transparent;
+  border: none;
+  color: var(--ink-60);
+  font-size: 0.74rem;
+  font-weight: 600;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.composer-form-row {
+  display: flex;
+  gap: 8px;
+}
+
+.composer-input {
+  flex: 1;
+  padding: 10px 13px;
+  border-radius: 10px;
+  border: 1px solid var(--ink-15);
+  background: #ffffff;
+  font-size: 0.84rem;
+  color: var(--ink);
+}
+
+.composer-input:focus {
+  outline: none;
+  border-color: var(--accent-blue);
+}
+
+.btn-composer-send {
+  background: var(--ink);
+  color: #ffffff;
+  border: none;
+  border-radius: 10px;
+  padding: 0 18px;
+  font-size: 0.84rem;
+  font-weight: 800;
+  cursor: pointer;
+  flex: none;
+}
+
+.btn-composer-send:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}

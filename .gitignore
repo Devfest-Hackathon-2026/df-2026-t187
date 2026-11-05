@@ -1,0 +1,32 @@
+# Nodeパッケージ・ビルド成果物
+node_modules/
+dist/
+dist-ssr/
+
+# 環境変数・秘密情報
+.env
+.env.local
+.env.*.local
+service-account*.json
+*credentials*.json
+.gcp/
+
+# Firebase
+.firebase/
+firebase-debug.log*
+firestore-debug.log*
+ui-debug.log*
+
+# ログ
+logs/
+*.log
+npm-debug.log*
+
+# OS・エディタ・AIツール
+.DS_Store
+**/.DS_Store
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.claude/
+.aider*

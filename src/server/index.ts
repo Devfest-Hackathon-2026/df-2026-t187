@@ -1,0 +1,62 @@
+import { existsSync, readFileSync, statSync } from 'node:fs';
+import { createServer } from 'node:http';
+import { extname, join, normalize, resolve, sep } from 'node:path';
+import { handleApiRequest } from './api.ts';
+
+const PORT = Number(process.env.PORT || 8080);
+const DIST_DIR = resolve(process.cwd(), 'dist');
+
+const MIME_TYPES: Record<string, string> = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
+  '.svg': 'image/svg+xml',
+  '.ico': 'image/x-icon',
+};
+
+const SECURITY_HEADERS: Record<string, string> = {
+  'X-Content-Type-Options': 'nosniff',
+  'X-Frame-Options': 'SAMEORIGIN',
+  'Referrer-Policy': 'strict-origin-when-cross-origin',
+};
+
+const server = createServer(async (req, res) => {
+  const handled = await handleApiRequest(req, res);
+  if (handled) return;
+
+  // Cloud Run 等での静的ファイル配信 (dist/)
+  const urlPath = (req.url ?? '/').split('?')[0];
+  const safeRelPath = normalize(urlPath).replace(/^(\.\.(\/|\\|$))+/, '');
+  let targetPath = resolve(DIST_DIR, safeRelPath === '/' ? 'index.html' : `.${safeRelPath}`);
+
+  if (targetPath !== DIST_DIR && !targetPath.startsWith(DIST_DIR + sep)) {
+    res.writeHead(403, SECURITY_HEADERS);
+    res.end('Forbidden');
+    return;
+  }
+
+  if (!existsSync(targetPath) || statSync(targetPath).isDirectory()) {
+    targetPath = join(DIST_DIR, 'index.html');
+  }
+
+  if (!existsSync(targetPath)) {
+    res.writeHead(404, { ...SECURITY_HEADERS, 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('Not Found (build dist/ first)');
+    return;
+  }
+
+  const ext = extname(targetPath).toLowerCase();
+  const contentType = MIME_TYPES[ext] || 'application/octet-stream';
+  const content = readFileSync(targetPath);
+  res.writeHead(200, { ...SECURITY_HEADERS, 'Content-Type': contentType });
+  res.end(content);
+});
+
+server.listen(PORT, () => {
+  console.log(`[yukid-df-hack] Server listening on http://localhost:${PORT}`);
+});
