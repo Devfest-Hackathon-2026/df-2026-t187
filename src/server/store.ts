@@ -1,10 +1,29 @@
 import { GoogleAuth } from 'google-auth-library';
 import { existsSync, readFileSync } from 'node:fs';
 import type { IncomingMessage } from 'node:http';
-import type { HumanDecisionRecord, TtsRequest, TtsResponse } from '../shared/types.ts';
+import {
+  classifyDeterministicArchetype,
+  cosineSimilarity,
+  extractDeterministicNlSignal,
+  summarizePromptTelemetry,
+} from '../shared/promptTelemetry.ts';
+import type {
+  EmbeddingSignal,
+  HumanDecisionRecord,
+  NaturalLanguageSignal,
+  PromptArchetype,
+  PromptSessionMode,
+  PromptSessionSummary,
+  PromptTelemetryEvent,
+  TargetCohortId,
+  TtsRequest,
+  TtsResponse,
+} from '../shared/types.ts';
 
 const MAX_IN_MEMORY_DECISIONS = 200;
 const inMemoryDecisions: HumanDecisionRecord[] = [];
+const MAX_IN_MEMORY_TELEMETRY = 300;
+const inMemoryTelemetryEvents: PromptTelemetryEvent[] = [];
 const MAX_TTS_CACHE_ENTRIES = 300;
 const ttsAudioCache = new Map<string, string>();
 let presetsLoaded = false;
@@ -103,6 +122,338 @@ export async function saveHumanDecision(
 
 export function listHumanDecisions(): HumanDecisionRecord[] {
   return [...inMemoryDecisions];
+}
+
+const ARCHETYPE_ANCHOR_TEXTS: Record<PromptArchetype, string> = {
+  simple_delete: '定期便やクーポンや広告の欄をそのまま消して削除してなくして',
+  condition_design:
+    '初期チェックを外して自分で選べるようにして解約条件を分かりやすく明記して閉じるボタンを大きく下に配置して',
+  direct_fix: '注文ボタンが動くように直して合計金額の数字を読みやすく変更して',
+  vague_delegate: 'いい感じに全部まとめて使いやすく見やすく直しておまかせで',
+  inquiry: '店長やお客さんにどこで困ったか理由や狙いを質問して教えて',
+};
+
+let cachedAnchorEmbeddings: Map<PromptArchetype, number[]> | null = null;
+
+/**
+ * Cloud Natural Language API (`documents:annotateText`) を用いて指示文のエンティティと感情極性を抽出する。
+ * GCP 未設定または通信失敗時は決定論的抽出へフォールバックする。
+ */
+export async function analyzePromptWithCloudNaturalLanguage(
+  promptText: string,
+): Promise<NaturalLanguageSignal> {
+  const base = extractDeterministicNlSignal(promptText);
+  const project = process.env.GOOGLE_CLOUD_PROJECT;
+  if (!project || project === 'your-gcp-project-id' || !promptText.trim()) {
+    return base;
+  }
+
+  try {
+    const token = await getGcpAccessToken();
+    if (!token) return base;
+
+    const res = await fetch('https://language.googleapis.com/v1/documents:annotateText', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+        'x-goog-user-project': project,
+      },
+      body: JSON.stringify({
+        document: {
+          type: 'PLAIN_TEXT',
+          language: 'ja',
+          content: promptText.slice(0, 500),
+        },
+        features: {
+          extractEntities: true,
+          extractDocumentSentiment: true,
+        },
+        encodingType: 'UTF8',
+      }),
+      signal: AbortSignal.timeout(1200),
+    });
+    if (!res.ok) return base;
+
+    const data = (await res.json()) as {
+      entities?: Array<{ name?: string }>;
+      documentSentiment?: { score?: number };
+    };
+
+    const mergedEntities = [...base.entities];
+    for (const ent of data.entities ?? []) {
+      const name = ent.name?.trim();
+      if (name && name.length >= 2 && !mergedEntities.some((e) => e.includes(name) || name.includes(e))) {
+        mergedEntities.push(name);
+      }
+    }
+
+    const sentimentScore =
+      typeof data.documentSentiment?.score === 'number'
+        ? Number(data.documentSentiment.score.toFixed(2))
+        : base.sentimentScore;
+
+    return {
+      entities: mergedEntities.slice(0, 8),
+      hasConditionConstraint: base.hasConditionConstraint,
+      sentimentScore,
+      analyzedVia: 'cloud_natural_language_api',
+    };
+  } catch {
+    return base;
+  }
+}
+
+/**
+ * Vertex AI Text Embeddings (`text-multilingual-embedding-002`) で指示文をベクトル化し、
+ * 典型的な指示の型（単純削除型 / 条件設計型 / 具体修正型 / 丸投げ型 / 探索型）とのコサイン類似度で分類する。
+ */
+export async function classifyPromptWithVertexEmbeddings(
+  promptText: string,
+  sessionMode: PromptSessionMode,
+): Promise<EmbeddingSignal> {
+  const base = classifyDeterministicArchetype(promptText, sessionMode);
+  const project = process.env.GOOGLE_CLOUD_PROJECT;
+  if (!project || project === 'your-gcp-project-id' || !promptText.trim()) {
+    return base;
+  }
+
+  try {
+    const token = await getGcpAccessToken();
+    if (!token) return base;
+
+    const rawLocation = process.env.GOOGLE_CLOUD_LOCATION || 'us-central1';
+    const location = rawLocation === 'global' ? 'us-central1' : rawLocation;
+    const endpoint = `https://${encodeURIComponent(location)}-aiplatform.googleapis.com/v1/projects/${encodeURIComponent(project)}/locations/${encodeURIComponent(location)}/publishers/google/models/text-multilingual-embedding-002:predict`;
+
+    const archetypes = Object.keys(ARCHETYPE_ANCHOR_TEXTS) as PromptArchetype[];
+    const needAnchors = !cachedAnchorEmbeddings;
+    const instances = needAnchors
+      ? [
+          { content: promptText.slice(0, 500) },
+          ...archetypes.map((k) => ({ content: ARCHETYPE_ANCHOR_TEXTS[k] })),
+        ]
+      : [{ content: promptText.slice(0, 500) }];
+
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ instances }),
+      signal: AbortSignal.timeout(1500),
+    });
+    if (!res.ok) return base;
+
+    const data = (await res.json()) as {
+      predictions?: Array<{ embeddings?: { values?: number[] } }>;
+    };
+    const vectors = (data.predictions ?? []).map((p) => p.embeddings?.values ?? []);
+    if (vectors.length === 0 || vectors[0].length === 0) return base;
+
+    const promptVector = vectors[0];
+    if (needAnchors && vectors.length === archetypes.length + 1) {
+      const map = new Map<PromptArchetype, number[]>();
+      for (let i = 0; i < archetypes.length; i++) {
+        if (vectors[i + 1].length > 0) {
+          map.set(archetypes[i], vectors[i + 1]);
+        }
+      }
+      if (map.size === archetypes.length) {
+        cachedAnchorEmbeddings = map;
+      }
+    }
+
+    if (!cachedAnchorEmbeddings) return base;
+
+    let bestArchetype: PromptArchetype = base.closestArchetype;
+    let bestScore = -1;
+    for (const [arch, vec] of cachedAnchorEmbeddings.entries()) {
+      if (sessionMode === 'explore' && arch !== 'inquiry') continue;
+      if (sessionMode === 'execute' && arch === 'inquiry') continue;
+      const sim = cosineSimilarity(promptVector, vec);
+      if (sim > bestScore) {
+        bestScore = sim;
+        bestArchetype = arch;
+      }
+    }
+
+    return {
+      closestArchetype: bestArchetype,
+      similarityScore: bestScore > 0 ? bestScore : base.similarityScore,
+      analyzedVia: 'vertex_ai_embedding',
+    };
+  } catch {
+    return base;
+  }
+}
+
+async function persistTelemetryToCloud(event: PromptTelemetryEvent): Promise<void> {
+  const project = process.env.GOOGLE_CLOUD_PROJECT;
+  if (!project || project === 'your-gcp-project-id') return;
+
+  try {
+    const token = await getGcpAccessToken();
+    if (!token) return;
+
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    };
+
+    // 1. Cloud Firestore への保存
+    if (process.env.FIRESTORE_ENABLED !== '0') {
+      const firestoreUrl = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(project)}/databases/(default)/documents/prompt_telemetry?documentId=${encodeURIComponent(event.id)}`;
+      void fetch(firestoreUrl, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          fields: {
+            cohortId: { stringValue: event.cohortId ?? '' },
+            promptText: { stringValue: event.promptText },
+            sessionMode: { stringValue: event.sessionMode },
+            recipient: { stringValue: event.recipient },
+            hasPenAnnotation: { booleanValue: event.hasPenAnnotation },
+            changedComponentIds: { stringValue: event.changedComponentIds.join(',') },
+            isReworkOnSameComponent: { booleanValue: event.isReworkOnSameComponent },
+            removedNeededFeature: { booleanValue: event.removedNeededFeature },
+            closestArchetype: { stringValue: event.embeddingSignal.closestArchetype },
+            hasConditionConstraint: { booleanValue: event.nlSignal.hasConditionConstraint },
+            entities: { stringValue: event.nlSignal.entities.join(',') },
+            sentimentScore: { doubleValue: event.nlSignal.sentimentScore },
+            createdAt: { stringValue: event.createdAt },
+          },
+        }),
+        signal: AbortSignal.timeout(1500),
+      }).catch(() => {});
+    }
+
+    // 2. BigQuery Streaming Insert への保存
+    const dataset = process.env.BIGQUERY_DATASET || 'studio_telemetry';
+    const table = process.env.BIGQUERY_TABLE || 'prompt_events';
+    const bqUrl = `https://bigquery.googleapis.com/bigquery/v2/projects/${encodeURIComponent(project)}/datasets/${encodeURIComponent(dataset)}/tables/${encodeURIComponent(table)}/insertAll`;
+    void fetch(bqUrl, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        kind: 'bigquery#tableDataInsertAllRequest',
+        skipInvalidRows: true,
+        ignoreUnknownValues: true,
+        rows: [
+          {
+            insertId: event.id,
+            json: {
+              id: event.id,
+              cohort_id: event.cohortId ?? null,
+              prompt_text: event.promptText,
+              session_mode: event.sessionMode,
+              recipient: event.recipient,
+              has_pen_annotation: event.hasPenAnnotation,
+              changed_component_ids: event.changedComponentIds.join(','),
+              is_rework_on_same_component: event.isReworkOnSameComponent,
+              removed_needed_feature: event.removedNeededFeature,
+              closest_archetype: event.embeddingSignal.closestArchetype,
+              similarity_score: event.embeddingSignal.similarityScore,
+              embedding_via: event.embeddingSignal.analyzedVia,
+              entities: event.nlSignal.entities.join(','),
+              has_condition_constraint: event.nlSignal.hasConditionConstraint,
+              sentiment_score: event.nlSignal.sentimentScore,
+              nl_via: event.nlSignal.analyzedVia,
+              created_at: event.createdAt,
+            },
+          },
+        ],
+      }),
+      signal: AbortSignal.timeout(1500),
+    }).catch(() => {});
+  } catch {
+    // クラウド送信エラー時はインメモリ記録を維持する
+  }
+}
+
+/**
+ * 学習者の1回の発言・指示を Cloud Natural Language API + Vertex AI Embeddings で分析し、
+ * 行動テレメトリとして記録する。
+ */
+export async function recordPromptTelemetryEvent(input: {
+  cohortId?: TargetCohortId;
+  promptText: string;
+  sessionMode: PromptSessionMode;
+  recipient: string;
+  hasPenAnnotation: boolean;
+  changedComponentIds?: string[];
+  removedNeededFeature?: boolean;
+}): Promise<PromptTelemetryEvent> {
+  const changedComponentIds = input.changedComponentIds ?? [];
+  const priorExecuteEvents = inMemoryTelemetryEvents.filter(
+    (e) =>
+      e.sessionMode === 'execute' &&
+      (!input.cohortId || !e.cohortId || e.cohortId === input.cohortId),
+  );
+  const previouslyTouchedIds = new Set(priorExecuteEvents.flatMap((e) => e.changedComponentIds));
+  const isReworkOnSameComponent =
+    input.sessionMode === 'execute' &&
+    changedComponentIds.some((id) => previouslyTouchedIds.has(id));
+
+  const [nlSignal, embeddingSignal] = await Promise.all([
+    analyzePromptWithCloudNaturalLanguage(input.promptText),
+    classifyPromptWithVertexEmbeddings(input.promptText, input.sessionMode),
+  ]);
+
+  const event: PromptTelemetryEvent = {
+    id: `pt-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    cohortId: input.cohortId,
+    promptText: input.promptText,
+    sessionMode: input.sessionMode,
+    recipient: input.recipient,
+    hasPenAnnotation: input.hasPenAnnotation,
+    changedComponentIds,
+    isReworkOnSameComponent,
+    removedNeededFeature: Boolean(input.removedNeededFeature),
+    nlSignal,
+    embeddingSignal,
+    createdAt: new Date().toISOString(),
+  };
+
+  inMemoryTelemetryEvents.push(event);
+  if (inMemoryTelemetryEvents.length > MAX_IN_MEMORY_TELEMETRY) {
+    inMemoryTelemetryEvents.splice(0, inMemoryTelemetryEvents.length - MAX_IN_MEMORY_TELEMETRY);
+  }
+
+  void persistTelemetryToCloud(event);
+  return event;
+}
+
+/**
+ * 顧客シミュレーション実行後、直近のテレメトリイベントに結果（何人満足したか・クリアしたか）を紐づけ、
+ * 現在のコホートの集計サマリーを返す。
+ */
+export function finalizeTelemetryOnEvaluate(
+  cohortId: TargetCohortId | undefined,
+  achievedCount: number,
+  totalCustomers: number,
+): PromptSessionSummary {
+  const latest = [...inMemoryTelemetryEvents]
+    .reverse()
+    .find((e) => !cohortId || !e.cohortId || e.cohortId === cohortId);
+  if (latest) {
+    latest.outcomeAfterTurn = {
+      achievedCount,
+      totalCustomers,
+      passed: achievedCount === totalCustomers && totalCustomers > 0,
+    };
+  }
+  return summarizePromptTelemetry(inMemoryTelemetryEvents, cohortId);
+}
+
+export function listPromptTelemetryEvents(cohortId?: TargetCohortId): PromptTelemetryEvent[] {
+  if (!cohortId) return [...inMemoryTelemetryEvents];
+  return inMemoryTelemetryEvents.filter((e) => !e.cohortId || e.cohortId === cohortId);
+}
+
+export function clearPromptTelemetryEvents(): void {
+  inMemoryTelemetryEvents.length = 0;
 }
 
 const SPEAKER_VOICE_MAP: Record<

@@ -27,6 +27,7 @@ import {
   detectExplicitRecipientMention,
 } from '../shared/intent.ts';
 import { applySpecPatches } from '../shared/specPatch.ts';
+import { inspectAppliedChangeForTelemetry } from '../shared/promptTelemetry.ts';
 import { describeWorkSteps } from '../shared/workSteps.ts';
 
 export { classifyUserMessageIntent, detectExplicitRecipientMention };
@@ -47,13 +48,16 @@ import type {
   RecordDecisionRequest,
   RecordDecisionResponse,
   ReviewerEvaluation,
-  ReviewerPersona,
   ReviewOutcome,
   SpecPatch,
   TranscribeRequest,
   TranscribeResponse,
 } from '../shared/types.ts';
-import { saveHumanDecision } from './store.ts';
+import {
+  finalizeTelemetryOnEvaluate,
+  recordPromptTelemetryEvent,
+  saveHumanDecision,
+} from './store.ts';
 
 let envLoaded = false;
 
@@ -354,38 +358,76 @@ const STUDIO_GUIDE = [
   '赤ペンで囲むを選んでスマホの部品を囲み、チャットで指示を送ると、その部品を話題にできます。囲まずに文章だけで頼んでも大丈夫です。',
   'チャットで手直しを頼むと、お助けAIが画面を書き換えます。「1つ前の画面に戻して」「最初の画面に戻して」とチャットで伝えると、前の画面に戻れます。',
   'お客さんの反応を見るを押すと、選んだ3人がその画面で実際に買ってみて、感想を言います。',
-  '入力欄の上のボタンで、お助けAI・店長・客A〜Cの誰に話しかけるかを選べます。初期設定はお助けAIで、文頭や@で別の人を明確に呼びかけると宛先も切り替わります。',
+  '入力欄の上のボタンで、お助けAI・店長・お客さんの誰に話しかけるかを選べます。初期設定はお助けAIで、文頭や@で別の人を明確に呼びかけると宛先も切り替わります。',
   '目標は、選んだ3人全員が満足して買える画面にすることです。',
   '誰のために直すかは途中では変えられません。選んだ3人全員が満足して買えると、直した画面のまま別のお客さんを呼ぶか、最初の画面からやり直すかを選べます。',
 ];
 
+const CUSTOMER_COHORT_REPLY_SCHEMA: Schema = {
+  type: Type.OBJECT,
+  properties: {
+    replies: {
+      type: Type.ARRAY,
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          personaId: { type: Type.STRING },
+          text: {
+            type: Type.STRING,
+            description: 'そのお客さん本人になりきった返答1文（35文字以内、括弧なし、直し方の指示は言わない）',
+          },
+        },
+        required: ['personaId', 'text'],
+      },
+    },
+  },
+  required: ['replies'],
+};
+
 /**
- * お客さん（客A・客B・客C）が話しかけられたときに、本人として返事を作る。
+ * お客さんに話しかけられたときに、選んだ客層の3人それぞれが自分の立場・体験から一言ずつ返事をする。
  * 実際に画面を操作した記録（actionTrace）だけを根拠にし、改善指示は言わせない。
  */
-async function voiceCustomerLine(
-  persona: ReviewerPersona,
+async function voiceCohortCustomers(
   req: ChatRequest,
-): Promise<{ text: string; personaId: string }> {
-  const sim = simulatePersonaComputerUse(req.currentSpec, persona);
-  const latestForPersona = req.latestReviews?.reviews.find((r) => r.name === persona.name);
-  const trace = latestForPersona?.actionTrace ?? sim.actionTrace;
-  const outcome = latestForPersona?.outcome ?? sim.outcome;
-  const fallback = sim.simulatedComment || persona.greeting;
+): Promise<Array<{ personaId: string; text: string }>> {
+  const reviewers = getReviewersByCohort(req.cohortId);
+  const sims = reviewers.map((persona) => {
+    const sim = simulatePersonaComputerUse(req.currentSpec, persona);
+    const latestForPersona = req.latestReviews?.reviews.find((r) => r.name === persona.name);
+    const trace = latestForPersona?.actionTrace ?? sim.actionTrace;
+    const outcome = latestForPersona?.outcome ?? sim.outcome;
+    const fallback = sim.simulatedComment || persona.greeting;
+    return { persona, sim, trace, outcome, fallback };
+  });
+
+  const fallbackReplies = sims.map(({ persona, fallback }) => ({
+    personaId: persona.id,
+    text: fallback,
+  }));
+
   const aiInfo = createGenAIClient();
-  if (!aiInfo) return { text: fallback, personaId: persona.id };
+  if (!aiInfo) return fallbackReplies;
+
+  const customerProfiles = sims.map(({ persona, trace, outcome, fallback }) => ({
+    personaId: persona.id,
+    name: persona.name,
+    role: persona.role,
+    trait: persona.traitLabel,
+    goal: persona.goal,
+    voiceSample: `${persona.greeting} / ${fallback}`,
+    outcome: OUTCOME_LABELS[outcome],
+    actionTrace: trace,
+  }));
 
   const prompt = [
-    `あなたは注文画面を使いに来たお客さん（${persona.name}：${persona.role}、特徴：${persona.traitLabel}、来店時の希望：${persona.goal}）です。`,
-    `普段の話し方の見本：「${persona.greeting}」「${sim.simulatedComment}」`,
-    `お店の画面を手直ししている人から、あなたにこう話しかけられました：${req.userMessage}`,
-    '【あなたが画面を操作したときの実際の記録】',
-    `- 結果: ${OUTCOME_LABELS[outcome]}`,
-    ...trace.map((t) => `- ${t}`),
+    `あなたは注文画面を使いに来た3人のお客さんです。お店の画面を手直ししている人から、お客さんに向けてこう質問・声かけされました：${req.userMessage}`,
+    '【3人のお客さんそれぞれのプロフィールと実際に画面を操作した記録】',
+    JSON.stringify(customerProfiles),
     '【絶対ルール】',
-    '1. 記録にある実際の体験だけを根拠に、あなた本人の言葉で素直に答えてください。',
-    '2. こう直して・ボタンを大きくして・色を揃えて等の改善指示やデザイン用語は絶対に言わず、どこで迷ったか・何が困ったか・どう感じたかだけを話してください。',
-    '3. 吹き出しは1〜2つ、1つ35文字以内、括弧なし、日本語だけで書いてください。',
+    '1. 3人それぞれ（personaId ごと）が、自分の実際の操作記録と希望だけを根拠に、本人らしい口調で1文ずつ素直に答えてください。',
+    '2. こう直して・ボタンを大きくして・色を揃えて等の改善指示やデザイン用語は絶対に言わず、どこで迷ったか・何が困ったか・何が欲しかったか・どう感じたかだけを話してください。',
+    '3. 各人の text は35文字以内、括弧なし、日本語だけで書いてください。',
     `【これまでの会話】\n${formatHistory(req.history)}`,
   ].join('\n');
 
@@ -397,22 +439,27 @@ async function voiceCustomerLine(
         contents: prompt,
         config: {
           responseMimeType: 'application/json',
-          responseSchema: OWNER_LINE_SCHEMA,
+          responseSchema: CUSTOMER_COHORT_REPLY_SCHEMA,
           temperature: 0.7,
           ...thinkingConfig(),
         },
       },
       TIMEOUTS.side,
     );
-    const parsed = parseJsonResponse<{ lines: string[] }>(response.text, 'customer');
-    const lines = (parsed.lines ?? [])
-      .map((l) => cleanJapaneseText(l.trim(), ''))
-      .filter(Boolean)
-      .slice(0, 2);
-    return { text: lines.length > 0 ? lines.join('\n') : fallback, personaId: persona.id };
+    const parsed = parseJsonResponse<{
+      replies?: Array<{ personaId?: string; text?: string }>;
+    }>(response.text, 'customer-cohort');
+    return sims.map(({ persona, fallback }) => {
+      const found = (parsed.replies ?? []).find((r) => r.personaId === persona.id);
+      const cleaned = cleanJapaneseText((found?.text ?? '').trim(), '');
+      return {
+        personaId: persona.id,
+        text: cleaned || fallback,
+      };
+    });
   } catch (err) {
     console.warn('[gemini:customer] お客さんの返事を作れなかったためシミュレーターの言葉を使います:', err);
-    return { text: fallback, personaId: persona.id };
+    return fallbackReplies;
   }
 }
 
@@ -1060,14 +1107,29 @@ export async function applyOptionToSpec(req: ApplyRequest): Promise<ApplyRespons
   // 判断の記録は裏で続けてよい。画面の改造が終わったら、記録を少しだけ待って返事をする
   const safeDecision = decisionPromise.catch(() => undefined);
   const candidate = await specUpdatePromise;
-  const decisionRecord = await Promise.race([
-    safeDecision,
-    new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 1500)),
+  const changeStats = candidate.rolledBack
+    ? { changedComponentIds: [], removedNeededFeature: false }
+    : inspectAppliedChangeForTelemetry(req.currentSpec, candidate.updatedSpec, candidate.patches);
+  const [decisionRecord, telemetryEvent] = await Promise.all([
+    Promise.race([
+      safeDecision,
+      new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 1500)),
+    ]),
+    recordPromptTelemetryEvent({
+      cohortId: req.cohortId,
+      promptText: req.userInstruction,
+      sessionMode: 'execute',
+      recipient: 'assistant',
+      hasPenAnnotation: req.targetComponentIds.length > 0 || Boolean(req.annotatedImageBase64),
+      changedComponentIds: changeStats.changedComponentIds,
+      removedNeededFeature: changeStats.removedNeededFeature,
+    }),
   ]);
 
   return {
     ...candidate,
     decisionRecord,
+    telemetryEvent,
   };
 }
 
@@ -1237,11 +1299,19 @@ export async function evaluateAppWithPersonas(req: EvaluateRequest): Promise<Eva
   const closing = await closingPromise;
   if (closing) owner.closingLines = closing.text.split('\n').filter(Boolean);
 
+  const achievedCount = results.filter((r) => r.outcome === 'achieved').length;
+  const telemetrySummary = finalizeTelemetryOnEvaluate(
+    req.cohortId,
+    achievedCount,
+    results.length,
+  );
+
   return {
     evaluatedAt: new Date().toISOString(),
     cohortId: req.cohortId,
     results,
     owner,
+    telemetrySummary,
   };
 }
 
@@ -1289,35 +1359,8 @@ async function applyFromChat(req: ChatRequest): Promise<ChatResponse> {
     reply: applied.commitMessage,
     suggestedFollowUps: [],
     applied,
+    telemetryEvent: applied.telemetryEvent,
   };
-}
-
-/**
- * 話しかける相手のお客さん（ReviewerPersona）を決める。
- * 指定された名前・IDがあればその人、なければ直前に話したお客さん、それもなければ満足できなかった最初のお客さんを返す。
- */
-function resolveTargetCustomer(
-  req: ChatRequest,
-  hintName?: string,
-): ReviewerPersona {
-  const reviewers = getReviewersByCohort(req.cohortId);
-  if (hintName) {
-    const matched = reviewers.find(
-      (p) => p.id === hintName || p.name === hintName || hintName.includes(p.name),
-    );
-    if (matched) return matched;
-  }
-  const recentHistory = [...(req.history ?? [])].reverse();
-  for (const h of recentHistory) {
-    const matched = reviewers.find((p) => h.speaker.includes(p.name));
-    if (matched) return matched;
-  }
-  for (const p of reviewers) {
-    if (simulatePersonaComputerUse(req.currentSpec, p).outcome !== 'achieved') {
-      return p;
-    }
-  }
-  return reviewers[0];
 }
 
 const TRANSCRIBE_SCHEMA: Schema = {
@@ -1465,27 +1508,49 @@ export async function chatWithStudio(req: ChatRequest): Promise<ChatResponse> {
 
   // 宛先が「店長」または「客A〜C」のときは、その本人に繋ぐ
   if (!circledOnly && recipient === 'owner') {
-    const owner = await voiceOwnerLine({
-      situation: 'reply',
-      userMessage: effectiveReq.userMessage,
-      facts: describeOwnerContext(effectiveReq.currentSpec, effectiveReq.latestReviews),
-      fallback: OWNER_REPLY_FALLBACK,
-      history: effectiveReq.history,
-    });
+    const [owner, telemetryEvent] = await Promise.all([
+      voiceOwnerLine({
+        situation: 'reply',
+        userMessage: effectiveReq.userMessage,
+        facts: describeOwnerContext(effectiveReq.currentSpec, effectiveReq.latestReviews),
+        fallback: OWNER_REPLY_FALLBACK,
+        history: effectiveReq.history,
+      }),
+      recordPromptTelemetryEvent({
+        cohortId: effectiveReq.cohortId,
+        promptText: effectiveReq.userMessage,
+        sessionMode: 'explore',
+        recipient: 'owner',
+        hasPenAnnotation:
+          effectiveReq.targetComponentIds.length > 0 || Boolean(effectiveReq.annotatedImageBase64),
+      }),
+    ]);
     return {
       intent: 'owner',
       reply: owner.text || OWNER_REPLY_FALLBACK,
       suggestedFollowUps: [],
+      telemetryEvent,
     };
   }
   if (!circledOnly && recipient !== 'assistant') {
-    const targetPersona = resolveTargetCustomer(effectiveReq, recipient);
-    const customer = await voiceCustomerLine(targetPersona, effectiveReq);
+    const [customerReplies, telemetryEvent] = await Promise.all([
+      voiceCohortCustomers(effectiveReq),
+      recordPromptTelemetryEvent({
+        cohortId: effectiveReq.cohortId,
+        promptText: effectiveReq.userMessage,
+        sessionMode: 'explore',
+        recipient: 'customer',
+        hasPenAnnotation:
+          effectiveReq.targetComponentIds.length > 0 || Boolean(effectiveReq.annotatedImageBase64),
+      }),
+    ]);
     return {
       intent: 'customer',
-      customerPersonaId: customer.personaId,
-      reply: customer.text,
+      customerPersonaId: customerReplies[0]?.personaId,
+      customerReplies,
+      reply: customerReplies.map((r) => r.text).join('\n'),
       suggestedFollowUps: [],
+      telemetryEvent,
     };
   }
 
@@ -1642,9 +1707,23 @@ export async function chatWithStudio(req: ChatRequest): Promise<ChatResponse> {
         .slice(0, 2)
     : [];
 
+  const telemetryEvent =
+    !circledOnly && effectiveReq.userMessage
+      ? await recordPromptTelemetryEvent({
+          cohortId: effectiveReq.cohortId,
+          promptText: effectiveReq.userMessage,
+          sessionMode: 'explore',
+          recipient: 'assistant',
+          hasPenAnnotation:
+            effectiveReq.targetComponentIds.length > 0 ||
+            Boolean(effectiveReq.annotatedImageBase64),
+        })
+      : undefined;
+
   return {
     intent: parsed.intent === 'unclear' ? 'clarify' : 'explain',
     reply: cleanJapaneseText(parsed.reply, 'どこをどう変えたいか教えてください'),
     suggestedFollowUps: filteredFollowUps,
+    telemetryEvent,
   };
 }

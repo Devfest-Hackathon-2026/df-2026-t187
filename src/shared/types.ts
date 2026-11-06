@@ -2,6 +2,23 @@
 // UI部品ツリーと状態変数は型安全なJSONで管理し、単一HTMLとしてiframe内で隔離実行する。
 
 import type { Rect2D } from './hitTest.ts';
+import type {
+  EmbeddingSignal,
+  NaturalLanguageSignal,
+  PromptArchetype,
+  PromptSessionMode,
+  PromptSessionSummary,
+  PromptTelemetryEvent,
+} from './promptTelemetry.ts';
+
+export type {
+  EmbeddingSignal,
+  NaturalLanguageSignal,
+  PromptArchetype,
+  PromptSessionMode,
+  PromptSessionSummary,
+  PromptTelemetryEvent,
+};
 
 export type StateValue = string | number | boolean;
 
@@ -285,6 +302,8 @@ export interface EvaluationResponse {
   cohortId?: TargetCohortId;
   results: ReviewerEvaluation[];
   owner?: OwnerReport;
+  /** クリア時などの行動ベースのプロンプト到達効率サマリー */
+  telemetrySummary?: PromptSessionSummary;
 }
 
 // 人間の判断記録 (Own the Why / Function Calling で構造化記録)
@@ -369,6 +388,7 @@ export interface ApplyResponse {
   validation?: SandboxValidationResult;
   rolledBack?: boolean;
   decisionRecord?: HumanDecisionRecord;
+  telemetryEvent?: PromptTelemetryEvent;
 }
 
 // 店長のせりふ API の入出力
@@ -442,6 +462,9 @@ export interface ChatResponse {
   applied?: ApplyResponse;
   /** intent が customer のときの返答したペルソナID */
   customerPersonaId?: string;
+  /** intent が customer で選んだ客層のお客さんたちが順番に返答するときのリスト */
+  customerReplies?: Array<{ personaId: string; text: string }>;
+  telemetryEvent?: PromptTelemetryEvent;
 }
 
 export interface TtsRequest {

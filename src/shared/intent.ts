@@ -7,21 +7,28 @@ const QUESTION_PATTERN =
 const CHANGE_REQUEST_PATTERN =
   /(直|消|外|変え|足|加え|入れ|作|動か|移|並べ替え|まとめ|大きく|小さく|目立たなく|戻)(して|す|る|したい|しておいて|ておいて)|手直しして|改造して|ほしい|にして/;
 
-const AT_MENTION_RE =
-  /(?:^|[\s、,，。！？!?])[@＠](店長|お助けAI|お助けエージェント|お?客(?:さん)?[ABCＡＢＣ])(?:さん|くん|ちゃん|様)?(?=[、,，：:！!？?\s]|$)/i;
+const CUSTOMER_VOCATIVE_PART =
+  '(?:(?:目が遠い|指が震える|スマホに不慣れな|時間がない|片手で操作する|移動中に使う|少しでも安く買いたい|安さ重視の|うっかりしがちな|画面が割れている)?お?客(?:さん)?(?:たち|達|[ABCＡＢＣ])?)';
 
-const VOCATIVE_START_RE =
-  /^(?:(?:ねえ|ねぇ|あの|すみません|すいません|ちょっと|おい|なあ|もしもし|こんにちは|どうも)[、,，\s！!]*)*(店長|お助けAI|お助けエージェント|お?客(?:さん)?[ABCＡＢＣ])(?:さん|くん|ちゃん|様)?(?:(?:[、,，：:！!]+|\s+)|(?:へ|に(?:質問|聞きたい|聞くけど|聞くね|聞きます|相談|お願い|確認))(?:[、,，：:！!\s]|$|だけど|なんだけど)|[！!？?]*$)/i;
+const AT_MENTION_RE = new RegExp(
+  `(?:^|[\\s、,，。！？!?])[@＠](店長|お助けAI|お助けエージェント|${CUSTOMER_VOCATIVE_PART})(?:さん|くん|ちゃん|様)?(?=[、,，：:！!？?\\s]|$)`,
+  'i',
+);
+
+const VOCATIVE_START_RE = new RegExp(
+  `^(?:(?:ねえ|ねぇ|あの|すみません|すいません|ちょっと|おい|なあ|もしもし|こんにちは|どうも)[、,，\\s！!]*)*(店長|お助けAI|お助けエージェント|${CUSTOMER_VOCATIVE_PART})(?:さん|くん|ちゃん|様)?(?:(?:[、,，：:！!]+|\\s+)|(?:へ|に(?:質問|聞きたい|聞くけど|聞くね|聞きます|相談|お願い|確認))(?:[、,，：:！!\\s]|$|だけど|なんだけど)|[！!？?]*$)`,
+  'i',
+);
 
 /**
  * 発言の中で別の相手を「明確にメンション（呼びかけ・宛先指定）」しているか判定する。
- * 「店長が付けた広告」「客Aはどこで困った？」のように文中に名前が入っているだけ（第三者への言及）では反応しない。
+ * 「店長が付けた広告」「お客さんはどこで困った？」のように文中に名前が入っているだけ（第三者への言及）では反応しない。
  *
- * @returns 'assistant' | 'owner' | ペルソナID（または '客A'〜'客C'） | null（明確なメンションなし）
+ * @returns 'assistant' | 'owner' | 'customer' | null（明確なメンションなし）
  */
 export function detectExplicitRecipientMention(
   message: string,
-  cohortPersonas: Pick<ReviewerPersona, 'id' | 'name'>[] = [],
+  _cohortPersonas: Pick<ReviewerPersona, 'id' | 'name'>[] = [],
 ): string | null {
   const trimmed = message.trim();
   if (!trimmed) return null;
@@ -34,13 +41,8 @@ export function detectExplicitRecipientMention(
 
   if (rawTarget === '店長') return 'owner';
   if (rawTarget.startsWith('お助け')) return 'assistant';
+  if (rawTarget.includes('客')) return 'customer';
 
-  const customerMatch = rawTarget.match(/[ABC]$/);
-  if (customerMatch) {
-    const customerName = `客${customerMatch[0]}`;
-    const matchedPersona = cohortPersonas.find((p) => p.name === customerName);
-    return matchedPersona ? matchedPersona.id : customerName;
-  }
   return null;
 }
 

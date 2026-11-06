@@ -35,8 +35,8 @@ fi
 echo "==> 1. GCP プロジェクトを '${PROJECT_ID}' に設定します..."
 gcloud config set project "$PROJECT_ID"
 
-echo "==> 2. Gemini Enterprise Agent Platform API (aiplatform.googleapis.com) と Cloud Run API を確認・有効化します..."
-gcloud services enable aiplatform.googleapis.com run.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com
+echo "==> 2. Gemini / Cloud Natural Language / Text-to-Speech / BigQuery / Firestore / Cloud Run API を確認・有効化します..."
+gcloud services enable aiplatform.googleapis.com language.googleapis.com texttospeech.googleapis.com bigquery.googleapis.com firestore.googleapis.com run.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com
 
 ADC_FILE="$HOME/.config/gcloud/application_default_credentials.json"
 if [ ! -f "$ADC_FILE" ]; then

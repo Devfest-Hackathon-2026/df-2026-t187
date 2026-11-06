@@ -1213,8 +1213,10 @@ function resolveExplicitRecipientSwitch(text: string): string | null {
     : [];
   const mentioned = detectExplicitRecipientMention(text, cohortPersonas);
   if (!mentioned) return null;
-  if (mentioned === 'assistant' || mentioned === 'owner') return mentioned;
-  if (cohortPersonas.some((p) => p.id === mentioned)) return mentioned;
+  if (mentioned === 'assistant' || mentioned === 'owner' || mentioned === 'customer') {
+    return mentioned;
+  }
+  if (cohortPersonas.some((p) => p.id === mentioned)) return 'customer';
   return null;
 }
 
@@ -1517,16 +1519,23 @@ async function handleSendMessage(
       );
       return;
     } else if (data.intent === 'customer') {
-      // お客さんに話しかけたときは、そのお客さん本人が返事をする
+      // お客さんに話しかけたときは、選んだ客層の3人が順番に一言ずつ返事をする
       if (logMessage) state.messages = state.messages.filter((m) => m !== logMessage);
       state.chatLoading = false;
-      const personaId = data.customerPersonaId;
-      enqueueMessages(
-        splitIntoChatChunks(data.reply).map((chunk, i) => ({
-          message: { role: 'customer' as const, personaId, text: chunk },
-          typingMs: i === 0 ? 400 : typingDurationFor(chunk),
-        })),
-      );
+      const replies =
+        data.customerReplies && data.customerReplies.length > 0
+          ? data.customerReplies
+          : [{ personaId: data.customerPersonaId ?? '', text: data.reply }];
+      const queued: QueuedMessage[] = [];
+      replies.forEach((item, idx) => {
+        for (const [chunkIdx, chunk] of splitIntoChatChunks(item.text).entries()) {
+          queued.push({
+            message: { role: 'customer' as const, personaId: item.personaId, text: chunk },
+            typingMs: idx === 0 && chunkIdx === 0 ? 400 : typingDurationFor(chunk),
+          });
+        }
+      });
+      enqueueMessages(queued);
       return;
     } else {
       // 改造だと思って作業ログを出したが、質問や聞き返しだったときは消す
@@ -1695,6 +1704,15 @@ async function handleEvaluate(): Promise<void> {
             text: line,
           },
           typingMs: typingDurationFor(line),
+        });
+      }
+      for (const telemetryLine of evaluation.telemetrySummary?.systemLogLines ?? []) {
+        queued.push({
+          message: {
+            role: 'system',
+            text: telemetryLine,
+          },
+          typingMs: 0,
         });
       }
       if (remaining.length > 0) {
@@ -1907,9 +1925,8 @@ function getRecipientPlaceholder(
   if (recipient === 'owner') {
     return `${OWNER.name}に話しかける（例：定期便のチェック外してもいい？）`;
   }
-  const selectedPersona = cohortPersonas.find((p) => p.id === recipient);
-  if (selectedPersona) {
-    return `${selectedPersona.name}に聞く（例：どこで困ったの？）`;
+  if (recipient === 'customer' || cohortPersonas.some((p) => p.id === recipient)) {
+    return 'お客さんに聞く（例：どこで困ったの？ / 定期便はあった方がいい？）';
   }
   return 'お助けAIに手直しの指示や質問を入力（例：注文ボタンを動くように直して）';
 }
@@ -2079,12 +2096,12 @@ function renderChatPanel(): HTMLElement {
       stream.appendChild(
         createSpeakerRow(
           'customer',
-          persona?.icon ?? '',
-          persona?.name ?? '',
+          persona?.icon ?? '客',
+          persona?.name ?? 'お客さん',
           bubble,
           [],
           isContinuation,
-          persona?.id,
+          'customer',
         ),
       );
       continue;
@@ -2115,13 +2132,14 @@ function renderChatPanel(): HTMLElement {
     stream.appendChild(row);
   }
 
+  const cohortPersonas = state.selectedCohortId ? getReviewersByCohort(state.selectedCohortId) : [];
   const workLogRunning = state.messages.some((m) => m.workLog && !m.workLog.finished);
   const loadingPersona =
     state.chatLoading &&
     !workLogRunning &&
     state.recipient !== 'assistant' &&
     state.recipient !== 'owner'
-      ? findPersona(state.recipient)
+      ? (findPersona(state.recipient) ?? cohortPersonas[0])
       : undefined;
 
   // 店長の書き込み中の表示
@@ -2199,7 +2217,6 @@ function renderChatPanel(): HTMLElement {
   recipientLabel.textContent = '宛先';
   recipientRow.appendChild(recipientLabel);
 
-  const cohortPersonas = state.selectedCohortId ? getReviewersByCohort(state.selectedCohortId) : [];
   let latestEvalForRecipients: EvaluationResponse | undefined;
   for (let i = state.activeCheckpointIndex; i >= 0; i--) {
     const e = evaluationFor(state.checkpoints[i]);
@@ -2208,6 +2225,12 @@ function renderChatPanel(): HTMLElement {
       break;
     }
   }
+  const allCustomersAchieved =
+    cohortPersonas.length > 0 &&
+    cohortPersonas.every(
+      (p) =>
+        latestEvalForRecipients?.results.find((r) => r.reviewerId === p.id)?.outcome === 'achieved',
+    );
   const recipientOptions: Array<{
     key: string;
     label: string;
@@ -2216,16 +2239,16 @@ function renderChatPanel(): HTMLElement {
   }> = [
     { key: 'assistant', label: AGENT_NAME },
     { key: 'owner', label: OWNER.name },
-    ...cohortPersonas.map((p, idx) => {
-      const achieved =
-        latestEvalForRecipients?.results.find((r) => r.reviewerId === p.id)?.outcome === 'achieved';
-      return {
-        key: p.id,
-        label: achieved ? `✓ ${p.name}` : p.name,
-        customerIndex: idx,
-        achieved,
-      };
-    }),
+    ...(cohortPersonas.length > 0
+      ? [
+          {
+            key: 'customer',
+            label: allCustomersAchieved ? '✓ お客さん' : 'お客さん',
+            customerIndex: 0,
+            achieved: allCustomersAchieved,
+          },
+        ]
+      : []),
   ];
   const isCohortLocked = !state.selectedCohortId;
   const now = performance.now();
@@ -2237,8 +2260,8 @@ function renderChatPanel(): HTMLElement {
     pill.className = `composer-recipient-pill${state.recipient === opt.key ? ' is-active' : ''}${opt.customerIndex !== undefined ? ' is-customer-pill' : ''}${opt.achieved ? ' is-achieved-customer' : ''}`;
     if (opt.customerIndex !== undefined) {
       pill.title = opt.achieved
-        ? 'このお客さんは満足して注文できました（クリックで話しかける）'
-        : 'まだ困っているお客さんに話しかける';
+        ? 'お客さん全員が満足して注文できました（クリックで話しかける）'
+        : 'お客さんに質問する';
       let firstSeen = recipientFirstSeenAt.get(opt.key);
       if (firstSeen === undefined) {
         firstSeen = now;

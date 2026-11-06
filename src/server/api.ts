@@ -19,7 +19,13 @@ import {
   transcribeAndRefineUserAudio,
   voiceOwnerLine,
 } from './gemini.ts';
-import { listHumanDecisions, synthesizeStudioSpeech, verifyAppCheckHeader } from './store.ts';
+import { summarizePromptTelemetry } from '../shared/promptTelemetry.ts';
+import {
+  listHumanDecisions,
+  listPromptTelemetryEvents,
+  synthesizeStudioSpeech,
+  verifyAppCheckHeader,
+} from './store.ts';
 
 const MAX_BODY_BYTES = 8 * 1024 * 1024; // 8MB (ペン描きスクリーンショットBase64対応)
 
@@ -95,6 +101,15 @@ export async function handleApiRequest(
 
     if (req.method === 'GET' && url === '/api/decisions') {
       sendJson(res, 200, { decisions: listHumanDecisions() });
+      return true;
+    }
+
+    if (req.method === 'GET' && url === '/api/telemetry') {
+      const events = listPromptTelemetryEvents();
+      sendJson(res, 200, {
+        events,
+        summary: summarizePromptTelemetry(events),
+      });
       return true;
     }
 

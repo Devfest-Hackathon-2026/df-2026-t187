@@ -34,10 +34,10 @@
 ## 体験の流れ
 
 1. **顧客層を選ぶ**
-   - 依頼主の店長が事情を話したあと、システムメッセージで「誰のために手直ししますか」と尋ねます。選んだ顧客層の3人（客A・客B・客C）が来店し、それぞれの希望を話します。
+   - 依頼主の店長が事情を話したあと、システムメッセージで「誰のために手直ししますか」と尋ねます。選んだ顧客層の3人（例：目が遠いお客さん・指が震えるお客さん・スマホに不慣れなお客さん）が来店し、それぞれの希望を話します。
 2. **ダメ出しと質問・対話**
    - スマートフォン実機プレビューの気になる部品を赤ペンで囲むか、チャット入力欄から自然言語で送信します（マイク音声入力にも対応）。
-   - 宛先ピル（または `@店長` `客A、` などの呼びかけ）で、お助けAI・店長・客A〜Cの誰にでも直接質問・相談できます。
+   - 宛先ピル（`お助けAI`・`店長`・`お客さん` の3択、または `@店長` `お客さん、` などの呼びかけ）で直接質問・相談できます。`お客さん` に質問すると、3人がそれぞれの立場から順番に一言ずつ返答します。
    - 質問にはお助けAIが画面の実際の仕様にある事実だけで短く答え、誰が喜ぶか・困るかといった判断は言いません。
 3. **改造する**
    - 改造の指示を送ると、実装AIが部品の削除・差し替え・追加・移動と状態の変更という最小限の差分パッチを生成し、画面を書き換えます。触っていない部品は変わらないため、改修してもデザインが崩れません。
@@ -51,7 +51,9 @@
    - Gemini は操作ログに基づく各ペルソナの感想生成のみを担い、改善方法は指示しません。感想はお客さん本人の発言としてチャットに表示され、店長も注文数や定期便の件数に反応します。
 5. **トレードオフを判断して次の改善を回す**
    - まだ満足できていないお客さんに理由を聞いたり、売上が減って困っている店長の意見を聞いたりしながら、「ただ消す」のではなく「誰のためにどう整えて残すか」を判断して次の手直しへ進みます。
-   - 顧客層の選択や改造の指示は、Gemini Function Calling を通じて判断履歴として記録されます。
+   - プレイ中の発言は、店長や顧客への質問（探索型）と画面の手直し指示（実行型）に分離して裏側で記録されます。指示文の具体的な対象・条件の有無を Cloud Natural Language API で抽出し、Vertex AI Text Embeddings によって指示の型（単純削除型・条件設計型・具体修正型・丸投げ型）を分類します。
+   - 選んだ顧客層3人全員が満足してステージをクリアした瞬間のみ、LLMの主観採点ではなく「情報聞き出し回数・手直し指示回数・同じ部品への手戻り回数・初回成功率」と「どの指示への改善が決め手になったか」が実プロンプト引用つきでシステムログに表示されます。
+   - 顧客層の選択・改造の判断履歴とプロンプトの行動テレメトリは、Cloud Firestore および BigQuery へ構造化保存されます。
 
 ## 3つのAIの役割分担
 
@@ -86,13 +88,16 @@
 - [`src/shared/appRuntime.ts`](src/shared/appRuntime.ts)：計算式・表示条件・アクションの実行規則。画面描画と操作シミュレーターで共有
 - [`src/client/sandboxRenderer.ts`](src/client/sandboxRenderer.ts)：スマホ画面内でのコンポーネント描画とイベント発火ロジック
 - [`src/shared/sandboxValidator.ts`](src/shared/sandboxValidator.ts)：単一HTMLサンドボックスの整合性検査と、部品の役割に基づく操作シミュレーション
+- [`src/shared/promptTelemetry.ts`](src/shared/promptTelemetry.ts)：探索型・実行型の分離、指示の型分類、手戻り判定、クリア時の行動指標集計
 - [`src/server/gemini.ts`](src/server/gemini.ts)：3つのAIのプロンプト設計、Structured Outputs スキーマ、発言の意図判定
+- [`src/server/store.ts`](src/server/store.ts)：Cloud Natural Language API・Vertex AI Text Embeddings・Cloud Text-to-Speech・BigQuery・Cloud Firestore 連携
 
 ## 技術構成
 
 - **フロントエンド**：TypeScript / Vite / HTML5 Canvas / Sandbox `iframe`
-- **バックエンド**：Node.js HTTP Server / `@google/genai` によるマルチモーダル入力・Structured Outputs・Function Calling
-- **インフラ・永続化**：Google Cloud Run / Cloud Firestore / Firebase App Check
+- **生成AI・音声**：`@google/genai` (Vertex AI / Gemini) によるマルチモーダル入力・Structured Outputs・Function Calling / Google Cloud Text-to-Speech API (11キャラクター別ボイス合成)
+- **非LLM分析・テレメトリ基盤**：Google Cloud Natural Language API (エンティティ・感情抽出) / Vertex AI Text Embeddings (`text-multilingual-embedding-002` による指示クラスタ分類) / BigQuery Streaming Insert / Cloud Firestore
+- **インフラ・セキュリティ**：Google Cloud Run / Firebase App Check
 - **品質・衛生管理**：Node.js Test Runner / `scripts/check-hygiene.mjs` によるコミット・機密情報・パス混入検査
 
 ## セットアップ・起動方法

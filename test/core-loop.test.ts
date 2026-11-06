@@ -41,6 +41,18 @@ import {
   buildOwnerReport,
 } from '../src/shared/owner.ts';
 import { applySpecPatches } from '../src/shared/specPatch.ts';
+import {
+  classifyDeterministicArchetype,
+  cosineSimilarity,
+  extractDeterministicNlSignal,
+  inspectAppliedChangeForTelemetry,
+  summarizePromptTelemetry,
+} from '../src/shared/promptTelemetry.ts';
+import {
+  clearPromptTelemetryEvents,
+  finalizeTelemetryOnEvaluate,
+  recordPromptTelemetryEvent,
+} from '../src/server/store.ts';
 import { buildInitialSpec, buildScenarioSpec, findComponent } from '../src/shared/theme.ts';
 import type { AppSpec, ReviewOutcome, SpecPatch } from '../src/shared/types.ts';
 
@@ -339,8 +351,10 @@ describe('core-loop', () => {
     for (const cohort of ACTIVE_THEME.cohorts) {
       const reviewers = getReviewersByCohort(cohort.id);
       assert.equal(reviewers.length, 3);
-      assert.deepEqual(reviewers.map((r) => r.name), ['客A', '客B', '客C']);
-      assert.deepEqual(reviewers.map((r) => r.icon), ['A', 'B', 'C']);
+      for (const r of reviewers) {
+        assert.match(r.name, /お客さん$/);
+        assert.equal(r.icon, '客');
+      }
     }
   });
 
@@ -351,9 +365,9 @@ describe('core-loop', () => {
     assert.equal(detectExplicitRecipientMention('店長、広告を消してもいい？', carefulPersonas), 'owner');
     assert.equal(detectExplicitRecipientMention('@店長 定期便はどうする？', carefulPersonas), 'owner');
     assert.equal(detectExplicitRecipientMention('ねえ店長！売上って大事？', carefulPersonas), 'owner');
-    assert.equal(detectExplicitRecipientMention('客A、どこで困ったの？', carefulPersonas), 'kazuko');
-    assert.equal(detectExplicitRecipientMention('客Bさん、何が嫌だった？', carefulPersonas), 'shigeru');
-    assert.equal(detectExplicitRecipientMention('@客C どこが分かりにくかった？', carefulPersonas), 'harue');
+    assert.equal(detectExplicitRecipientMention('お客さん、どこで困ったの？', carefulPersonas), 'customer');
+    assert.equal(detectExplicitRecipientMention('@お客さん 何が嫌だった？', carefulPersonas), 'customer');
+    assert.equal(detectExplicitRecipientMention('目が遠いお客さん、文字は読めた？', carefulPersonas), 'customer');
     assert.equal(detectExplicitRecipientMention('お助けAI、注文ボタンを直して', carefulPersonas), 'assistant');
     assert.equal(detectExplicitRecipientMention('@お助けAI これ何の部品？', carefulPersonas), 'assistant');
 
@@ -361,9 +375,9 @@ describe('core-loop', () => {
     for (const msg of [
       '店長が付けた広告を消して',
       '店長の言ってる定期便って何？',
-      '客Aはどこで困ったの？',
-      '客Bが買えなかった原因を教えて',
-      '客Cの言ってるボタンを直して',
+      'お客さんはどこで困ったの？',
+      '目が遠いお客さんが買えなかった原因を教えて',
+      'お客さんの言ってるボタンを直して',
       'お助けAIに頼む前にどう思う？',
     ]) {
       assert.equal(detectExplicitRecipientMention(msg, carefulPersonas), null, msg);
@@ -943,5 +957,153 @@ describe('core-loop', () => {
     const subMetric = ownerReport.metrics.find((m) => m.label === '定期便');
     assert.equal(subMetric?.missing, false);
     assert.ok((subMetric?.count ?? 0) >= 1);
+  });
+
+  it('プロンプト・テレメトリが探索と実行を分離し、単純削除から条件設計への改善を行動指標として集計する', async () => {
+    clearPromptTelemetryEvents();
+    const initial = buildScenarioSpec(ACTIVE_THEME, ACTIVE_THEME.defaultScenarioId).spec;
+
+    // 1. 一次特徴（NLシグナル）と型分類（Embeddingシグナル）の検証
+    const deleteNl = extractDeterministicNlSignal('定期便を消して');
+    assert.deepEqual(deleteNl.entities, ['定期便']);
+    assert.equal(deleteNl.hasConditionConstraint, false);
+    assert.equal(
+      classifyDeterministicArchetype('定期便を消して', 'execute').closestArchetype,
+      'simple_delete',
+    );
+
+    const conditionNl = extractDeterministicNlSignal(
+      '定期便の初期チェックを外して解約条件を明記して',
+    );
+    assert.ok(conditionNl.entities.includes('定期便'));
+    assert.ok(conditionNl.entities.includes('チェック'));
+    assert.ok(conditionNl.entities.includes('解約条件'));
+    assert.equal(conditionNl.hasConditionConstraint, true);
+    assert.equal(
+      classifyDeterministicArchetype(
+        '定期便の初期チェックを外して解約条件を明記して',
+        'execute',
+      ).closestArchetype,
+      'condition_design',
+    );
+
+    assert.equal(cosineSimilarity([1, 0], [1, 0]), 1);
+    assert.equal(cosineSimilarity([1, 0], [0, 1]), 0);
+
+    // 2. 探索型（店長・客への質問）は往復数のペナルティ（初回成功率の分母）に入らない
+    await recordPromptTelemetryEvent({
+      cohortId: 'careful',
+      promptText: '店長、定期便ってどうして付けてるの？',
+      sessionMode: 'explore',
+      recipient: 'owner',
+      hasPenAnnotation: false,
+    });
+    await recordPromptTelemetryEvent({
+      cohortId: 'careful',
+      promptText: '客B、どこで困ったの？',
+      sessionMode: 'explore',
+      recipient: 'shigeru',
+      hasPenAnnotation: false,
+    });
+
+    // 3. 実行1回目：定期便を単純削除してしまった場合（removedNeededFeature: true）
+    const deletedPatch: SpecPatch[] = [{ op: 'remove_component', id: 'check-subscription' }];
+    const deletedResult = applyPatchesToSpecWithValidation(
+      initial,
+      '定期便を消しました',
+      deletedPatch,
+    );
+    const deletedStats = inspectAppliedChangeForTelemetry(
+      initial,
+      deletedResult.updatedSpec,
+      deletedPatch,
+    );
+    assert.equal(deletedStats.removedNeededFeature, true);
+
+    await recordPromptTelemetryEvent({
+      cohortId: 'careful',
+      promptText: '定期便を消して',
+      sessionMode: 'execute',
+      recipient: 'assistant',
+      hasPenAnnotation: true,
+      changedComponentIds: deletedStats.changedComponentIds,
+      removedNeededFeature: deletedStats.removedNeededFeature,
+    });
+
+    // 4. 実行2回目：同じ定期便部品を、初期チェック解除＋解約条件明記の形で整え直した場合
+    const subComp = findComponent(initial, 'check-subscription');
+    const restoredPatches: SpecPatch[] = [
+      {
+        op: 'insert_component',
+        afterId: 'summary-price',
+        component: {
+          ...subComp,
+          label: '定期お届け便で注文する・いつでも解約OK',
+          style: { variant: 'default', size: 'sm' },
+        },
+      },
+      {
+        op: 'upsert_state',
+        variable: { key: 'subscription', label: '定期便', type: 'boolean', initialValue: false },
+      },
+    ];
+    const restoredResult = applyPatchesToSpecWithValidation(
+      deletedResult.updatedSpec,
+      '定期便の条件を整えました',
+      restoredPatches,
+    );
+    const restoredStats = inspectAppliedChangeForTelemetry(
+      deletedResult.updatedSpec,
+      restoredResult.updatedSpec,
+      restoredPatches,
+    );
+    assert.equal(restoredStats.removedNeededFeature, false);
+
+    const secondExecEvent = await recordPromptTelemetryEvent({
+      cohortId: 'careful',
+      promptText: '定期便の初期チェックを外して解約条件を明記して',
+      sessionMode: 'execute',
+      recipient: 'assistant',
+      hasPenAnnotation: true,
+      changedComponentIds: restoredStats.changedComponentIds,
+      removedNeededFeature: restoredStats.removedNeededFeature,
+    });
+    assert.equal(secondExecEvent.isReworkOnSameComponent, true);
+
+    // 5. クリア時のサマリー生成とシステムメッセージ行（括弧なし・インラインコード付き）の確認
+    const summary = finalizeTelemetryOnEvaluate('careful', 3, 3);
+    assert.equal(summary.exploreTurns, 2);
+    assert.equal(summary.executeTurns, 2);
+    assert.equal(summary.reworkTurns, 1);
+    assert.equal(summary.firstShotSuccessRate, 50);
+    assert.ok(summary.turningPoint);
+    assert.equal(summary.turningPoint?.beforePrompt, '定期便を消して');
+    assert.equal(
+      summary.turningPoint?.afterPrompt,
+      '定期便の初期チェックを外して解約条件を明記して',
+    );
+    assert.equal(summary.systemLogLines.length, 2);
+    assert.match(
+      summary.systemLogLines[0],
+      /情報聞き出し `2回` 手直し指示 `2回` 手戻り `1回` 初回成功率 `50%`/,
+    );
+    assert.match(
+      summary.systemLogLines[1],
+      /`定期便を消して` から条件を具体化した `定期便の初期チェックを外して解約条件を明記して`/,
+    );
+    for (const line of summary.systemLogLines) {
+      assert.doesNotMatch(line, /[()（）「」『』]/);
+    }
+
+    // 6. 手戻りなしで一発到達したケースの初回成功率100%確認
+    const oneShotSummary = summarizePromptTelemetry([
+      {
+        ...secondExecEvent,
+        isReworkOnSameComponent: false,
+        removedNeededFeature: false,
+      },
+    ]);
+    assert.equal(oneShotSummary.firstShotSuccessRate, 100);
+    assert.match(oneShotSummary.systemLogLines[0], /初回成功率 `100%`/);
   });
 });
