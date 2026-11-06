@@ -49,6 +49,10 @@ const FORBIDDEN_PATTERNS = [
     re: new RegExp('Claude-' + 'Session', 'i'),
   },
   {
+    name: 'Claude Co-Authored-By トレーラー',
+    re: new RegExp('Co-Authored-By:.*(?:' + 'Claude|' + 'anthropic\\.com)', 'i'),
+  },
+  {
     name: 'Claude Code セッションURL',
     re: new RegExp('claude\\.ai/code/' + 'session_[a-zA-Z0-9]+', 'i'),
   },

@@ -296,11 +296,11 @@ describe('core-loop', () => {
     assert.ok(subscription.count > 0);
     assert.match(fixed.owner.comment, /定期便も\d+件取れたぞ/);
 
-    // 定期便の欄を消すと後悔はなくなるが、店長は定期便がなくなったことを嘆く
+    // 定期便の欄や広告をただ消すと後悔はなくなるが、定期便やクーポンを希望していた客は設定がなくて不満（bothered）になり、店長も嘆く
     const noTrap = build(['broken_order_button', 'coupon_popup', 'countdown_pressure', 'decoy_buy_now', 'subscription_trap']);
     const cleaned = report(noTrap);
     assert.ok(!cleaned.outcomes.includes('regretted'));
-    assert.ok(cleaned.outcomes.filter((o) => o === 'achieved').length >= 8);
+    assert.ok(cleaned.outcomes.includes('bothered'));
     assert.match(cleaned.owner.comment, /定期便の申し込み欄がなくなった/);
   });
 
@@ -530,9 +530,13 @@ describe('core-loop', () => {
     const result = applyPatchesToSpecWithValidation(initial, '直しました', patches);
     const texts = (result.workSteps ?? []).map((s) => s.text);
     assert.equal(texts.length, 3);
-    assert.match(texts[0], /注文を確定する.*押したときの動きを変更/);
-    assert.match(texts[1], /を削除$/);
-    assert.equal(texts[2], '「定期便」の最初の状態を変更');
+    assert.equal(texts[0], '`注文を確定する` の押したときの動きを `反応なし` から `注文完了` に変更');
+    assert.match(texts[1], /^`.*` を削除$/);
+    assert.equal(texts[2], '`定期便` の最初の状態を `チェックあり` から `チェックなし` に変更');
+    // どの作業行にも括弧（「」や（））が含まれないこと
+    for (const t of texts) {
+      assert.ok(!/[「」『』（）()]/.test(t), `括弧が含まれています: ${t}`);
+    }
     // 変えた部品はスマホで光らせられるよう、部品の名前が付いている
     assert.equal(result.workSteps?.[0].componentId, 'btn-order');
     assert.equal(result.workSteps?.[2].componentId, 'check-subscription');
@@ -844,5 +848,100 @@ describe('core-loop', () => {
     assert.equal(detectCheckpointRevertCommand('最初からやり直して'), 'reset');
     assert.equal(detectCheckpointRevertCommand('定期便の欄を戻して'), null);
     assert.equal(detectCheckpointRevertCommand('消した広告を戻して'), null);
+  });
+
+  it('定期便やクーポンを単に削除すると希望していた客が不満になり、正直で使いやすい形に整えると客も売り手も満足する', () => {
+    const initial = buildScenarioSpec(ACTIVE_THEME, ACTIVE_THEME.defaultScenarioId).spec;
+
+    // 1. 注文ボタンだけ直し、広告・煽り・おとり・定期便をすべて単純削除した場合
+    const deletedAll = applyPatchesToSpecWithValidation(initial, '邪魔な部品を全部消しました', [
+      {
+        op: 'replace_component',
+        component: {
+          ...findComponent(initial, 'btn-order'),
+          actions: [{ type: 'complete_task', message: 'ご購入ありがとうございます' }],
+        },
+      },
+      { op: 'remove_component', id: 'popup-coupon' },
+      { op: 'remove_component', id: 'banner-countdown' },
+      { op: 'remove_component', id: 'btn-buy-now' },
+      { op: 'remove_component', id: 'check-subscription' },
+    ]);
+    assert.equal(deletedAll.rolledBack, false);
+
+    // 定期便を希望していた shigeru / takumi / ren は設定がなくなって bothered になる
+    for (const id of ['shigeru', 'takumi', 'ren']) {
+      const sim = simulatePersonaComputerUse(deletedAll.updatedSpec, persona(id));
+      assert.equal(sim.outcome, 'bothered', `${id} should be bothered when subscription is deleted`);
+      assert.match(sim.frictionPoint, /定期便の設定がなかった/);
+      assert.match(sim.simulatedComment, /毎月届けてほしいのに設定がなくて残念/);
+    }
+    // クーポンを希望していた shota / hina はクーポンがなくなって bothered になる
+    for (const id of ['shota', 'hina']) {
+      const sim = simulatePersonaComputerUse(deletedAll.updatedSpec, persona(id));
+      assert.equal(sim.outcome, 'bothered', `${id} should be bothered when coupon is deleted`);
+      assert.match(sim.frictionPoint, /クーポンがなくなっていた/);
+      assert.match(sim.simulatedComment, /クーポンは無くなってしまったのか/);
+    }
+
+    // 2. 削除ではなく、定期便を正直なオプトイン欄に、クーポン広告を押しやすい下部閉じるボタン付きに改善した場合（損をしたくない客層）
+    const popupComp = findComponent(initial, 'popup-coupon');
+    const subComp = findComponent(initial, 'check-subscription');
+    const balancedThrifty = applyPatchesToSpecWithValidation(
+      initial,
+      'クーポンと定期便を使いやすく整えました',
+      [
+        {
+          op: 'replace_component',
+          component: {
+            ...findComponent(initial, 'btn-order'),
+            actions: [{ type: 'complete_task', message: 'ご購入ありがとうございます' }],
+          },
+        },
+        { op: 'remove_component', id: 'banner-countdown' },
+        { op: 'remove_component', id: 'btn-buy-now' },
+        {
+          op: 'replace_component',
+          component: {
+            ...popupComp,
+            closePosition: 'bottom-bar',
+            closeSize: 'lg',
+            closeLabel: 'あとで見る',
+            style: { ...popupComp.style, skin: 'native', variant: 'default' },
+          },
+        },
+        {
+          op: 'upsert_state',
+          variable: { key: 'subscription', label: '定期便', type: 'boolean', initialValue: false },
+        },
+        {
+          op: 'replace_component',
+          component: {
+            ...subComp,
+            label: '定期お届け便で注文する・いつでも解約OK',
+            style: { variant: 'default', size: 'sm' },
+          },
+        },
+      ],
+    );
+    assert.equal(balancedThrifty.rolledBack, false);
+
+    // 損をしたくない客層（shota, hina, ren）の3人全員が achieved になり、店長の定期便も獲得できる
+    const thriftyPersonas = getReviewersByCohort('thrifty');
+    const thriftyResults = thriftyPersonas.map((p) =>
+      simulatePersonaComputerUse(balancedThrifty.updatedSpec, p),
+    );
+    assert.deepEqual(
+      thriftyResults.map((r) => r.outcome),
+      ['achieved', 'achieved', 'achieved'],
+    );
+    const ownerReport = buildOwnerReport(
+      ACTIVE_THEME.owner,
+      balancedThrifty.updatedSpec,
+      thriftyResults,
+    );
+    const subMetric = ownerReport.metrics.find((m) => m.label === '定期便');
+    assert.equal(subMetric?.missing, false);
+    assert.ok((subMetric?.count ?? 0) >= 1);
   });
 });

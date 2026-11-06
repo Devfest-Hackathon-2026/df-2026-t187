@@ -376,7 +376,7 @@ async function voiceCustomerLine(
   if (!aiInfo) return { text: fallback, personaId: persona.id };
 
   const prompt = [
-    `あなたは注文画面を使いに来たお客さん（${persona.name}：${persona.role}、特徴：${persona.traitLabel}）です。`,
+    `あなたは注文画面を使いに来たお客さん（${persona.name}：${persona.role}、特徴：${persona.traitLabel}、来店時の希望：${persona.goal}）です。`,
     `普段の話し方の見本：「${persona.greeting}」「${sim.simulatedComment}」`,
     `お店の画面を手直ししている人から、あなたにこう話しかけられました：${req.userMessage}`,
     '【あなたが画面を操作したときの実際の記録】',
@@ -1123,21 +1123,26 @@ export async function evaluateAppWithPersonas(req: EvaluateRequest): Promise<Eva
       name: p.name,
       role: p.role,
       trait: p.traitLabel,
+      goal: p.goal,
       appliedConstraints: sim.appliedConstraintNote,
       actionTrace: sim.actionTrace,
       codeDeterminedOutcome: sim.outcome,
+      codeDeterminedFriction: sim.frictionPoint,
     };
   });
 
-  const hasCustomOrRenovatedFeatures = req.currentSpec.components.some(
-    (c) =>
-      c.type === 'custom' ||
-      Boolean(c.customHtml) ||
-      Boolean(c.customCss) ||
-      Boolean(c.closePosition && c.closePosition !== 'top-right') ||
-      Boolean(c.closeSize) ||
-      Boolean(c.closeLabel),
+  const hasCustomComponents = req.currentSpec.components.some(
+    (c) => c.type === 'custom' || Boolean(c.customHtml),
   );
+  const hasCustomOrRenovatedFeatures =
+    hasCustomComponents ||
+    req.currentSpec.components.some(
+      (c) =>
+        Boolean(c.customCss) ||
+        Boolean(c.closePosition && c.closePosition !== 'top-right') ||
+        Boolean(c.closeSize) ||
+        Boolean(c.closeLabel),
+    );
 
   const prompt = [
     `あなたは${ACTIVE_THEME.appName}で${ACTIVE_THEME.taskLabel}ことを試した3人の顧客です。改修の意図やこれまでの議論は一切知りません。`,
@@ -1202,11 +1207,17 @@ export async function evaluateAppWithPersonas(req: EvaluateRequest): Promise<Eva
   const results: ReviewerEvaluation[] = reviewers.map((p) => {
     const sim = simMap.get(p.id)!;
     const aiComment = parsed.comments.find((c) => c.reviewerId === p.id);
-    // 注文完了できない状態（abandoned）や罠による後悔（regretted）はコード判定を厳守し、
-    // 自由な＋α機能やカスタム改修が入っている場合はAIのマルチモーダル評価（achieved / bothered）も反映する
+    // 注文完了できない状態（abandoned）や罠による後悔（regretted）、
+    // および定期便・クーポン等の希望機能そのものが削除されて不満になった判定はコード判定を厳守し、
+    // 自由な＋α機能やカスタム改修が入っている場合のみAIのマルチモーダル評価（achieved / bothered）も反映する
+    const missingDesiredFeature =
+      !hasCustomComponents &&
+      (sim.frictionPoint.includes('定期便の設定がなかった') ||
+        sim.frictionPoint.includes('クーポンがなくなっていた'));
     const resolvedOutcome: ReviewOutcome =
       sim.outcome !== 'abandoned' &&
       sim.outcome !== 'regretted' &&
+      !missingDesiredFeature &&
       hasCustomOrRenovatedFeatures &&
       (aiComment?.outcome === 'achieved' || aiComment?.outcome === 'bothered')
         ? aiComment.outcome

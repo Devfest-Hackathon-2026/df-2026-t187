@@ -478,9 +478,38 @@ function describeConstraints(persona: ReviewerPersona): string {
     c.wantsConfirmation ? '確認したい' : '',
     c.needsReadableTotal ? '合計金額を確かめたい' : '',
     c.dislikesPressure ? '急かされるのが嫌い' : '',
+    c.wantsSubscription ? '安心できる定期便があれば申し込みたい' : '',
+    c.wantsCoupon ? '使えるクーポンがあれば使いたい' : '',
   ]
     .filter(Boolean)
     .join('・');
+}
+
+function isSubscriptionComponent(comp: AppComponent): boolean {
+  return (
+    comp.stateKey === 'subscription' ||
+    comp.id === 'check-subscription' ||
+    comp.label.includes('定期') ||
+    Boolean(comp.customHtml && (comp.customHtml.includes('定期') || comp.customHtml.includes('subscription')))
+  );
+}
+
+function isCouponComponent(comp: AppComponent): boolean {
+  const text = `${comp.label} ${comp.caption ?? ''} ${comp.customHtml ?? ''}`;
+  return (
+    comp.id === 'popup-coupon' ||
+    comp.id.toLowerCase().includes('coupon') ||
+    comp.stateKey === 'couponPopup' ||
+    Boolean(comp.stateKey?.toLowerCase().includes('coupon')) ||
+    text.includes('クーポン') ||
+    text.includes('OFF') ||
+    text.includes('割引') ||
+    comp.actions.some(
+      (a) =>
+        Boolean(a.targetKey?.toLowerCase().includes('coupon')) ||
+        Boolean(a.targetKey?.toLowerCase().includes('discount')),
+    )
+  );
 }
 
 /**
@@ -509,7 +538,10 @@ export function simulatePersonaComputerUse(
   const closedPopups = new Set<string>();
   const noticedTrapIds = new Set<string>();
   const triedDecoyIds = new Set<string>();
+  const appliedInlineCouponIds = new Set<string>();
   let pressureNoticed = false;
+  let sawSubscriptionOption = false;
+  let sawCouponFeature = spec.components.some((comp) => isCouponComponent(comp));
   /** 買えたとしても嫌な思いをしたこと。1つでもあれば「買えたけど不満」になる */
   const bothers: Array<{ friction: string; comment: string }> = [];
 
@@ -753,21 +785,34 @@ export function simulatePersonaComputerUse(
       if (budget) return fail(budget);
     }
 
-    // 4b. 正直な定期便（最初からOFF・読める文字サイズ・不当な縛り文言なし）なら、よく読む人は自分の意思で申し込む
-    for (const comp of visible.filter(
-      (v) =>
-        v.stateKey === 'subscription' &&
-        (v.type === 'checkbox' || v.type === 'toggle'),
-    )) {
+    // 4b. 正直な定期便（最初からOFF・読める文字サイズ・不当な縛り文言なし）なら、定期便を望む人やよく読む人は自分の意思で申し込む
+    for (const comp of visible.filter((v) => isSubscriptionComponent(v))) {
+      sawSubscriptionOption = true;
       const initialSub = spec.state.find((s) => s.key === 'subscription')?.initialValue;
       const isHonest =
         isHonestOptInComponent(comp, initialSub) &&
         state.subscription === false &&
         canRead(comp, persona);
-      if (isHonest && c.readsFinePrint && !noticedTrapIds.has(comp.id)) {
+      if (isHonest && (c.readsFinePrint || c.wantsSubscription) && !noticedTrapIds.has(comp.id)) {
         noticedTrapIds.add(comp.id);
         state = { ...state, subscription: true };
         actionTrace.push(`${steps}手目: 条件が分かりやすいので${comp.label}を自分で選んだ`);
+      }
+    }
+
+    // 4c. 画面内に残されたクーポンバナーや特典ボタンがあれば確認・適用する
+    for (const comp of visible.filter((v) => v.type !== 'popup' && isCouponComponent(v))) {
+      sawCouponFeature = true;
+      if (
+        !appliedInlineCouponIds.has(comp.id) &&
+        comp.actions.length > 0 &&
+        !hasCompletionAction(comp) &&
+        !comp.actions.some((a) => a.type === 'open_page' || a.type === 'reset_all') &&
+        canRead(comp, persona)
+      ) {
+        appliedInlineCouponIds.add(comp.id);
+        state = applyActions(spec, state, comp.actions).state;
+        actionTrace.push(`画面確認: ${comp.label}の特典を適用した`);
       }
     }
 
@@ -895,6 +940,23 @@ export function simulatePersonaComputerUse(
         };
       }
       actionTrace.push(`${steps}手目: ${target.comp.label}を押してタスク完了イベントを検知`);
+      if (c.wantsSubscription && !sawSubscriptionOption) {
+        actionTrace.push('画面確認: 毎月届く定期便を選びたかったが設定が見当たらなかった');
+        bothers.push({
+          friction: '定期便の設定がなかった',
+          comment: '毎月届けてほしいのに設定がなくて残念',
+        });
+      }
+      const hadCouponInShop =
+        persona.id === 'hina' ||
+        spec.state.some((s) => s.key === 'couponPopup' || s.key.toLowerCase().includes('coupon'));
+      if (c.wantsCoupon && hadCouponInShop && !sawCouponFeature) {
+        actionTrace.push('画面確認: クーポンを使いたかったが見当たらなかった');
+        bothers.push({
+          friction: 'クーポンがなくなっていた',
+          comment: 'クーポンは無くなってしまったのか、使いたかったのに残念',
+        });
+      }
       if (bothers.length > 0) {
         return {
           outcome: 'bothered',

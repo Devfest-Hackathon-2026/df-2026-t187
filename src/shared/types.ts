@@ -229,6 +229,10 @@ export interface PersonaConstraints {
   needsReadableTotal: boolean;
   /** 残り時間などで急かされると嫌な気分になる（買えても不満が残る） */
   dislikesPressure?: boolean;
+  /** まともな定期便があれば申し込みたい。定期便の欄自体が消されると買えても不満が残る */
+  wantsSubscription?: boolean;
+  /** 割引クーポンがあれば使いたい。クーポン自体が消されると買えても不満が残る */
+  wantsCoupon?: boolean;
 }
 
 export interface ReviewerPersona {

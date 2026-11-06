@@ -69,7 +69,7 @@ interface TimelineMessage {
   targetComponentIds?: string[];
   /** 改造の作業の過程。システムのメッセージとして1行ずつ進み、完了後もそのまま残す */
   workLog?: {
-    steps: Array<{ text: string; done: boolean }>;
+    steps: Array<{ text: string; done: boolean; componentId?: string }>;
     finished: boolean;
   };
   /** 赤ペンで囲んだことへのお助けエージェントの反応。囲み直したら置き換える */
@@ -1112,9 +1112,14 @@ function setPrepWorkStep(log: NonNullable<TimelineMessage['workLog']>, text: str
 }
 
 /** 作業ログの行を足す。前の行は終わったことにする */
-function addWorkStep(log: NonNullable<TimelineMessage['workLog']>, text: string, done = false): void {
+function addWorkStep(
+  log: NonNullable<TimelineMessage['workLog']>,
+  text: string,
+  done = false,
+  componentId?: string,
+): void {
   for (const step of log.steps) step.done = true;
-  log.steps.push({ text, done });
+  log.steps.push({ text, done, componentId });
   renderStudio();
   scrollToLatestMessage();
 }
@@ -1126,6 +1131,31 @@ function startWorkLog(targetIds: string[]): TimelineMessage {
     targetComponentIds: targetIds,
     workLog: { steps: [{ text: '指示を読んでいます', done: false }], finished: false },
   });
+}
+
+let highlightClearTimer: number | null = null;
+
+/** システムメッセージの作業行をクリックしたとき、スマホ内の該当部品へスクロールして光らせる */
+function highlightSandboxComponent(componentId: string): void {
+  if (highlightClearTimer !== null) {
+    window.clearTimeout(highlightClearTimer);
+    highlightClearTimer = null;
+  }
+  state.justChangedIds = [componentId];
+  renderStudio();
+  if (sandboxStageEl) {
+    const el = querySandboxComponentElements(sandboxStageEl).find(
+      (node) => node.dataset.componentId === componentId,
+    );
+    el?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }
+  highlightClearTimer = window.setTimeout(() => {
+    highlightClearTimer = null;
+    if (state.justChangedIds.length === 1 && state.justChangedIds[0] === componentId) {
+      state.justChangedIds = [];
+      renderStudio();
+    }
+  }, 1800);
 }
 
 /**
@@ -1148,7 +1178,13 @@ async function playWorkLog(
     log.steps = [];
     for (const step of steps) {
       state.justChangedIds = step.componentId ? [step.componentId] : [];
-      addWorkStep(log, step.text, false);
+      addWorkStep(log, step.text, false, step.componentId);
+      if (step.componentId && sandboxStageEl) {
+        const el = querySandboxComponentElements(sandboxStageEl).find(
+          (node) => node.dataset.componentId === step.componentId,
+        );
+        el?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      }
       await sleep(WORK_STEP_INTERVAL_MS);
       log.steps[log.steps.length - 1].done = true;
     }
@@ -1811,14 +1847,42 @@ function renderActionChoiceRow(msg: TimelineMessage): HTMLElement | null {
   return pillRow.childNodes.length > 0 ? pillRow : null;
 }
 
+/**
+ * システムメッセージ行のテキストを描画する。
+ * バッククォート `...` で囲まれた固有名詞・変更前後の値はインラインコード要素（.chat-system-token）にする。
+ */
+function appendFormattedSystemText(container: HTMLElement, text: string): void {
+  const parts = text.split(/`([^`]+)`/g);
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+    if (!part) continue;
+    if (i % 2 === 1) {
+      const code = document.createElement('code');
+      code.className = 'chat-system-token';
+      code.textContent = part;
+      container.appendChild(code);
+    } else {
+      container.appendChild(document.createTextNode(part));
+    }
+  }
+}
+
 /** 改造の進捗・変更内容を、ボックスに入れず通常のシステムメッセージ行と同じ形式で描画する */
 function appendWorkLogLines(row: HTMLElement, msg: TimelineMessage): void {
   const log = msg.workLog!;
   for (const step of log.steps) {
     const line = document.createElement('div');
     if (step.done) {
-      line.className = 'chat-system-line';
-      line.textContent = step.text;
+      const componentId = step.componentId;
+      line.className = `chat-system-line${componentId ? ' is-interactive is-selectable' : ''}`;
+      appendFormattedSystemText(line, step.text);
+      if (componentId) {
+        line.title = 'クリックするとスマホ画面の該当箇所を光らせます';
+        line.addEventListener('click', (e) => {
+          e.stopPropagation();
+          highlightSandboxComponent(componentId);
+        });
+      }
     } else {
       line.className = 'chat-system-line is-progress';
       const dots = document.createElement('span');
@@ -1826,7 +1890,7 @@ function appendWorkLogLines(row: HTMLElement, msg: TimelineMessage): void {
       dots.setAttribute('aria-hidden', 'true');
       dots.innerHTML = '<span></span><span></span><span></span>';
       const text = document.createElement('span');
-      text.textContent = step.text;
+      appendFormattedSystemText(text, step.text);
       line.append(dots, text);
     }
     row.appendChild(line);
@@ -1981,7 +2045,7 @@ function renderChatPanel(): HTMLElement {
       } else if (msg.text) {
         const line = document.createElement('div');
         line.className = `chat-system-line ${msg.tone === 'warning' ? 'is-warning' : ''}`;
-        line.textContent = msg.text;
+        appendFormattedSystemText(line, msg.text);
         row.appendChild(line);
       }
       if (msg.showCohortSelector) {

@@ -454,9 +454,9 @@ const PERSONAS: ReviewerPersona[] = [
     age: 78,
     role: '指先が少し震えるおじいちゃん',
     icon: 'B',
-    goal: '指がずれても押し間違えずに注文したい',
+    goal: '押し間違えずに、安心できる定期便があれば毎月届くように注文したい',
     greeting: '指が震えても押し間違えないといいんだが',
-    focusPoint: 'ボタンが十分に大きく、隣に危ないボタンがないか',
+    focusPoint: 'ボタンが十分に大きく隣に危ないボタンがないか、安心できる定期便を選べるか',
     constraints: {
       blurPx: 1.2,
       contrast: 0.85,
@@ -468,6 +468,7 @@ const PERSONAS: ReviewerPersona[] = [
       readsFinePrint: true,
       wantsConfirmation: false,
       needsReadableTotal: false,
+      wantsSubscription: true,
     },
   },
   {
@@ -552,9 +553,9 @@ const PERSONAS: ReviewerPersona[] = [
     age: 41,
     role: '通勤電車で操作する会社員',
     icon: 'C',
-    goal: '揺れる電車の中でも押し間違えずに注文したい',
+    goal: '揺れる電車でも押し間違えず、毎回頼む手間が省ける定期便があれば申し込みたい',
     greeting: '電車で揺れても押し間違えないといいな',
-    focusPoint: '押し間違えると困るボタンが近くにないか',
+    focusPoint: '押し間違えると困るボタンが近くにないか、納得できる定期便を選べるか',
     constraints: {
       blurPx: 0.9,
       contrast: 0.9,
@@ -566,6 +567,7 @@ const PERSONAS: ReviewerPersona[] = [
       readsFinePrint: true,
       wantsConfirmation: false,
       needsReadableTotal: false,
+      wantsSubscription: true,
     },
   },
   // ==================== 損をしたくない人 ====================
@@ -577,9 +579,9 @@ const PERSONAS: ReviewerPersona[] = [
     age: 20,
     role: '仕送りでやりくりする大学生',
     icon: 'A',
-    goal: '払う金額を確かめてから買いたい',
+    goal: '払う金額を確かめ、使えるクーポンがあればお得に買いたい',
     greeting: '結局いくらになるのか先に知りたいんだよね',
-    focusPoint: '合計金額がすぐ分かるか、余計な契約がないか',
+    focusPoint: '合計金額がすぐ分かるか、余計な契約がないか、クーポンが使えるか',
     constraints: {
       blurPx: 0.6,
       contrast: 0.95,
@@ -592,6 +594,7 @@ const PERSONAS: ReviewerPersona[] = [
       wantsConfirmation: false,
       needsReadableTotal: true,
       dislikesPressure: true,
+      wantsCoupon: true,
     },
   },
   {
@@ -602,9 +605,9 @@ const PERSONAS: ReviewerPersona[] = [
     age: 19,
     role: '細かい字は読み飛ばす大学生',
     icon: 'B',
-    goal: '余計なものを頼まずに注文したい',
+    goal: '余計なものを頼まず、クーポンがあれば使って注文したい',
     greeting: '気づいたら変なの頼んでたことあるんだよね',
-    focusPoint: '最初からチェックの入った項目がないか',
+    focusPoint: '最初からチェックの入った項目がないか、クーポンが使えるか',
     constraints: {
       blurPx: 0.6,
       contrast: 0.95,
@@ -617,6 +620,7 @@ const PERSONAS: ReviewerPersona[] = [
       wantsConfirmation: false,
       needsReadableTotal: true,
       dislikesPressure: true,
+      wantsCoupon: true,
     },
   },
   {
@@ -627,11 +631,11 @@ const PERSONAS: ReviewerPersona[] = [
     age: 22,
     role: '画面がバキバキのスマホを使う大学生',
     icon: 'C',
-    goal: 'ひび割れた画面でも、払う金額はちゃんと確かめたい',
+    goal: 'ひび割れた画面でも金額を確かめ、安心できる定期便があれば毎月届くようにしたい',
     greeting: '画面がバキバキでも、金額だけはちゃんと見たい',
-    focusPoint: '小さな文字や小さなボタンがないか',
+    focusPoint: '小さな文字や小さなボタンがないか、安心できる定期便を選べるか',
     constraints: {
-      blurPx: 2.2,
+      blurPx: 1.8,
       contrast: 0.75,
       jitterPx: 14,
       maxSteps: 6,
@@ -642,6 +646,7 @@ const PERSONAS: ReviewerPersona[] = [
       wantsConfirmation: false,
       needsReadableTotal: true,
       dislikesPressure: true,
+      wantsSubscription: true,
     },
   },
 ];

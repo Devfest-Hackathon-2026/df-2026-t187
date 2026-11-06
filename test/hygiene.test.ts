@@ -8,13 +8,11 @@ import {
 } from '../scripts/check-hygiene.mjs';
 
 describe('check-hygiene', () => {
-  it('正しい Conventional Commits (日本語 + 本文 + Co-Authored-By) を通す', () => {
+  it('正しい Conventional Commits を通す', () => {
     const msg = [
-      'feat(sandbox): チェックポイント保存とロールバック機能を追加',
+      'feat: チェックポイント保存とロールバック機能を追加',
       '',
       '- 改造ステップごとの状態を履歴に記録し、任意の時点へ戻せるようにする',
-      '',
-      'Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>',
     ].join('\n');
     assert.deepEqual(validateCommitMessage(msg), []);
   });
@@ -67,15 +65,19 @@ describe('check-hygiene', () => {
     assert.equal(validateSubjectDescription('「ボタン」を直す', 'PR タイトル').length, 1);
   });
 
-  it('Claude-Session やセッション URL を含むコミットメッセージを弾く', () => {
-    const trailer = 'feat(studio): 画面を整理\n\nClaude-' + 'Session: https://claude.ai/code/session_01AbCdEf';
+  it('Claude-Session やセッション URL および Claude Co-Authored-By を含むコミットメッセージを弾く', () => {
+    const trailer = 'feat: 画面を整理\n\nClaude-' + 'Session: https://claude.ai/code/session_01AbCdEf';
     const errs = validateCommitMessage(trailer);
     assert.ok(errs.length >= 1);
+
+    const coAuthor =
+      'feat: 画面を整理\n\nCo-Authored-By: ' + 'Claude Opus 5.5 <noreply@' + 'anthropic.com>';
+    const coAuthorErrs = validateCommitMessage(coAuthor);
+    assert.ok(coAuthorErrs.length >= 1);
   });
 
   it('Author メールアドレスの .local や個人のフリーメールを弾く', () => {
     assert.deepEqual(validateAuthorEmail('202958124+xxxxholica@users.noreply.github.com'), []);
-    assert.deepEqual(validateAuthorEmail('noreply@anthropic.com'), []);
 
     assert.equal(validateAuthorEmail('user@MyMacBook-Air.local').length, 1);
     assert.equal(validateAuthorEmail('someone@gmail.com').length, 1);

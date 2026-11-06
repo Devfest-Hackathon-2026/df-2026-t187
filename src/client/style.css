@@ -1277,7 +1277,40 @@ body {
   font-weight: 700;
   color: var(--ink-60);
   text-align: center;
-  line-height: 1.5;
+  line-height: 1.65;
+}
+
+.chat-system-line.is-interactive {
+  cursor: pointer;
+  border-radius: 8px;
+  padding: 2px 8px;
+  transition: background-color 140ms ease, color 140ms ease;
+}
+
+.chat-system-line.is-interactive:hover {
+  background: rgba(37, 99, 235, 0.08);
+  color: var(--ink);
+}
+
+.chat-system-token {
+  display: inline-block;
+  font-family: inherit;
+  font-size: 0.72rem;
+  font-weight: 800;
+  color: var(--ink);
+  background: rgba(15, 23, 42, 0.06);
+  border: 1px solid var(--ink-15);
+  border-radius: 6px;
+  padding: 1px 6px;
+  margin: 0 2px;
+  line-height: 1.35;
+  vertical-align: baseline;
+}
+
+.chat-system-line.is-interactive:hover .chat-system-token {
+  border-color: rgba(37, 99, 235, 0.35);
+  background: #eff6ff;
+  color: var(--accent-blue);
 }
 
 .chat-system-line.is-warning {
