@@ -9,7 +9,13 @@ import {
   withDerivedValues,
   type AppState,
 } from '../shared/appRuntime.ts';
-import { buildStandaloneSandboxHtml } from '../shared/sandboxValidator.ts';
+import {
+  buildStandaloneSandboxHtml,
+  escapeHtml,
+  sanitizeCssColor,
+  sanitizeCustomCss,
+  sanitizeCustomHtml,
+} from '../shared/sandboxValidator.ts';
 import type { AppComponent, AppSpec, ComponentAction, StateValue } from '../shared/types.ts';
 
 export interface SandboxCallbacks {
@@ -544,10 +550,13 @@ export function renderSandboxApp(
 
   const phoneScreen = targetDoc.createElement('div');
   phoneScreen.className = `phone-app-screen ${spec.theme.chaoticLayout ? 'is-chaotic' : 'is-clean'}`;
-  phoneScreen.style.backgroundColor = spec.theme.bgColor || '#ffffff';
-  phoneScreen.style.color = spec.theme.textColor || '#1c1917';
-  if (spec.theme.accentColor) {
-    phoneScreen.style.setProperty('--app-accent', spec.theme.accentColor);
+  phoneScreen.style.backgroundColor = sanitizeCssColor(spec.theme?.bgColor, '#ffffff');
+  phoneScreen.style.color = sanitizeCssColor(spec.theme?.textColor, '#1c1917');
+  if (spec.theme?.accentColor) {
+    phoneScreen.style.setProperty(
+      '--app-accent',
+      sanitizeCssColor(spec.theme.accentColor, '#5b3a26'),
+    );
   }
 
   const statusBar = targetDoc.createElement('div');
@@ -652,6 +661,104 @@ export function renderSandboxApp(
     callbacks.onStateChange(withDerivedValues(spec, { ...liveState, [key]: value }));
   };
 
+  /**
+   * サンドボックス内でカスタムHTMLを安全に描画し、data-* 属性による状態変更・タスク完了をバインドする。
+   */
+  const renderCustomContent = (comp: AppComponent, rawHtml: string): HTMLElement => {
+    const wrapper = targetDoc.createElement('div');
+    wrapper.className = 'comp-custom-sandbox';
+    const templated = sanitizeCustomHtml(renderTemplate(rawHtml, liveState, comp.style.numberFormat));
+    wrapper.innerHTML = templated;
+    wrapper
+      .querySelectorAll('script, style, iframe, object, embed, applet, meta, link, base, form')
+      .forEach((node) => node.remove());
+    wrapper.querySelectorAll('*').forEach((node) => {
+      for (const attr of Array.from(node.attributes)) {
+        const attrName = attr.name.toLowerCase();
+        const attrVal = attr.value.replace(/[\s\u0000-\u001f]+/g, '').toLowerCase();
+        if (
+          attrName.startsWith('on') ||
+          attrName === 'srcdoc' ||
+          ((attrName === 'href' ||
+            attrName === 'src' ||
+            attrName === 'xlink:href' ||
+            attrName === 'action' ||
+            attrName === 'formaction') &&
+            (attrVal.startsWith('javascript:') ||
+              attrVal.startsWith('vbscript:') ||
+              attrVal.startsWith('data:text/html')))
+        ) {
+          node.removeAttribute(attr.name);
+        }
+      }
+    });
+
+    // 状態変数と双方向バインドされた input / select / textarea
+    wrapper.querySelectorAll<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>('[data-state-key]').forEach((el) => {
+      const key = el.dataset.stateKey;
+      if (!key) return;
+      if (el instanceof HTMLInputElement && (el.type === 'checkbox' || el.type === 'radio')) {
+        const expected = el.value && el.value !== 'on' ? el.value : 'true';
+        el.checked = String(liveState[key]) === expected;
+        el.addEventListener('change', () => {
+          setValue(key, el.value && el.value !== 'on' ? el.value : el.checked);
+        });
+      } else {
+        if (liveState[key] !== undefined) el.value = String(liveState[key]);
+        el.addEventListener('change', () => {
+          setValue(key, el.value);
+        });
+      }
+    });
+
+    // クリックによる状態更新・アクション実行バインド
+    wrapper
+      .querySelectorAll<HTMLElement>(
+        '[data-set-state], [data-toggle-state], [data-increment-state], [data-complete-task], [data-close-popup]',
+      )
+      .forEach((el) => {
+        el.addEventListener('click', (e) => {
+          e.stopPropagation();
+          if (el.hasAttribute('data-close-popup') && comp.stateKey) {
+            callbacks.onStatePatch({ [comp.stateKey]: 'closed' });
+            return;
+          }
+          const acts: ComponentAction[] = [];
+          const setSpec = el.dataset.setState;
+          if (setSpec) {
+            for (const pair of setSpec.split(';')) {
+              const eqIdx = pair.indexOf(':');
+              if (eqIdx > 0) {
+                const k = pair.slice(0, eqIdx).trim();
+                const v = pair.slice(eqIdx + 1).trim();
+                acts.push({ type: 'set_state', targetKey: k, value: coerceStateValue(spec, k, v) });
+              }
+            }
+          }
+          if (el.dataset.toggleState) {
+            acts.push({ type: 'toggle_state', targetKey: el.dataset.toggleState.trim() });
+          }
+          if (el.dataset.incrementState) {
+            acts.push({ type: 'increment_state', targetKey: el.dataset.incrementState.trim() });
+          }
+          if (el.dataset.toast) {
+            acts.push({ type: 'show_toast', message: el.dataset.toast });
+          }
+          if (el.dataset.completeTask !== undefined) {
+            acts.push({
+              type: 'complete_task',
+              message: el.dataset.completeTask || 'ご購入ありがとうございます',
+            });
+          }
+          if (acts.length > 0) {
+            executeActions(acts);
+          }
+        });
+      });
+
+    return wrapper;
+  };
+
   const openConfirmOverlay = (comp: AppComponent, onConfirm: () => void) => {
     overlaySlot.innerHTML = '';
     const sheet = targetDoc.createElement('div');
@@ -689,38 +796,84 @@ export function renderSandboxApp(
     const backdrop = targetDoc.createElement('div');
     backdrop.className = 'inapp-popup-backdrop';
 
+    const closePos = comp.closePosition ?? 'top-right';
+    const closeSize = comp.closeSize ?? comp.style.size;
+    const defaultCloseLabel = closePos === 'bottom-bar' ? '閉じる' : '×';
+    const closeLabel = (comp.closeLabel ?? defaultCloseLabel).trim() || defaultCloseLabel;
+
     const card = targetDoc.createElement('div');
-    card.className = `inapp-popup-card variant-${comp.style.variant} ${comp.style.skin === 'intrusive' ? 'is-intrusive' : ''}`;
+    card.className = [
+      'inapp-popup-card',
+      `variant-${comp.style.variant}`,
+      `close-pos-${closePos}`,
+      comp.style.skin === 'intrusive' ? 'is-intrusive' : '',
+      selectedComponentIds.has(comp.id) ? 'is-circled-target' : '',
+      callbacks.justChangedIds?.has(comp.id) ? 'is-just-changed' : '',
+    ]
+      .filter(Boolean)
+      .join(' ');
     card.dataset.componentId = comp.id;
+    card.dataset.role = comp.role;
+    if (comp.customCss) {
+      const safeCss = sanitizeCustomCss(comp.customCss);
+      if (safeCss) card.style.cssText += `;${safeCss}`;
+    }
 
     const closeBtn = targetDoc.createElement('button');
     closeBtn.type = 'button';
-    closeBtn.className = `inapp-popup-close size-${comp.style.size}`;
+    closeBtn.className = [
+      'inapp-popup-close',
+      `size-${closeSize}`,
+      `pos-${closePos}`,
+      closeLabel.length > 1 ? 'has-label' : '',
+    ]
+      .filter(Boolean)
+      .join(' ');
     closeBtn.setAttribute('aria-label', '閉じる');
-    closeBtn.textContent = '×';
+    closeBtn.textContent = closeLabel;
     closeBtn.addEventListener('click', (e) => {
       e.stopPropagation();
       if (comp.stateKey) callbacks.onStatePatch({ [comp.stateKey]: 'closed' });
     });
 
-    const text = targetDoc.createElement('div');
-    text.className = 'inapp-popup-text';
-    text.textContent = renderLabel(comp, liveState);
-    card.append(closeBtn, text);
-    if (comp.caption) {
-      const sub = targetDoc.createElement('div');
-      sub.className = 'inapp-popup-sub';
-      sub.textContent = renderTemplate(comp.caption, liveState, comp.style.numberFormat);
-      card.appendChild(sub);
-    }
-    if (comp.actions.some((a) => a.type === 'open_page')) {
-      const go = targetDoc.createElement('div');
-      go.className = 'inapp-popup-go';
-      go.textContent = '今すぐチェック ＞＞';
-      card.appendChild(go);
+    if (comp.customHtml) {
+      card.append(closeBtn, renderCustomContent(comp, comp.customHtml));
+    } else {
+      const text = targetDoc.createElement('div');
+      text.className = 'inapp-popup-text';
+      text.textContent = renderLabel(comp, liveState);
+      card.append(closeBtn, text);
+      if (comp.caption) {
+        const sub = targetDoc.createElement('div');
+        sub.className = 'inapp-popup-sub';
+        sub.textContent = renderTemplate(comp.caption, liveState, comp.style.numberFormat);
+        card.appendChild(sub);
+      }
+      if (comp.actions.some((a) => a.type === 'open_page')) {
+        const go = targetDoc.createElement('div');
+        go.className = 'inapp-popup-go';
+        go.textContent = '今すぐチェック ＞＞';
+        card.appendChild(go);
+      } else if (comp.actions.length > 0) {
+        const actionBtn = targetDoc.createElement('button');
+        actionBtn.type = 'button';
+        actionBtn.className = 'inapp-popup-action-btn';
+        actionBtn.textContent = 'この特典を使う';
+        actionBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          executeActions(comp.actions);
+          if (comp.stateKey) callbacks.onStatePatch({ [comp.stateKey]: 'closed' });
+        });
+        card.appendChild(actionBtn);
+      }
     }
     card.addEventListener('click', () => {
-      if (comp.actions.length > 0) executeActions(comp.actions);
+      if (comp.actions.length > 0) {
+        executeActions(comp.actions);
+        if (!comp.actions.some((a) => a.type === 'open_page') && comp.stateKey) {
+          callbacks.onStatePatch({ [comp.stateKey]: 'closed' });
+        }
+      }
     });
     backdrop.appendChild(card);
     overlaySlot.appendChild(backdrop);
@@ -756,13 +909,28 @@ export function renderSandboxApp(
     if (comp.style.rotateDeg) {
       itemWrap.style.transform = `rotate(${comp.style.rotateDeg}deg)`;
     }
+    if (comp.customCss) {
+      const safeCss = sanitizeCustomCss(comp.customCss);
+      if (safeCss) itemWrap.style.cssText += `;${safeCss}`;
+    }
     const label = renderLabel(comp, liveState);
 
     const caption = comp.caption
       ? renderTemplate(comp.caption, liveState, comp.style.numberFormat)
       : '';
 
-    if (comp.type === 'product_card') {
+    if (comp.customHtml || comp.type === 'custom') {
+      itemWrap.appendChild(
+        renderCustomContent(
+          comp,
+          comp.customHtml || `<div class="comp-custom-fallback">${escapeHtml(label)}</div>`,
+        ),
+      );
+      if (comp.actions.length > 0 && !comp.customHtml?.includes('data-')) {
+        itemWrap.style.cursor = 'pointer';
+        itemWrap.addEventListener('click', () => executeActions(comp.actions));
+      }
+    } else if (comp.type === 'product_card') {
       itemWrap.appendChild(renderProductCard(targetDoc, comp, liveState, label, caption, setValue));
     } else if (comp.type === 'progress_steps') {
       itemWrap.appendChild(
@@ -894,6 +1062,16 @@ export function renderSandboxApp(
       const banner = targetDoc.createElement('div');
       banner.className = 'comp-status-banner';
       writeLabel(banner, comp, liveState);
+      if (caption) {
+        const sub = targetDoc.createElement('div');
+        sub.className = 'comp-caption';
+        sub.textContent = caption;
+        banner.appendChild(sub);
+      }
+      if (comp.actions.length > 0) {
+        banner.style.cursor = 'pointer';
+        banner.addEventListener('click', () => executeActions(comp.actions));
+      }
       itemWrap.appendChild(banner);
     } else if (comp.type === 'button') {
       const btn = targetDoc.createElement('button');

@@ -45,6 +45,27 @@ export function detectExplicitRecipientMention(
 }
 
 /**
+ * チャットで「画面全体を1つ前に戻す」「最初の画面に戻す」と指示しているか判定する。
+ * 「定期便を戻して」「ボタンの色を元に戻して」のように特定の部品名を含む場合は null を返し、AIの部品パッチに任せる。
+ */
+const SPECIFIC_PART_KEYWORDS =
+  /ボタン|広告|バナー|ポップアップ|定期|チェック|金額|合計|送料|手数料|カウントダウン|タイマー|文字|色|見出し|説明|確認|選択|入力|欄|枠|画像|写真/;
+
+const RESET_SCREEN_RE =
+  /^(?:やっぱり|ちょっと|すみません|お助けAI[、,\s]*)?(?:一番)?(?:最初|初期|はじめ)(?:の画面|の状態)?(?:に|から|へ)?(?:戻して|戻す|やり直して|やり直す|リセットして)[！!。？?]*$/;
+
+const UNDO_SCREEN_RE =
+  /^(?:やっぱり|ちょっと|すみません|お助けAI[、,\s]*)?(?:(?:1つ|ひとつ|一歩)?前の(?:画面|状態)に?(?:戻して|戻す)|さっきの(?:変更|手直し|画面|状態)?を?(?:戻して|取り消して|やめて|キャンセルして)|(?:画面を)?(?:元に|もとに)?戻して|変更を取り消して|手直しを取り消して|アンドゥ(?:して)?)[！!。？?]*$/;
+
+export function detectCheckpointRevertCommand(message: string): 'undo' | 'reset' | null {
+  const msg = message.trim();
+  if (!msg || SPECIFIC_PART_KEYWORDS.test(msg)) return null;
+  if (RESET_SCREEN_RE.test(msg)) return 'reset';
+  if (UNDO_SCREEN_RE.test(msg)) return 'undo';
+  return null;
+}
+
+/**
  * 発言をAIに渡す前の振り分け。
  * 何をどう変えるかがはっきりした改造の指示だけをそのまま改修（apply）に回し、
  * 質問・感想・あいさつ・変え方が決まらない発言は、お助けエージェント（triage）に判断させる。

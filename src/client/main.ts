@@ -8,6 +8,7 @@ import {
 } from '../shared/initialTheme.ts';
 import {
   classifyUserMessageIntent,
+  detectCheckpointRevertCommand,
   detectExplicitRecipientMention,
 } from '../shared/intent.ts';
 import { buildOwnerClosingLines } from '../shared/owner.ts';
@@ -29,6 +30,8 @@ import type {
   ReviewOutcome,
   StateValue,
   TargetCohortId,
+  TranscribeResponse,
+  TtsResponse,
 } from '../shared/types.ts';
 import { ICONS } from './icons.ts';
 import {
@@ -58,6 +61,8 @@ interface TimelineMessage {
   showCohortSelector?: boolean;
   /** この選択肢で選ばれた顧客層 */
   chosenCohortId?: TargetCohortId;
+  /** 次のお客さんチャレンジ等で選ばれた選択肢キー */
+  chosenOption?: string;
   /** 改造完了後にチャット内からも「お客さんの反応を見る」を押せるようにする */
   showEvaluateAction?: boolean;
   /** この発言が対象にしている、赤ペンで囲んだ部品 */
@@ -103,6 +108,12 @@ interface StudioState {
   justChangedIds: string[];
   chatLoading: boolean;
   evaluateLoading: boolean;
+  /** Cloud TTS による音声読み上げのON/OFF */
+  voiceEnabled: boolean;
+  /** マイク音声入力の録音中フラグ */
+  isRecordingAudio: boolean;
+  /** 録音した音声をGeminiで整形・文字起こし中フラグ */
+  isTranscribingAudio: boolean;
   messages: TimelineMessage[];
 }
 
@@ -168,6 +179,9 @@ const state: StudioState = {
   justChangedIds: [],
   chatLoading: false,
   evaluateLoading: false,
+  voiceEnabled: true,
+  isRecordingAudio: false,
+  isTranscribingAudio: false,
   messages: [],
 };
 
@@ -209,12 +223,185 @@ function findPersona(personaId: string | undefined): ReviewerPersona | undefined
   return ALL_REVIEWER_PERSONAS.find((p) => p.id === personaId);
 }
 
-function pushMessage(msg: Omit<TimelineMessage, 'id'>): TimelineMessage {
+let currentAudioEl: HTMLAudioElement | null = null;
+const ttsPlaybackQueue: Array<{
+  text: string;
+  speaker: string;
+  onDone?: () => void;
+}> = [];
+let isPlayingTts = false;
+let currentTtsDoneResolver: (() => void) | null = null;
+const ttsPrefetchCache = new Map<string, Promise<TtsResponse>>();
+
+/** ブラウザ標準TTSフォールバック時も全11キャラクターで高さと速さを変える */
+const BROWSER_VOICE_PROFILES: Record<string, { pitch: number; rate: number }> = {
+  owner: { pitch: 0.75, rate: 1.0 },
+  assistant: { pitch: 1.15, rate: 1.12 },
+  kazuko: { pitch: 0.82, rate: 0.9 },
+  shigeru: { pitch: 0.65, rate: 0.9 },
+  harue: { pitch: 0.95, rate: 0.95 },
+  kenta: { pitch: 0.92, rate: 1.2 },
+  misaki: { pitch: 1.08, rate: 1.15 },
+  takumi: { pitch: 0.82, rate: 1.1 },
+  shota: { pitch: 1.02, rate: 1.08 },
+  hina: { pitch: 1.28, rate: 1.14 },
+  ren: { pitch: 0.86, rate: 1.05 },
+};
+
+function isSpokenMessage(msg: Pick<TimelineMessage, 'role' | 'text'>): boolean {
+  return (
+    Boolean(msg.text.trim()) &&
+    (msg.role === 'assistant' || msg.role === 'owner' || msg.role === 'customer')
+  );
+}
+
+function speakerOfMessage(msg: Pick<TimelineMessage, 'role' | 'personaId'>): string {
+  return msg.role === 'customer' ? (msg.personaId ?? 'assistant') : msg.role;
+}
+
+function fetchTtsAudio(text: string, speaker: string): Promise<TtsResponse> {
+  const trimmed = text.trim();
+  const key = `${speaker}::${trimmed}`;
+  const cached = ttsPrefetchCache.get(key);
+  if (cached) return cached;
+  const promise = postJson<TtsResponse>('/api/tts', {
+    text: trimmed,
+    speaker,
+  }).catch(() => {
+    ttsPrefetchCache.delete(key);
+    return { fallbackBrowserTts: true };
+  });
+  ttsPrefetchCache.set(key, promise);
+  return promise;
+}
+
+function stopAllTtsPlayback(): void {
+  while (ttsPlaybackQueue.length > 0) {
+    const item = ttsPlaybackQueue.shift();
+    item?.onDone?.();
+  }
+  isPlayingTts = false;
+  if (currentAudioEl) {
+    currentAudioEl.pause();
+    currentAudioEl = null;
+  }
+  if ('speechSynthesis' in window) {
+    window.speechSynthesis.cancel();
+  }
+  if (currentTtsDoneResolver) {
+    const resolve = currentTtsDoneResolver;
+    currentTtsDoneResolver = null;
+    resolve();
+  }
+}
+
+async function processNextTtsInQueue(): Promise<void> {
+  if (isPlayingTts || !state.voiceEnabled) {
+    if (!state.voiceEnabled) {
+      while (ttsPlaybackQueue.length > 0) {
+        ttsPlaybackQueue.shift()?.onDone?.();
+      }
+    }
+    return;
+  }
+  const next = ttsPlaybackQueue.shift();
+  if (!next) return;
+  isPlayingTts = true;
+  try {
+    const res = await fetchTtsAudio(next.text, next.speaker);
+    if (!state.voiceEnabled) {
+      next.onDone?.();
+      isPlayingTts = false;
+      return;
+    }
+    if (res.audioContent) {
+      await new Promise<void>((resolve) => {
+        const audio = new Audio(`data:audio/mp3;base64,${res.audioContent}`);
+        currentAudioEl = audio;
+        let finished = false;
+        const done = () => {
+          if (finished) return;
+          finished = true;
+          if (currentAudioEl === audio) currentAudioEl = null;
+          if (currentTtsDoneResolver === done) currentTtsDoneResolver = null;
+          resolve();
+        };
+        currentTtsDoneResolver = done;
+        audio.addEventListener('ended', done, { once: true });
+        audio.addEventListener('error', done, { once: true });
+        audio.play().catch(done);
+      });
+    } else if ('speechSynthesis' in window) {
+      await new Promise<void>((resolve) => {
+        const utter = new SpeechSynthesisUtterance(next.text);
+        utter.lang = 'ja-JP';
+        const profile = BROWSER_VOICE_PROFILES[next.speaker] ?? BROWSER_VOICE_PROFILES.assistant;
+        utter.pitch = profile.pitch;
+        utter.rate = profile.rate;
+        let finished = false;
+        const done = () => {
+          if (finished) return;
+          finished = true;
+          if (currentTtsDoneResolver === done) currentTtsDoneResolver = null;
+          resolve();
+        };
+        currentTtsDoneResolver = done;
+        utter.addEventListener('end', done, { once: true });
+        utter.addEventListener('error', done, { once: true });
+        window.speechSynthesis.speak(utter);
+      });
+    }
+  } catch {
+    // 音声合成失敗時は静かにスキップ
+  } finally {
+    next.onDone?.();
+    isPlayingTts = false;
+    if (state.voiceEnabled && ttsPlaybackQueue.length > 0) {
+      void processNextTtsInQueue();
+    }
+  }
+}
+
+function playCloudTtsForMessage(msg: TimelineMessage, onDone?: () => void): void {
+  if (!state.voiceEnabled || !isSpokenMessage(msg)) {
+    onDone?.();
+    return;
+  }
+  const speaker = speakerOfMessage(msg);
+  ttsPlaybackQueue.push({ text: msg.text, speaker, onDone });
+  void processNextTtsInQueue();
+}
+
+function playTtsAndWait(msg: TimelineMessage): Promise<void> {
+  if (!state.voiceEnabled || !isSpokenMessage(msg)) {
+    return Promise.resolve();
+  }
+  return new Promise<void>((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(safetyTimer);
+      resolve();
+    };
+    // 万一ブラウザの音声再生イベントが返らない場合でも12秒で次へ進める安全弁
+    const safetyTimer = window.setTimeout(finish, 12_000);
+    playCloudTtsForMessage(msg, finish);
+  });
+}
+
+function pushMessage(
+  msg: Omit<TimelineMessage, 'id'>,
+  options?: { skipAutoTts?: boolean },
+): TimelineMessage {
   const full: TimelineMessage = {
     id: `${msg.role}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
     ...msg,
   };
   state.messages.push(full);
+  if (!options?.skipAutoTts) {
+    playCloudTtsForMessage(full);
+  }
   return full;
 }
 
@@ -263,11 +450,31 @@ interface QueuedMessage {
 
 const QUEUE_PAUSE_MS = 650;
 const messageQueue: QueuedMessage[] = [];
-let queueTimer: number | null = null;
+const queueTimers = new Set<number>();
+let activeQueuedItem: QueuedMessage | null = null;
+let isQueueRunning = false;
+let queueRunId = 0;
 
-/** 発言の長さに応じた書き込み時間（1文ずつじっくり読めるテンポにする） */
+function clearQueueTimers(): void {
+  for (const id of queueTimers) {
+    window.clearTimeout(id);
+  }
+  queueTimers.clear();
+}
+
+function sleepWithQueueTimer(ms: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const id = window.setTimeout(() => {
+      queueTimers.delete(id);
+      resolve();
+    }, ms);
+    queueTimers.add(id);
+  });
+}
+
+/** 発言の長さに応じた書き込み時間（音声OFF時のテンポ） */
 function typingDurationFor(text: string): number {
-  return Math.min(2400, 1000 + text.length * 45);
+  return Math.min(2000, 850 + text.length * 38);
 }
 
 /** 長い発言を句点や改行で短く区切り、チャットらしく1文ずつ送れるようにする */
@@ -297,45 +504,141 @@ function splitIntoChatChunks(text: string): string[] {
 }
 
 function enqueueMessages(items: QueuedMessage[]): void {
+  // キューに入った時点で裏で音声データを先読みし、吹き出しが出た瞬間に遅延ゼロで再生できるようにする
+  if (state.voiceEnabled) {
+    for (const item of items) {
+      if (isSpokenMessage(item.message)) {
+        void fetchTtsAudio(item.message.text, speakerOfMessage(item.message));
+      }
+    }
+  }
   messageQueue.push(...items);
-  if (queueTimer === null) {
-    playNextQueuedMessage();
+  if (!isQueueRunning) {
+    isQueueRunning = true;
+    void runQueueLoop(++queueRunId);
   }
 }
 
-function playNextQueuedMessage(): void {
-  const next = messageQueue.shift();
-  if (!next) {
-    queueTimer = null;
+async function runQueueLoop(runId: number): Promise<void> {
+  while (runId === queueRunId && messageQueue.length > 0) {
+    const next = messageQueue.shift()!;
+    activeQueuedItem = next;
+    const spoken = isSpokenMessage(next.message);
+
+    if (next.typingMs > 0) {
+      state.typingMessage = { role: next.message.role, personaId: next.message.personaId };
+      renderStudio();
+      scrollToLatestMessage();
+
+      if (state.voiceEnabled && spoken) {
+        // 音声ONのときは、最小限の「…」表示（550ms）と音声先読み完了（最大1800ms）が揃い次第すぐ吹き出しを出す
+        const speaker = speakerOfMessage(next.message);
+        await Promise.all([
+          sleepWithQueueTimer(550),
+          Promise.race([fetchTtsAudio(next.message.text, speaker), sleepWithQueueTimer(1800)]),
+        ]);
+      } else {
+        await sleepWithQueueTimer(next.typingMs);
+      }
+    } else {
+      state.typingMessage = undefined;
+      renderStudio();
+      await sleepWithQueueTimer(260);
+    }
+
+    if (runId !== queueRunId) return;
+
+    activeQueuedItem = null;
     state.typingMessage = undefined;
+    const shouldSpeak = state.voiceEnabled && spoken;
+    const full = pushMessage(next.message, { skipAutoTts: true });
+    renderStudio();
+    scrollToLatestMessage();
+
+    if (shouldSpeak) {
+      // 現在の吹き出しの音声読み上げが終わるのを待ってから、次の発言の書き込みに進む
+      await playTtsAndWait(full);
+      if (runId !== queueRunId) return;
+      if (messageQueue.length > 0) {
+        await sleepWithQueueTimer(220);
+      }
+    } else if (messageQueue.length > 0) {
+      await sleepWithQueueTimer(QUEUE_PAUSE_MS);
+    }
+  }
+
+  if (runId === queueRunId) {
+    activeQueuedItem = null;
+    clearQueueTimers();
+    state.typingMessage = undefined;
+    isQueueRunning = false;
+    renderStudio();
+  }
+}
+
+/** チャット欄をタップしたときは、いま待っている発言を1つだけ即座に出してその音声へ切り替える */
+function advanceOneQueuedMessage(): void {
+  const item = activeQueuedItem ?? messageQueue.shift() ?? null;
+  activeQueuedItem = null;
+  clearQueueTimers();
+  stopAllTtsPlayback();
+  state.typingMessage = undefined;
+  const myRunId = ++queueRunId;
+
+  if (!item) {
+    isQueueRunning = false;
     renderStudio();
     return;
   }
 
-  state.typingMessage =
-    next.typingMs > 0 ? { role: next.message.role, personaId: next.message.personaId } : undefined;
+  const spoken = isSpokenMessage(item.message);
+  const shouldSpeak = state.voiceEnabled && spoken;
+  const full = pushMessage(item.message, { skipAutoTts: true });
   renderStudio();
   scrollToLatestMessage();
 
-  queueTimer = window.setTimeout(() => {
-    state.typingMessage = undefined;
-    pushMessage(next.message);
-    renderStudio();
-    scrollToLatestMessage();
-    queueTimer = window.setTimeout(playNextQueuedMessage, QUEUE_PAUSE_MS);
-  }, next.typingMs > 0 ? next.typingMs : QUEUE_PAUSE_MS);
+  isQueueRunning = true;
+  void (async () => {
+    if (shouldSpeak) {
+      await playTtsAndWait(full);
+      if (myRunId !== queueRunId) return;
+      if (messageQueue.length > 0) {
+        await sleepWithQueueTimer(220);
+      }
+    } else if (messageQueue.length > 0) {
+      await sleepWithQueueTimer(QUEUE_PAUSE_MS);
+    }
+    if (myRunId !== queueRunId) return;
+    await runQueueLoop(myRunId);
+  })();
 }
 
 /** 学習者が先に操作したときは、残りの発言を待たずにすべて出して順序を保つ */
 function flushMessageQueue(): void {
-  if (queueTimer !== null) {
-    window.clearTimeout(queueTimer);
-    queueTimer = null;
-  }
+  ++queueRunId;
+  isQueueRunning = false;
+  clearQueueTimers();
+  stopAllTtsPlayback();
   state.typingMessage = undefined;
-  while (messageQueue.length > 0) {
-    pushMessage(messageQueue.shift()!.message);
+  if (activeQueuedItem) {
+    const current = activeQueuedItem;
+    activeQueuedItem = null;
+    pushMessage(current.message, { skipAutoTts: true });
   }
+  while (messageQueue.length > 0) {
+    pushMessage(messageQueue.shift()!.message, { skipAutoTts: true });
+  }
+}
+
+/** 一時的な返信候補・反応確認ボタンのシステムメッセージを履歴から整理する */
+function clearTransientChoiceMessages(): void {
+  state.messages = state.messages.filter(
+    (m) =>
+      !(
+        m.role === 'system' &&
+        ((m.followUps && m.followUps.length > 0) || m.showEvaluateAction)
+      ),
+  );
 }
 
 /** 冒頭の会話。店長とお助けエージェントの行は書き込み中の表示を挟んで話す */
@@ -540,6 +843,10 @@ function preserveUnchangedLiveState(
 
 function pushNewCheckpoint(commitMessage: string, updatedSpec: AppSpec): void {
   const prevSpec = getCurrentSpec();
+  // 過去の画面に戻った状態で新しく手直ししたときは、その画面から分岐して以降の履歴を置き換える
+  if (state.activeCheckpointIndex < state.checkpoints.length - 1) {
+    state.checkpoints = state.checkpoints.slice(0, state.activeCheckpointIndex + 1);
+  }
   const nextStepNumber = state.checkpoints.length;
   const newCheckpoint: Checkpoint = {
     id: `cp-${nextStepNumber}-${Date.now()}`,
@@ -571,6 +878,7 @@ async function recordDecision(body: RecordDecisionRequest): Promise<void> {
 function handleSelectCohort(cohortId: TargetCohortId): void {
   if (state.selectedCohortId) return;
   flushMessageQueue();
+  clearTransientChoiceMessages();
   const selector = [...state.messages].reverse().find((m) => m.showCohortSelector);
   if (selector) selector.chosenCohortId = cohortId;
   startCohort(cohortId);
@@ -579,6 +887,7 @@ function handleSelectCohort(cohortId: TargetCohortId): void {
 /** クリア後に、直した画面のまま別の顧客層のお客さんを呼ぶ */
 function handleCallNextCohort(cohortId: TargetCohortId): void {
   flushMessageQueue();
+  clearTransientChoiceMessages();
   state.selectedCohortId = undefined;
   state.recipient = 'assistant';
   recipientFirstSeenAt.clear();
@@ -588,6 +897,7 @@ function handleCallNextCohort(cohortId: TargetCohortId): void {
 /** クリア後に、画面を最初に戻して顧客層を選び直す */
 function handleRestartFromScratch(): void {
   flushMessageQueue();
+  clearTransientChoiceMessages();
   state.selectedCohortId = undefined;
   state.recipient = 'assistant';
   recipientFirstSeenAt.clear();
@@ -693,19 +1003,29 @@ function buildOwnerHistory(): ChatHistoryEntry[] {
 }
 
 function buildChatHistory(): ChatHistoryEntry[] {
-  return state.messages.slice(-12).map((m) => ({
-    speaker:
-      m.role === 'user'
-        ? 'ユーザー'
-        : m.role === 'assistant'
-          ? 'お助けAI'
-          : m.role === 'owner'
-            ? OWNER.name
-            : m.role === 'system'
-              ? 'スマホ画面の通知'
-              : `お客さんの${findPersona(m.personaId)?.name ?? ''}`,
-    text: m.text,
-  }));
+  return state.messages
+    .filter(
+      (m) =>
+        m.text.trim().length > 0 &&
+        !(
+          m.role === 'system' &&
+          ((m.followUps && m.followUps.length > 0) || m.showEvaluateAction)
+        ),
+    )
+    .slice(-12)
+    .map((m) => ({
+      speaker:
+        m.role === 'user'
+          ? 'ユーザー'
+          : m.role === 'assistant'
+            ? 'お助けAI'
+            : m.role === 'owner'
+              ? OWNER.name
+              : m.role === 'system'
+                ? 'スマホ画面の通知'
+                : `お客さんの${findPersona(m.personaId)?.name ?? ''}`,
+      text: m.text,
+    }));
 }
 
 /**
@@ -717,7 +1037,8 @@ let circleRequestSeq = 0;
 let circleInFlight = false;
 
 async function reactToCircle(targetIds: string[]): Promise<void> {
-  // 改造中や質問への回答待ちのときは割り込まない。囲みへの反応を待っている間の囲み直しは、新しい方を使う
+  // 誰のために直すかを選ぶ前や、改造中・質問への回答待ちのときは割り込まない
+  if (!state.selectedCohortId) return;
   if (state.chatLoading && !circleInFlight) return;
   const seq = ++circleRequestSeq;
   circleInFlight = true;
@@ -726,31 +1047,45 @@ async function reactToCircle(targetIds: string[]): Promise<void> {
   while (state.messages.length > 0 && state.messages[state.messages.length - 1].circleReaction) {
     state.messages.pop();
   }
+  clearTransientChoiceMessages();
   state.topicTargetIds = [...targetIds];
   state.chatLoading = true;
   renderStudio();
   scrollToLatestMessage();
   try {
+    const spec = getCurrentSpec();
+    const annotatedImageBase64 = sandboxStageEl
+      ? captureSandboxSnapshot(spec, state.liveAppState, sandboxStageEl, penCanvasEl)
+      : undefined;
     const data = await postJson<ChatResponse>('/api/chat', {
-      currentSpec: getCurrentSpec(),
+      currentSpec: spec,
       latestReviews: buildLatestReviewRecord(),
       targetComponentIds: targetIds,
       userMessage: '',
       cohortId: state.selectedCohortId,
+      annotatedImageBase64,
       history: buildChatHistory(),
       mode: 'circled',
     });
     if (seq !== circleRequestSeq) return;
     const chunks = splitIntoChatChunks(data.reply);
-    chunks.forEach((chunk, i) =>
+    for (const chunk of chunks) {
       pushMessage({
         role: 'assistant',
         text: chunk,
         targetComponentIds: targetIds,
         circleReaction: true,
-        followUps: i === chunks.length - 1 ? data.suggestedFollowUps : undefined,
-      }),
-    );
+      });
+    }
+    if (data.suggestedFollowUps && data.suggestedFollowUps.length > 0) {
+      pushMessage({
+        role: 'system',
+        text: 'どう手直ししますか',
+        targetComponentIds: targetIds,
+        circleReaction: true,
+        followUps: data.suggestedFollowUps,
+      });
+    }
   } catch (err) {
     if (seq === circleRequestSeq) {
       pushMessage({ role: 'system', tone: 'warning', text: describeError(err) });
@@ -768,6 +1103,13 @@ async function reactToCircle(targetIds: string[]): Promise<void> {
 
 const sleep = (ms: number) => new Promise<void>((resolve) => window.setTimeout(resolve, ms));
 const WORK_STEP_INTERVAL_MS = 450;
+
+/** 準備中の進捗文言を更新する */
+function setPrepWorkStep(log: NonNullable<TimelineMessage['workLog']>, text: string): void {
+  log.steps = [{ text, done: false }];
+  renderStudio();
+  scrollToLatestMessage();
+}
 
 /** 作業ログの行を足す。前の行は終わったことにする */
 function addWorkStep(log: NonNullable<TimelineMessage['workLog']>, text: string, done = false): void {
@@ -798,6 +1140,7 @@ async function playWorkLog(
   const log = logMessage.workLog!;
   if (rolledBack) {
     log.steps = [{ text: '画面がうまく表示できなかったので、元に戻しました', done: true }];
+    logMessage.text = log.steps[0].text;
     renderStudio();
     scrollToLatestMessage();
   } else {
@@ -805,13 +1148,15 @@ async function playWorkLog(
     log.steps = [];
     for (const step of steps) {
       state.justChangedIds = step.componentId ? [step.componentId] : [];
-      addWorkStep(log, step.text, true);
+      addWorkStep(log, step.text, false);
       await sleep(WORK_STEP_INTERVAL_MS);
+      log.steps[log.steps.length - 1].done = true;
     }
     state.justChangedIds = [];
     if (log.steps.length === 0) {
       addWorkStep(log, '画面を書き換えました', true);
     }
+    logMessage.text = log.steps.map((s) => s.text).join(' / ');
   }
   log.finished = true;
   renderStudio();
@@ -837,11 +1182,120 @@ function resolveExplicitRecipientSwitch(text: string): string | null {
   return null;
 }
 
+let activeMediaRecorder: MediaRecorder | null = null;
+let recordedAudioChunks: Blob[] = [];
+
+function pickSupportedAudioMimeType(): string {
+  if (typeof MediaRecorder === 'undefined') return '';
+  for (const candidate of ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4']) {
+    if (MediaRecorder.isTypeSupported(candidate)) return candidate;
+  }
+  return '';
+}
+
+async function toggleVoiceRecording(): Promise<void> {
+  if (state.isRecordingAudio && activeMediaRecorder) {
+    activeMediaRecorder.stop();
+    return;
+  }
+  if (!state.selectedCohortId || state.chatLoading || state.isTranscribingAudio) return;
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    recordedAudioChunks = [];
+    const mimeType = pickSupportedAudioMimeType();
+    const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+    activeMediaRecorder = recorder;
+    state.isRecordingAudio = true;
+    renderStudio();
+
+    recorder.addEventListener('dataavailable', (e) => {
+      if (e.data.size > 0) recordedAudioChunks.push(e.data);
+    });
+    recorder.addEventListener('stop', () => {
+      for (const track of stream.getTracks()) track.stop();
+      state.isRecordingAudio = false;
+      activeMediaRecorder = null;
+      const resolvedMime = recorder.mimeType || mimeType || 'audio/webm';
+      const blob = new Blob(recordedAudioChunks, { type: resolvedMime });
+      recordedAudioChunks = [];
+      if (blob.size < 100) {
+        renderStudio();
+        return;
+      }
+      const reader = new FileReader();
+      reader.onloadend = async () => {
+        const dataUrl = typeof reader.result === 'string' ? reader.result : '';
+        if (!dataUrl) {
+          renderStudio();
+          return;
+        }
+        state.isTranscribingAudio = true;
+        renderStudio();
+        try {
+          const spec = getCurrentSpec();
+          const hasPenAnnotation =
+            state.circledComponentIds.length > 0 || state.penPoints.length > 0;
+          const targetComponentIds = hasPenAnnotation
+            ? [...state.circledComponentIds]
+            : [...state.topicTargetIds];
+          const annotatedImageBase64 =
+            hasPenAnnotation && sandboxStageEl
+              ? captureSandboxSnapshot(spec, state.liveAppState, sandboxStageEl, penCanvasEl)
+              : undefined;
+          const res = await postJson<TranscribeResponse>('/api/transcribe', {
+            audioBase64: dataUrl,
+            audioMimeType: resolvedMime,
+            currentSpec: spec,
+            targetComponentIds,
+            annotatedImageBase64,
+          });
+          if (res.hasMeaningfulSpeech && res.cleanedText.trim()) {
+            const cleaned = res.cleanedText.trim();
+            state.inputText = state.inputText.trim()
+              ? `${state.inputText.trim()} ${cleaned}`
+              : cleaned;
+            const switched = resolveExplicitRecipientSwitch(state.inputText);
+            if (switched) state.recipient = switched;
+          } else {
+            pushMessage({
+              role: 'system',
+              text: '音声が聞き取れなかったか、手直しに関係する言葉が見つかりませんでした',
+            });
+          }
+        } catch (err) {
+          pushMessage({ role: 'system', tone: 'warning', text: describeError(err) });
+        } finally {
+          state.isTranscribingAudio = false;
+          renderStudio();
+          window.requestAnimationFrame(() => {
+            const inputEl = shellEl?.querySelector<HTMLInputElement>('.composer-input');
+            if (inputEl) {
+              inputEl.focus();
+              const len = inputEl.value.length;
+              inputEl.setSelectionRange(len, len);
+            }
+          });
+        }
+      };
+      reader.readAsDataURL(blob);
+    });
+    recorder.start();
+  } catch {
+    state.isRecordingAudio = false;
+    pushMessage({
+      role: 'system',
+      tone: 'warning',
+      text: 'マイクの使用が許可されていないか、音声入力に対応していません',
+    });
+    renderStudio();
+  }
+}
+
 async function handleSendMessage(
   overrideText?: string,
   targetIdsOverride?: string[],
-  options: { hideUserBubble?: boolean } = {},
 ): Promise<void> {
+  if (!state.selectedCohortId) return;
   const text = (overrideText ?? state.inputText).trim();
   if (!text) return;
   if (state.chatLoading) {
@@ -853,6 +1307,7 @@ async function handleSendMessage(
     return;
   }
   flushMessageQueue();
+  clearTransientChoiceMessages();
 
   if (overrideText === undefined) {
     const switched = resolveExplicitRecipientSwitch(text);
@@ -873,28 +1328,77 @@ async function handleSendMessage(
       ? captureSandboxSnapshot(spec, state.liveAppState, sandboxStageEl, penCanvasEl)
       : undefined;
 
-  // 画面のボタンから自動で尋ねるときは、学習者が打ったように見せない
-  if (!options.hideUserBubble) {
-    pushMessage({ role: 'user', text, targetComponentIds: targetIdsSnapshot });
-  }
+  pushMessage({
+    role: 'user',
+    text,
+    targetComponentIds: targetIdsSnapshot,
+  });
   if (overrideText === undefined) {
     state.inputText = '';
   }
   state.penPoints = [];
   state.circledComponentIds = [];
+
+  // チャットから「1つ前に戻して」「最初の画面に戻して」と指示されたときは、会話の流れを保ったまま即座に画面を戻す
+  const revertCommand =
+    recipientSnapshot === 'assistant' && !hasPenAnnotation
+      ? detectCheckpointRevertCommand(text)
+      : null;
+  if (revertCommand) {
+    if (state.checkpoints.length <= 1) {
+      pushMessage({
+        role: 'assistant',
+        text: 'いまは一番最初の画面なので、これ以上前の画面はありません。気になるところを赤ペンで囲むか、直したい場所を教えてくださいね。',
+      });
+    } else if (revertCommand === 'reset') {
+      const prevSpec = getCurrentSpec();
+      state.checkpoints = [state.checkpoints[0]];
+      state.activeCheckpointIndex = 0;
+      state.liveAppState = preserveUnchangedLiveState(
+        prevSpec,
+        getCurrentSpec(),
+        state.liveAppState,
+      );
+      state.topicTargetIds = [];
+      pushMessage({ role: 'system', text: '一番最初の画面に戻しました' });
+      pushMessage({
+        role: 'assistant',
+        text: '一番最初の画面に戻しました。どこから手直ししますか？',
+      });
+    } else {
+      const prevSpec = getCurrentSpec();
+      state.checkpoints.pop();
+      state.activeCheckpointIndex = state.checkpoints.length - 1;
+      state.liveAppState = preserveUnchangedLiveState(
+        prevSpec,
+        getCurrentSpec(),
+        state.liveAppState,
+      );
+      state.topicTargetIds = [];
+      pushMessage({ role: 'system', text: '1つ前の画面に戻しました' });
+      pushMessage({
+        role: 'assistant',
+        text: '1つ前の画面に戻しました。ここからどう手直ししますか？',
+      });
+    }
+    renderStudio();
+    scrollToLatestMessage();
+    return;
+  }
+
   state.chatLoading = true;
   // はっきりした改造の指示（かつ店長やお客さん宛てでないとき）なら、返事を待つ間から作業の過程をシステムメッセージで見せる
   const canApplyDirectly = recipientSnapshot === 'assistant';
   let logMessage: TimelineMessage | undefined =
-    canApplyDirectly && classifyUserMessageIntent(text) === 'apply'
+    canApplyDirectly && text && classifyUserMessageIntent(text) === 'apply'
       ? startWorkLog(targetIdsSnapshot)
       : undefined;
   const logTimers: number[] = [];
   if (logMessage) {
     const log = logMessage.workLog!;
     logTimers.push(
-      window.setTimeout(() => !log.finished && addWorkStep(log, '画面の部品を調べています'), 900),
-      window.setTimeout(() => !log.finished && addWorkStep(log, '変え方を考えています'), 2200),
+      window.setTimeout(() => !log.finished && setPrepWorkStep(log, '画面の部品を調べています'), 900),
+      window.setTimeout(() => !log.finished && setPrepWorkStep(log, '変え方を考えています'), 2200),
     );
   }
   renderStudio();
@@ -939,17 +1443,30 @@ async function handleSendMessage(
           role: 'assistant',
           text: applied.commitMessage,
           targetComponentIds: targetIdsSnapshot,
-          showEvaluateAction: hasWorkingOrder,
         });
+        const evalChoiceMsg: Omit<TimelineMessage, 'id'> | undefined = hasWorkingOrder
+          ? {
+              role: 'system',
+              text: '手直しした画面をお客さんに試してもらいますか',
+              targetComponentIds: targetIdsSnapshot,
+              showEvaluateAction: true,
+            }
+          : undefined;
 
         if (applied.ownerFacts && applied.ownerFacts.length > 0) {
           state.chatLoading = false;
-          void speakOwner({
-            situation: 'change',
-            facts: applied.ownerFacts,
-            fallback: applied.ownerReaction ?? '',
-          });
+          void speakOwner(
+            {
+              situation: 'change',
+              facts: applied.ownerFacts,
+              fallback: applied.ownerReaction ?? '',
+            },
+            evalChoiceMsg,
+          );
           return;
+        }
+        if (evalChoiceMsg) {
+          pushMessage(evalChoiceMsg);
         }
       }
     } else if (data.intent === 'owner') {
@@ -984,29 +1501,40 @@ async function handleSendMessage(
         role: 'assistant',
         text: firstChunk,
         targetComponentIds: targetIdsSnapshot,
-        followUps: restChunks.length === 0 ? data.suggestedFollowUps : undefined,
       });
+      const followUpMsg: Omit<TimelineMessage, 'id'> | undefined =
+        data.suggestedFollowUps && data.suggestedFollowUps.length > 0
+          ? {
+              role: 'system',
+              text: 'どう手直ししますか',
+              targetComponentIds: targetIdsSnapshot,
+              followUps: data.suggestedFollowUps,
+            }
+          : undefined;
       if (restChunks.length > 0) {
         state.chatLoading = false;
-        enqueueMessages(
-          restChunks.map((chunk, idx) => ({
-            message: {
-              role: 'assistant' as const,
-              text: chunk,
-              targetComponentIds: targetIdsSnapshot,
-              followUps: idx === restChunks.length - 1 ? data.suggestedFollowUps : undefined,
-            },
-            typingMs: typingDurationFor(chunk),
-          })),
-        );
+        const queued: QueuedMessage[] = restChunks.map((chunk) => ({
+          message: {
+            role: 'assistant' as const,
+            text: chunk,
+            targetComponentIds: targetIdsSnapshot,
+          },
+          typingMs: typingDurationFor(chunk),
+        }));
+        if (followUpMsg) {
+          queued.push({ message: followUpMsg, typingMs: 0 });
+        }
+        enqueueMessages(queued);
         return;
+      }
+      if (followUpMsg) {
+        pushMessage(followUpMsg);
       }
     }
   } catch (err) {
     logTimers.forEach((t) => window.clearTimeout(t));
     if (logMessage?.workLog && !logMessage.workLog.finished) {
-      addWorkStep(logMessage.workLog, '途中で止まりました', true);
-      logMessage.workLog.finished = true;
+      state.messages = state.messages.filter((m) => m !== logMessage);
     }
     pushMessage({ role: 'system', tone: 'warning', text: describeError(err) });
   } finally {
@@ -1022,7 +1550,10 @@ async function handleSendMessage(
  * 店長に話してもらう。せりふはAIが作るので、届くまで店長の書き込み中の表示を出しておく。
  * 届かなかったときは決まったせりふを使う
  */
-async function speakOwner(req: Omit<OwnerLineRequest, 'history'>): Promise<void> {
+async function speakOwner(
+  req: Omit<OwnerLineRequest, 'history'>,
+  afterMessage?: Omit<TimelineMessage, 'id'>,
+): Promise<void> {
   state.typingMessage = { role: 'owner' };
   renderStudio();
   scrollToLatestMessage();
@@ -1038,33 +1569,41 @@ async function speakOwner(req: Omit<OwnerLineRequest, 'history'>): Promise<void>
   }
   if (state.typingMessage?.role === 'owner') state.typingMessage = undefined;
   const chunks = text ? splitIntoChatChunks(text) : [];
-  if (chunks.length === 0) {
+  const queued: QueuedMessage[] = chunks.map((chunk, i) => ({
+    message: { role: 'owner' as const, text: chunk },
+    typingMs: i === 0 ? 300 : typingDurationFor(chunk),
+  }));
+  if (afterMessage) {
+    queued.push({ message: afterMessage, typingMs: 0 });
+  }
+  if (queued.length === 0) {
     renderStudio();
     return;
   }
   // 1つ目はすでに書き込み中を見せて待たせたので、すぐ出す
-  enqueueMessages(
-    chunks.map((chunk, i) => ({
-      message: { role: 'owner' as const, text: chunk },
-      typingMs: i === 0 ? 300 : typingDurationFor(chunk),
-    })),
-  );
+  enqueueMessages(queued);
 }
 
 async function handleEvaluate(): Promise<void> {
   if (state.evaluateLoading || !state.selectedCohortId) return;
   flushMessageQueue();
+  clearTransientChoiceMessages();
   state.evaluateLoading = true;
   renderStudio();
   scrollToLatestMessage();
 
   try {
     const activePersonas = getReviewersByCohort(state.selectedCohortId);
+    const currentSpec = getCurrentSpec();
     const componentBounds = sandboxStageEl ? collectComponentRects(sandboxStageEl) : undefined;
+    const screenshotBase64 = sandboxStageEl
+      ? captureSandboxSnapshot(currentSpec, state.liveAppState, sandboxStageEl, null)
+      : undefined;
 
     const evaluation = await postJson<EvaluationResponse>('/api/evaluate', {
-      currentSpec: getCurrentSpec(),
+      currentSpec,
       cohortId: state.selectedCohortId,
+      screenshotBase64,
       componentBounds,
       history: buildOwnerHistory(),
     });
@@ -1108,21 +1647,30 @@ async function handleEvaluate(): Promise<void> {
       const remaining = TARGET_COHORTS.filter((c) => !state.clearedCohortIds.includes(c.id));
       const closing =
         remaining.length > 0
-          ? ['おつかれさまでした！', 'ほかのお客さんにもチャレンジしますか？']
+          ? ['おつかれさまでした！']
           : [
               'おつかれさまでした！すべてのお客さんでクリアです',
               'ほかの直し方も試したくなったら、続けていつでも指示してくださいね',
             ];
-      closing.forEach((line, i) => {
+      for (const line of closing) {
         queued.push({
           message: {
             role: 'assistant',
             text: line,
-            showNextChallenge: remaining.length > 0 && i === closing.length - 1,
           },
           typingMs: typingDurationFor(line),
         });
-      });
+      }
+      if (remaining.length > 0) {
+        queued.push({
+          message: {
+            role: 'system',
+            text: 'ほかのお客さんにもチャレンジしますか',
+            showNextChallenge: true,
+          },
+          typingMs: 0,
+        });
+      }
     } else {
       for (const line of [
         `3人中${achievedCount}人が満足して買えました`,
@@ -1145,17 +1693,6 @@ async function handleEvaluate(): Promise<void> {
   }
 }
 
-function jumpToCheckpoint(index: number): void {
-  if (index < 0 || index >= state.checkpoints.length) return;
-  state.activeCheckpointIndex = index;
-  const spec = getCurrentSpec();
-  state.liveAppState = createInitialState(spec);
-  state.penPoints = [];
-  state.circledComponentIds = [];
-  state.topicTargetIds = [];
-  renderStudio();
-}
-
 function renderCohortSelector(msg: TimelineMessage, isLatestSelector: boolean): HTMLElement {
   const pillRow = document.createElement('div');
   pillRow.className = 'cohort-pill-row';
@@ -1173,33 +1710,127 @@ function renderCohortSelector(msg: TimelineMessage, isLatestSelector: boolean): 
   return pillRow;
 }
 
-/** 準備の行は、終わったら過去形で見せる */
-const PREP_STEP_DONE_TEXT: Record<string, string> = {
-  指示を読んでいます: '指示を読みました',
-  画面の部品を調べています: '画面の部品を調べました',
-  変え方を考えています: '変え方を決めました',
-};
-
-/** 改造の作業ログ。システムメッセージ領域に1行ずつ表示し、完了後もそのまま残す */
-function renderWorkLog(msg: TimelineMessage): HTMLElement {
-  const log = msg.workLog!;
-  const wrap = document.createElement('div');
-  wrap.className = `system-worklog ${log.finished ? 'is-finished' : 'is-running'}`;
-  const list = document.createElement('ul');
-  list.className = 'worklog-list is-system';
-  for (const step of log.steps) {
-    const item = document.createElement('li');
-    item.className = step.done ? 'is-done' : 'is-active';
-    const mark = document.createElement('span');
-    mark.className = 'worklog-mark';
-    mark.textContent = step.done ? '✓' : '';
-    const text = document.createElement('span');
-    text.textContent = step.done ? (PREP_STEP_DONE_TEXT[step.text] ?? step.text) : step.text;
-    item.append(mark, text);
-    list.appendChild(item);
+/** クリア後の「ほかのお客さんにもチャレンジしますか」の選択肢（システムメッセージ表示） */
+function renderNextChallengeSelector(msg: TimelineMessage, isLatestChallenge: boolean): HTMLElement {
+  const pillRow = document.createElement('div');
+  pillRow.className = 'cohort-pill-row';
+  const options: Array<{ key: string; label: string; onSelect: () => void }> = [];
+  for (const c of TARGET_COHORTS) {
+    if (state.clearedCohortIds.includes(c.id) || c.id === state.selectedCohortId) continue;
+    options.push({
+      key: `cohort:${c.id}`,
+      label: `この画面のまま${c.label}を呼ぶ`,
+      onSelect: () => handleCallNextCohort(c.id),
+    });
   }
-  wrap.appendChild(list);
-  return wrap;
+  options.push({
+    key: 'restart',
+    label: '最初の画面からやり直す',
+    onSelect: () => handleRestartFromScratch(),
+  });
+  for (const opt of options) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    const isSelected = msg.chosenOption === opt.key;
+    btn.className = `cohort-pill-btn ${isSelected ? 'is-selected' : ''}`;
+    btn.disabled = Boolean(msg.chosenOption) || !isLatestChallenge;
+    btn.textContent = opt.label;
+    btn.addEventListener('click', () => {
+      msg.chosenOption = opt.key;
+      opt.onSelect();
+    });
+    pillRow.appendChild(btn);
+  }
+  return pillRow;
+}
+
+/** お助けAIが出す選択肢（返信候補・お客さんの反応確認）をシステムメッセージのピルボタンとして描画する */
+function renderActionChoiceRow(msg: TimelineMessage): HTMLElement | null {
+  const pillRow = document.createElement('div');
+  pillRow.className = 'cohort-pill-row';
+  if (msg.showEvaluateAction && !evaluationFor(getCurrentCheckpoint()) && state.selectedCohortId) {
+    const evalBtn = document.createElement('button');
+    evalBtn.type = 'button';
+    evalBtn.className = 'cohort-pill-btn';
+    evalBtn.textContent = 'お客さんの反応を見る';
+    evalBtn.addEventListener('click', () => {
+      void handleEvaluate();
+    });
+    pillRow.appendChild(evalBtn);
+
+    const skipEvalBtn = document.createElement('button');
+    skipEvalBtn.type = 'button';
+    skipEvalBtn.className = 'cohort-pill-btn';
+    skipEvalBtn.textContent = '続けて手直しする';
+    skipEvalBtn.addEventListener('click', () => {
+      clearTransientChoiceMessages();
+      renderStudio();
+      window.requestAnimationFrame(() => {
+        shellEl?.querySelector<HTMLInputElement>('.composer-input')?.focus();
+      });
+    });
+    pillRow.appendChild(skipEvalBtn);
+  }
+  const followUps = msg.followUps ?? [];
+  for (const followUp of followUps) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'cohort-pill-btn';
+    btn.textContent = followUp;
+    btn.addEventListener('click', () => {
+      void handleSendMessage(followUp, msg.targetComponentIds);
+    });
+    pillRow.appendChild(btn);
+  }
+  if (
+    followUps.length > 0 &&
+    !followUps.some((f) => f.includes('何もしない') || f.includes('そのまま'))
+  ) {
+    const noopBtn = document.createElement('button');
+    noopBtn.type = 'button';
+    noopBtn.className = 'cohort-pill-btn';
+    noopBtn.textContent = '何もしない';
+    noopBtn.addEventListener('click', () => {
+      if (msg.targetComponentIds && msg.targetComponentIds.length > 0) {
+        void recordDecision({
+          stage: 'apply_change',
+          targetId: msg.targetComponentIds.join(','),
+          chosenLabel: '何もしない',
+          reason: '',
+          cohortId: state.selectedCohortId,
+        });
+      }
+      state.penPoints = [];
+      state.circledComponentIds = [];
+      state.topicTargetIds = [];
+      clearTransientChoiceMessages();
+      renderStudio();
+    });
+    pillRow.appendChild(noopBtn);
+  }
+  return pillRow.childNodes.length > 0 ? pillRow : null;
+}
+
+/** 改造の進捗・変更内容を、ボックスに入れず通常のシステムメッセージ行と同じ形式で描画する */
+function appendWorkLogLines(row: HTMLElement, msg: TimelineMessage): void {
+  const log = msg.workLog!;
+  for (const step of log.steps) {
+    const line = document.createElement('div');
+    if (step.done) {
+      line.className = 'chat-system-line';
+      line.textContent = step.text;
+    } else {
+      line.className = 'chat-system-line is-progress';
+      const dots = document.createElement('span');
+      dots.className = 'typing-dots';
+      dots.setAttribute('aria-hidden', 'true');
+      dots.innerHTML = '<span></span><span></span><span></span>';
+      const text = document.createElement('span');
+      text.textContent = step.text;
+      line.append(dots, text);
+    }
+    row.appendChild(line);
+  }
 }
 
 const AGENT_NAME = 'お助けAI';
@@ -1220,6 +1851,7 @@ function getRecipientPlaceholder(
 }
 
 function selectRecipientAndFocus(recipient: string): void {
+  if (!state.selectedCohortId) return;
   state.recipient = recipient;
   renderStudio();
   window.requestAnimationFrame(() => {
@@ -1297,41 +1929,56 @@ function renderChatPanel(): HTMLElement {
   chatCard.className = 'vibe-chat-card';
 
   const stream = document.createElement('div');
-  const isPlayingQueue = queueTimer !== null || messageQueue.length > 0;
+  const isPlayingQueue =
+    isQueueRunning || queueTimers.size > 0 || activeQueuedItem !== null || messageQueue.length > 0;
   stream.className = `vibe-chat-stream ${isPlayingQueue ? 'is-skippable' : ''}`;
-  if (isPlayingQueue) stream.title = 'クリックすると続きをすぐ表示します';
-  // 順番に出している途中の発言は、チャットを押せば待たずにすべて出す（ボタンや入力欄を押したときは除く）
+  if (isPlayingQueue) stream.title = 'クリックすると次の発言をすぐ表示します';
+  // 順番に出している途中の発言は、チャットを押せば1つずつすぐ表示して次に進める（ボタンや入力欄を押したときは除く）
   stream.addEventListener('click', (e) => {
     if ((e.target as HTMLElement).closest('button, input, textarea, a, select, .is-selectable')) return;
-    if (queueTimer === null && messageQueue.length === 0) return;
-    flushMessageQueue();
-    renderStudio();
-    scrollToLatestMessage();
+    if (!isPlayingQueue) return;
+    advanceOneQueuedMessage();
   });
   chatScrollEl = stream;
 
-  const lastAssistantMessageId = [...state.messages]
-    .reverse()
-    .find((m) => m.role === 'assistant')?.id;
   const isBusy = state.chatLoading || state.evaluateLoading;
   const latestSelectorMessageId = [...state.messages].reverse().find((m) => m.showCohortSelector)?.id;
+  const latestChallengeMessageId = [...state.messages].reverse().find((m) => m.showNextChallenge)?.id;
+  const latestActionChoiceId = [...state.messages]
+    .reverse()
+    .find((m) => (m.followUps && m.followUps.length > 0) || m.showEvaluateAction)?.id;
   let prevSpeakerKey = '';
 
   for (const msg of state.messages) {
-    const isFirstSeen = !seenMessageIds.has(msg.id);
-    seenMessageIds.add(msg.id);
-    const enteringClass = isFirstSeen ? ' is-entering' : '';
-    const currentSpeakerKey = speakerKeyOf(msg);
-    const isContinuation = currentSpeakerKey === prevSpeakerKey;
-    prevSpeakerKey = currentSpeakerKey;
-
-    // 進行役のアナウンス・AIの作業プログレス：吹き出しなしで中央に小さく出す
+    // 進行役のアナウンス・AIの作業プログレス・選択肢：吹き出しなしで中央に小さく出す
     if (msg.role === 'system') {
+      const isActionChoiceMsg = Boolean(
+        (msg.followUps && msg.followUps.length > 0) || msg.showEvaluateAction,
+      );
+      if (isActionChoiceMsg) {
+        if (msg.id !== latestActionChoiceId || isBusy || isPlayingQueue) continue;
+        const actionRow = renderActionChoiceRow(msg);
+        if (!actionRow) continue;
+        const row = document.createElement('div');
+        if (msg.text) {
+          const line = document.createElement('div');
+          line.className = 'chat-system-line';
+          line.textContent = msg.text;
+          row.appendChild(line);
+        }
+        row.appendChild(actionRow);
+        const isFirstSeen = !seenMessageIds.has(msg.id);
+        seenMessageIds.add(msg.id);
+        row.className = `chat-system-row${isFirstSeen ? ' is-entering' : ''}`;
+        prevSpeakerKey = 'system';
+        stream.appendChild(row);
+        continue;
+      }
+
       const row = document.createElement('div');
-      row.className = `chat-system-row${enteringClass}`;
       if (msg.workLog) {
-        row.appendChild(renderWorkLog(msg));
-      } else {
+        appendWorkLogLines(row, msg);
+      } else if (msg.text) {
         const line = document.createElement('div');
         line.className = `chat-system-line ${msg.tone === 'warning' ? 'is-warning' : ''}`;
         line.textContent = msg.text;
@@ -1340,9 +1987,25 @@ function renderChatPanel(): HTMLElement {
       if (msg.showCohortSelector) {
         row.appendChild(renderCohortSelector(msg, msg.id === latestSelectorMessageId));
       }
+      if (msg.showNextChallenge && state.selectedCohortId) {
+        row.appendChild(renderNextChallengeSelector(msg, msg.id === latestChallengeMessageId));
+      }
+      if (row.childNodes.length === 0) continue;
+
+      const isFirstSeen = !seenMessageIds.has(msg.id);
+      seenMessageIds.add(msg.id);
+      row.className = `chat-system-row${isFirstSeen ? ' is-entering' : ''}`;
+      prevSpeakerKey = 'system';
       stream.appendChild(row);
       continue;
     }
+
+    const isFirstSeen = !seenMessageIds.has(msg.id);
+    seenMessageIds.add(msg.id);
+    const enteringClass = isFirstSeen ? ' is-entering' : '';
+    const currentSpeakerKey = speakerKeyOf(msg);
+    const isContinuation = currentSpeakerKey === prevSpeakerKey;
+    prevSpeakerKey = currentSpeakerKey;
 
     // お客さんの発言：アイコンと名前つきの吹き出し
     if (msg.role === 'customer') {
@@ -1375,58 +2038,8 @@ function renderChatPanel(): HTMLElement {
     // お助けエージェントの発言：進行案内・質問回答・改造完了の報告
     if (msg.role === 'assistant') {
       const bubble = createBubble(`chat-bubble is-agent${enteringClass}`, msg.text);
-      const extras: HTMLElement[] = [];
-      if (msg.id === lastAssistantMessageId && !isBusy && !isPlayingQueue) {
-        if (msg.showNextChallenge && state.selectedCohortId) {
-          const chipRow = document.createElement('div');
-          chipRow.className = 'followup-chip-row';
-          for (const c of TARGET_COHORTS) {
-            if (state.clearedCohortIds.includes(c.id) || c.id === state.selectedCohortId) continue;
-            const chip = document.createElement('button');
-            chip.type = 'button';
-            chip.className = 'followup-chip is-evaluate-chip';
-            chip.textContent = `この画面のまま${c.label}を呼ぶ`;
-            chip.addEventListener('click', () => handleCallNextCohort(c.id));
-            chipRow.appendChild(chip);
-          }
-          const restart = document.createElement('button');
-          restart.type = 'button';
-          restart.className = 'followup-chip';
-          restart.textContent = '最初の画面からやり直す';
-          restart.addEventListener('click', () => handleRestartFromScratch());
-          chipRow.appendChild(restart);
-          extras.push(chipRow);
-        } else if (
-          (msg.followUps && msg.followUps.length > 0) ||
-          (msg.showEvaluateAction && !evaluationFor(getCurrentCheckpoint()) && state.selectedCohortId)
-        ) {
-          const chipRow = document.createElement('div');
-          chipRow.className = 'followup-chip-row';
-          if (msg.showEvaluateAction && !evaluationFor(getCurrentCheckpoint()) && state.selectedCohortId) {
-            const evalChip = document.createElement('button');
-            evalChip.type = 'button';
-            evalChip.className = 'followup-chip is-evaluate-chip';
-            evalChip.textContent = 'お客さんの反応を見る';
-            evalChip.addEventListener('click', () => {
-              void handleEvaluate();
-            });
-            chipRow.appendChild(evalChip);
-          }
-          for (const followUp of msg.followUps ?? []) {
-            const chip = document.createElement('button');
-            chip.type = 'button';
-            chip.className = 'followup-chip';
-            chip.textContent = followUp;
-            chip.addEventListener('click', () => {
-              void handleSendMessage(followUp, msg.targetComponentIds);
-            });
-            chipRow.appendChild(chip);
-          }
-          extras.push(chipRow);
-        }
-      }
       stream.appendChild(
-        createSpeakerRow('agent', AGENT_ICON, AGENT_NAME, bubble, extras, isContinuation, 'assistant'),
+        createSpeakerRow('agent', AGENT_ICON, AGENT_NAME, bubble, [], isContinuation, 'assistant'),
       );
       continue;
     }
@@ -1523,18 +2136,45 @@ function renderChatPanel(): HTMLElement {
   recipientRow.appendChild(recipientLabel);
 
   const cohortPersonas = state.selectedCohortId ? getReviewersByCohort(state.selectedCohortId) : [];
-  const recipientOptions: Array<{ key: string; label: string; customerIndex?: number }> = [
+  let latestEvalForRecipients: EvaluationResponse | undefined;
+  for (let i = state.activeCheckpointIndex; i >= 0; i--) {
+    const e = evaluationFor(state.checkpoints[i]);
+    if (e) {
+      latestEvalForRecipients = e;
+      break;
+    }
+  }
+  const recipientOptions: Array<{
+    key: string;
+    label: string;
+    customerIndex?: number;
+    achieved?: boolean;
+  }> = [
     { key: 'assistant', label: AGENT_NAME },
     { key: 'owner', label: OWNER.name },
-    ...cohortPersonas.map((p, idx) => ({ key: p.id, label: p.name, customerIndex: idx })),
+    ...cohortPersonas.map((p, idx) => {
+      const achieved =
+        latestEvalForRecipients?.results.find((r) => r.reviewerId === p.id)?.outcome === 'achieved';
+      return {
+        key: p.id,
+        label: achieved ? `✓ ${p.name}` : p.name,
+        customerIndex: idx,
+        achieved,
+      };
+    }),
   ];
+  const isCohortLocked = !state.selectedCohortId;
   const now = performance.now();
   for (const opt of recipientOptions) {
     const pill = document.createElement('button');
     pill.type = 'button';
     pill.dataset.recipientKey = opt.key;
-    pill.className = `composer-recipient-pill${state.recipient === opt.key ? ' is-active' : ''}${opt.customerIndex !== undefined ? ' is-customer-pill' : ''}`;
+    pill.disabled = isCohortLocked;
+    pill.className = `composer-recipient-pill${state.recipient === opt.key ? ' is-active' : ''}${opt.customerIndex !== undefined ? ' is-customer-pill' : ''}${opt.achieved ? ' is-achieved-customer' : ''}`;
     if (opt.customerIndex !== undefined) {
+      pill.title = opt.achieved
+        ? 'このお客さんは満足して注文できました（クリックで話しかける）'
+        : 'まだ困っているお客さんに話しかける';
       let firstSeen = recipientFirstSeenAt.get(opt.key);
       if (firstSeen === undefined) {
         firstSeen = now;
@@ -1550,6 +2190,7 @@ function renderChatPanel(): HTMLElement {
     }
     pill.textContent = opt.label;
     pill.addEventListener('click', () => {
+      if (isCohortLocked) return;
       state.recipient = opt.key;
       renderStudio();
       window.requestAnimationFrame(() => {
@@ -1558,6 +2199,7 @@ function renderChatPanel(): HTMLElement {
     });
     recipientRow.appendChild(pill);
   }
+
   composer.appendChild(recipientRow);
 
   const formRow = document.createElement('form');
@@ -1567,14 +2209,24 @@ function renderChatPanel(): HTMLElement {
     void handleSendMessage();
   });
 
+  const inputWrap = document.createElement('div');
+  inputWrap.className = `composer-input-wrap${state.isRecordingAudio ? ' is-recording' : ''}${state.isTranscribingAudio ? ' is-transcribing' : ''}${isCohortLocked ? ' is-locked' : ''}`;
+
   const input = document.createElement('input');
   input.type = 'text';
   input.className = 'composer-input';
-  input.placeholder = getRecipientPlaceholder(state.recipient, cohortPersonas);
+  input.disabled = isCohortLocked;
+  input.placeholder = isCohortLocked
+    ? 'まず上のボタンから、誰のために直すかを選んでください'
+    : state.isRecordingAudio
+      ? '録音中… 話し終えたら右の停止ボタンを押してください'
+      : state.isTranscribingAudio
+        ? '音声から指示を整えています…'
+        : getRecipientPlaceholder(state.recipient, cohortPersonas);
   input.value = state.inputText;
   input.addEventListener('input', () => {
     state.inputText = input.value;
-    sendBtn.disabled = !state.inputText.trim();
+    sendBtn.disabled = !state.inputText.trim() || isCohortLocked;
     const switched = resolveExplicitRecipientSwitch(state.inputText);
     if (switched && switched !== state.recipient) {
       state.recipient = switched;
@@ -1593,13 +2245,40 @@ function renderChatPanel(): HTMLElement {
     }
   });
 
+  const micBtn = document.createElement('button');
+  micBtn.type = 'button';
+  micBtn.className = `btn-composer-mic${state.isRecordingAudio ? ' is-recording' : ''}`;
+  micBtn.disabled = isCohortLocked || state.chatLoading || state.isTranscribingAudio;
+  micBtn.title = isCohortLocked
+    ? '先に上のボタンから、誰のために直すかを選んでください'
+    : state.isRecordingAudio
+      ? '録音を終えて入力欄に反映する'
+      : state.isTranscribingAudio
+        ? '音声を整えています…'
+        : '声で入力する（雑音や言い淀みを省いて入力欄に整えます）';
+  micBtn.setAttribute(
+    'aria-label',
+    state.isRecordingAudio ? '録音を終えて入力欄に反映' : '音声で入力',
+  );
+  micBtn.innerHTML = state.isRecordingAudio
+    ? `${ICONS.micStop}<span>停止</span>`
+    : state.isTranscribingAudio
+      ? '<span class="typing-dots" aria-hidden="true"><span></span><span></span><span></span></span>'
+      : ICONS.mic;
+  micBtn.addEventListener('click', () => {
+    void toggleVoiceRecording();
+  });
+
+  inputWrap.append(input, micBtn);
+
   const sendBtn = document.createElement('button');
   sendBtn.type = 'submit';
   sendBtn.className = 'btn-composer-send';
-  sendBtn.disabled = !state.inputText.trim();
+  sendBtn.disabled =
+    isCohortLocked || !state.inputText.trim() || state.isRecordingAudio || state.isTranscribingAudio;
   sendBtn.textContent = '送信';
 
-  formRow.append(input, sendBtn);
+  formRow.append(inputWrap, sendBtn);
   if (state.pendingSend) {
     const note = document.createElement('div');
     note.className = 'composer-pending-note';
@@ -1672,12 +2351,8 @@ function renderStudio(): void {
 
   const activeEl = document.activeElement;
   const focusedClass =
-    activeEl instanceof HTMLInputElement
-      ? activeEl.classList.contains('composer-input')
-        ? 'composer-input'
-        : activeEl.classList.contains('inline-reason-input')
-          ? 'inline-reason-input'
-          : null
+    activeEl instanceof HTMLInputElement && activeEl.classList.contains('composer-input')
+      ? 'composer-input'
       : null;
   const selectionStart = activeEl instanceof HTMLInputElement ? activeEl.selectionStart : null;
   const selectionEnd = activeEl instanceof HTMLInputElement ? activeEl.selectionEnd : null;
@@ -1685,59 +2360,102 @@ function renderStudio(): void {
 
   if (headerSlotEl) {
     headerSlotEl.innerHTML = '';
-    if (state.checkpoints.length > 1 || state.selectedCohortId) {
-      const header = document.createElement('header');
-      header.className = 'studio-header';
+    const header = document.createElement('header');
+    header.className = 'studio-header';
 
-      if (state.checkpoints.length > 1) {
-        const cpBar = document.createElement('div');
-        cpBar.className = 'checkpoint-bar';
-        state.checkpoints.forEach((cp, idx) => {
-          const pill = document.createElement('button');
-          pill.type = 'button';
-          pill.className = `checkpoint-pill ${idx === state.activeCheckpointIndex ? 'is-active' : ''}`;
-          pill.textContent = formatCheckpointLabel(cp);
-          pill.addEventListener('click', () => jumpToCheckpoint(idx));
-          cpBar.appendChild(pill);
-        });
-        header.appendChild(cpBar);
-        requestAnimationFrame(() => {
-          const active = cpBar.querySelector<HTMLElement>('.checkpoint-pill.is-active');
-          active?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
-        });
+    const cohort = state.selectedCohortId
+      ? TARGET_COHORTS.find((c) => c.id === state.selectedCohortId)
+      : undefined;
+    const cohortPersonas = state.selectedCohortId
+      ? getReviewersByCohort(state.selectedCohortId)
+      : [];
+    const evalRes = evaluationFor(getCurrentCheckpoint());
+    const achievedOf = (e: EvaluationResponse) =>
+      e.results.filter((r) => r.outcome === 'achieved').length;
+    let previous: { evalRes: EvaluationResponse; achieved: number } | undefined;
+    for (let i = state.activeCheckpointIndex - 1; i >= 0 && !evalRes; i--) {
+      const e = evaluationFor(state.checkpoints[i]);
+      if (e) {
+        previous = { evalRes: e, achieved: achievedOf(e) };
+        break;
       }
-
-      if (state.selectedCohortId) {
-        const cohort = TARGET_COHORTS.find((c) => c.id === state.selectedCohortId);
-        const evalRes = evaluationFor(getCurrentCheckpoint());
-        const goalBadge = document.createElement('div');
-        goalBadge.className = 'goal-status-bar';
-        const goal = `目標 ${cohort?.label ?? ''} 3人全員が満足して注文できること`;
-        const achievedOf = (e: EvaluationResponse) =>
-          e.results.filter((r) => r.outcome === 'achieved').length;
-        // 今の画面を試していなければ、それより前で最後に試した画面の結果を添えて、試すよう促す
-        let previous: { label: string; achieved: number } | undefined;
-        for (let i = state.activeCheckpointIndex - 1; i >= 0 && !evalRes; i--) {
-          const e = evaluationFor(state.checkpoints[i]);
-          if (e) {
-            const cp = state.checkpoints[i];
-            previous = { label: formatCheckpointLabel(cp), achieved: achievedOf(e) };
-            break;
-          }
-        }
-        if (evalRes) {
-          goalBadge.textContent = `達成 ${achievedOf(evalRes)}/3人｜${goal}`;
-        } else if (previous) {
-          goalBadge.textContent = `未確認（${previous.label}は${previous.achieved}/3人）｜${goal}`;
-        } else {
-          goalBadge.textContent = `未確認（0/3人）｜${goal}`;
-        }
-        goalBadge.title = goalBadge.textContent ?? '';
-        header.appendChild(goalBadge);
-      }
-
-      headerSlotEl.appendChild(header);
     }
+
+    const goalGroup = document.createElement('div');
+    goalGroup.className = 'goal-status-group';
+
+    const cohortBadge = document.createElement('div');
+    cohortBadge.className = `goal-cohort-badge${cohort ? '' : ' is-empty'}`;
+    const cohortLabelEl = document.createElement('span');
+    cohortLabelEl.className = 'goal-badge-prefix';
+    cohortLabelEl.textContent = '対象';
+    const cohortNameEl = document.createElement('span');
+    cohortNameEl.className = 'goal-cohort-name';
+    cohortNameEl.textContent = cohort ? cohort.label : '未選択';
+    cohortBadge.append(cohortLabelEl, cohortNameEl);
+
+    const progressBadge = document.createElement('div');
+    const activeEval = evalRes ?? previous?.evalRes;
+    const currentAchieved = evalRes ? achievedOf(evalRes) : (previous?.achieved ?? 0);
+    const isCleared = Boolean(
+      cohortPersonas.length > 0 && evalRes && currentAchieved === cohortPersonas.length,
+    );
+    const isUnverified = Boolean(state.selectedCohortId && !evalRes && state.checkpoints.length > 1);
+    progressBadge.className = `goal-progress-badge${isCleared ? ' is-cleared' : ''}${isUnverified ? ' is-unverified' : ''}${cohort ? '' : ' is-empty'}`;
+
+    const progressPrefixEl = document.createElement('span');
+    progressPrefixEl.className = 'goal-badge-prefix';
+    progressPrefixEl.textContent = '満足';
+
+    const dotsWrap = document.createElement('span');
+    dotsWrap.className = 'goal-progress-dots';
+    const dotCount = cohortPersonas.length > 0 ? cohortPersonas.length : 3;
+    for (let i = 0; i < dotCount; i++) {
+      const persona = cohortPersonas[i];
+      const dot = document.createElement('span');
+      const personaAchieved =
+        persona &&
+        activeEval?.results.find((r) => r.reviewerId === persona.id)?.outcome === 'achieved';
+      dot.className = `goal-dot${personaAchieved ? ' is-achieved' : ''}${!evalRes && previous ? ' is-pending' : ''}`;
+      if (persona) {
+        dot.title = `${persona.name}：${personaAchieved ? '満足して注文できた' : 'まだ困っている'}`;
+      }
+      dotsWrap.appendChild(dot);
+    }
+
+    if (isUnverified) {
+      progressBadge.title = '画面を手直ししました。「お客さんの反応を見る」で確かめられます';
+    } else if (cohort) {
+      progressBadge.title = `満足して注文できた人数：${currentAchieved}/${dotCount}人`;
+    }
+
+    progressBadge.append(progressPrefixEl, dotsWrap);
+
+    const voiceToggleBtn = document.createElement('button');
+    voiceToggleBtn.type = 'button';
+    voiceToggleBtn.className = `header-voice-toggle${state.voiceEnabled ? '' : ' is-off'}`;
+    const voiceLabel = state.voiceEnabled
+      ? '音声読み上げをオフにする'
+      : '音声読み上げはオフになっています（クリックでオンに戻す）';
+    voiceToggleBtn.title = voiceLabel;
+    voiceToggleBtn.setAttribute('aria-label', voiceLabel);
+    voiceToggleBtn.innerHTML = state.voiceEnabled ? ICONS.volumeOn : ICONS.volumeOff;
+    voiceToggleBtn.addEventListener('click', () => {
+      state.voiceEnabled = !state.voiceEnabled;
+      if (!state.voiceEnabled) {
+        stopAllTtsPlayback();
+      }
+      renderStudio();
+    });
+
+    const headerChatBar = document.createElement('div');
+    headerChatBar.className = 'header-chat-bar';
+
+    goalGroup.append(cohortBadge, progressBadge);
+    headerChatBar.append(goalGroup, voiceToggleBtn);
+    header.appendChild(headerChatBar);
+
+    headerSlotEl.appendChild(header);
   }
 
   if (phoneFrameEl) {
@@ -1761,8 +2479,13 @@ function renderStudio(): void {
     const penModeBtn = document.createElement('button');
     penModeBtn.type = 'button';
     penModeBtn.className = `header-mode-btn is-pen ${state.interactionMode === 'pen' ? 'is-active' : ''}`;
+    penModeBtn.disabled = !state.selectedCohortId;
+    if (!state.selectedCohortId) {
+      penModeBtn.title = '先にチャットで、誰のために直すかを選んでください';
+    }
     penModeBtn.innerHTML = `${ICONS.pen}<span>赤ペンで囲む</span>`;
     penModeBtn.addEventListener('click', () => {
+      if (!state.selectedCohortId) return;
       state.interactionMode = 'pen';
       renderStudio();
     });

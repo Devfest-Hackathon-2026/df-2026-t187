@@ -5,6 +5,8 @@ import type {
   EvaluateRequest,
   OwnerLineRequest,
   RecordDecisionRequest,
+  TranscribeRequest,
+  TtsRequest,
 } from '../shared/types.ts';
 import {
   AiNotConfiguredError,
@@ -14,9 +16,10 @@ import {
   evaluateAppWithPersonas,
   getAiConnectionStatus,
   recordHumanDecisionWithFunctionCalling,
+  transcribeAndRefineUserAudio,
   voiceOwnerLine,
 } from './gemini.ts';
-import { listHumanDecisions, verifyAppCheckHeader } from './store.ts';
+import { listHumanDecisions, synthesizeStudioSpeech, verifyAppCheckHeader } from './store.ts';
 
 const MAX_BODY_BYTES = 8 * 1024 * 1024; // 8MB (ペン描きスクリーンショットBase64対応)
 
@@ -145,6 +148,28 @@ export async function handleApiRequest(
         return true;
       }
       const result = await evaluateAppWithPersonas(body);
+      sendJson(res, 200, result);
+      return true;
+    }
+
+    if (req.method === 'POST' && url === '/api/tts') {
+      const body = await readJsonBody<TtsRequest>(req);
+      if (!body?.text) {
+        sendJson(res, 400, { error: 'text が必要です' });
+        return true;
+      }
+      const result = await synthesizeStudioSpeech(body);
+      sendJson(res, 200, result);
+      return true;
+    }
+
+    if (req.method === 'POST' && url === '/api/transcribe') {
+      const body = await readJsonBody<TranscribeRequest>(req);
+      if (!body?.audioBase64 || !body?.currentSpec) {
+        sendJson(res, 400, { error: 'audioBase64 と currentSpec が必要です' });
+        return true;
+      }
+      const result = await transcribeAndRefineUserAudio(body);
       sendJson(res, 200, result);
       return true;
     }

@@ -86,66 +86,124 @@ body {
 .studio-header {
   background: transparent;
   border-bottom: none;
-  max-width: 1440px;
+  /* 下の .game-stage と同じ2カラムグリッド・最大幅・左右余白に揃え、チャット欄の左右端に完全一致させる */
+  max-width: 1600px;
   width: 100%;
   margin: 0 auto;
-  padding: 10px clamp(20px, 3vw, 40px) 0;
+  padding: 12px clamp(20px, 3vw, 40px) 0;
+  display: grid;
+  grid-template-columns: minmax(0, 40%) minmax(0, 1fr);
+  gap: clamp(24px, 3vw, 48px);
+  align-items: center;
+}
+
+.header-chat-bar {
+  grid-column: 2;
   display: flex;
-  /* 版が増えても折り返さず、スマホや下のボタンの位置がずれないようにする。版が出る前から同じ高さを取っておく */
-  flex-wrap: nowrap;
-  min-height: 49px;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
-}
-
-.goal-status-bar {
-  flex: 0 1 auto;
+  gap: 8px;
+  width: 100%;
   min-width: 0;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  background: var(--paper-card);
-  color: var(--ink-80);
-  border: 1px solid var(--ink-15);
-  border-radius: 999px;
-  padding: 6px 14px;
-  font-size: 0.78rem;
-  font-weight: 800;
-  box-shadow: var(--shadow-soft);
 }
 
-.checkpoint-bar {
+.goal-status-group {
   display: flex;
   align-items: center;
   gap: 6px;
   flex: 0 1 auto;
   min-width: 0;
-  overflow-x: auto;
-  scrollbar-width: none;
 }
 
-.checkpoint-bar::-webkit-scrollbar {
-  display: none;
-}
-
-.checkpoint-pill {
+.goal-cohort-badge,
+.goal-progress-badge,
+.header-voice-toggle {
   flex: 0 0 auto;
-  background: var(--paper-subtle);
-  color: var(--ink-60);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 34px;
+  padding: 0 clamp(10px, 1.1vw, 14px);
+  background: var(--paper-card);
+  color: var(--ink);
   border: 1px solid var(--ink-15);
   border-radius: 999px;
-  padding: 8px 15px;
-  font-size: 0.82rem;
-  font-weight: 700;
+  font-size: clamp(0.72rem, 0.9vw, 0.78rem);
+  font-weight: 800;
+  line-height: 1;
+  box-shadow: var(--shadow-soft);
+  white-space: nowrap;
+}
+
+.header-voice-toggle {
+  width: 34px;
+  padding: 0;
+  justify-content: center;
+  color: var(--ink);
   cursor: pointer;
   transition: all 140ms ease;
 }
 
-.checkpoint-pill.is-active {
-  background: var(--ink);
-  border-color: var(--ink);
-  color: #ffffff;
+.header-voice-toggle svg {
+  width: 15px;
+  height: 15px;
+  flex: none;
+}
+
+.header-voice-toggle:hover {
+  border-color: var(--ink-40);
+}
+
+.header-voice-toggle.is-off {
+  background: rgba(254, 242, 242, 0.55);
+  border-color: rgba(220, 38, 38, 0.38);
+  color: rgba(220, 38, 38, 0.78);
+  box-shadow: 0 1px 4px rgba(220, 38, 38, 0.08);
+}
+
+.goal-badge-prefix {
+  color: var(--ink);
+  font-weight: 900;
+}
+
+.goal-cohort-badge.is-empty .goal-cohort-name {
+  color: var(--ink-60);
+}
+
+.goal-progress-badge.is-cleared {
+  background: #f0fdf4;
+  border-color: rgba(21, 128, 61, 0.35);
+  color: var(--accent-green);
+}
+
+.goal-progress-badge.is-unverified {
+  background: #eff6ff;
+  border-color: rgba(37, 99, 235, 0.28);
+  color: var(--accent-blue);
+}
+
+.goal-progress-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.goal-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--ink-15);
+  border: 1.5px solid var(--ink-40);
+  transition: all 160ms ease;
+}
+
+.goal-dot.is-achieved {
+  background: var(--accent-green);
+  border-color: var(--accent-green);
+}
+
+.goal-dot.is-pending {
+  opacity: 0.55;
 }
 
 /* 操作ボタンはスマホの列の幅に合わせて縮み、列からはみ出さない（大きさはすべて em で指定） */
@@ -202,6 +260,11 @@ body {
   color: #ffffff;
 }
 
+.header-mode-btn:disabled {
+  color: var(--ink-40);
+  cursor: not-allowed;
+}
+
 .btn-bottom-evaluate {
   display: inline-flex;
   align-items: center;
@@ -248,7 +311,7 @@ body {
   max-width: 1600px;
   width: 100%;
   margin: 0 auto;
-  padding: 1.5dvh clamp(20px, 3vw, 40px) 0;
+  padding: 1dvh clamp(20px, 3vw, 40px) 0;
   display: grid;
   /* スマホの列は画面の幅の4割まで。チャットは残り */
   grid-template-columns: minmax(0, 40%) minmax(0, 1fr);
@@ -256,19 +319,6 @@ body {
   justify-content: center;
   gap: clamp(24px, 3vw, 48px);
   align-items: stretch;
-}
-
-@media (max-width: 860px) {
-  .studio-shell {
-    height: auto;
-    min-height: 100dvh;
-    overflow: visible;
-  }
-
-  .game-stage {
-    grid-template-columns: 1fr;
-    justify-items: center;
-  }
 }
 
 /* ==================== 左：スマホ筐体（9:16比率を維持して大きく伸縮） ==================== */
@@ -988,6 +1038,74 @@ body {
   line-height: 1;
   cursor: pointer;
   text-shadow: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-family: inherit;
+  font-weight: 700;
+}
+
+.inapp-popup-close.pos-top-left {
+  top: 0.45rem;
+  left: 0.45rem;
+  right: auto;
+}
+
+.inapp-popup-close.pos-bottom-right {
+  top: auto;
+  bottom: 0.55rem;
+  right: 0.55rem;
+}
+
+.inapp-popup-close.pos-bottom-left {
+  top: auto;
+  bottom: 0.55rem;
+  left: 0.55rem;
+  right: auto;
+}
+
+.inapp-popup-card.close-pos-bottom-right,
+.inapp-popup-card.close-pos-bottom-left {
+  padding-bottom: 2.9rem;
+}
+
+.inapp-popup-card.close-pos-bottom-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  padding-top: 1.4rem;
+}
+
+.inapp-popup-close.pos-bottom-bar {
+  position: static;
+  order: 10;
+  width: 100% !important;
+  height: auto !important;
+  min-height: 2.5rem;
+  border-radius: 0.7rem;
+  padding: 0.55rem 0.9rem;
+  background: rgba(0, 0, 0, 0.14);
+  font-size: 0.95rem;
+}
+
+.inapp-popup-close.has-label:not(.pos-bottom-bar) {
+  width: auto !important;
+  border-radius: 999px;
+  padding: 0.35rem 0.75rem;
+}
+
+.inapp-popup-action-btn {
+  margin-top: 0.75rem;
+  width: 100%;
+  border: none;
+  border-radius: 0.75rem;
+  padding: 0.65rem 0.9rem;
+  background: var(--app-accent, #6f4e37);
+  color: #fff;
+  font-family: inherit;
+  font-size: 0.95rem;
+  font-weight: 700;
+  cursor: pointer;
 }
 
 /* 閉じるボタンの大きさは部品の size で決まる */
@@ -996,6 +1114,17 @@ body {
 .inapp-popup-close.size-md { width: 1.9rem; height: 1.9rem; font-size: 0.95rem; }
 .inapp-popup-close.size-lg,
 .inapp-popup-close.size-xl { width: 2.5rem; height: 2.5rem; font-size: 1.2rem; }
+
+/* ---------- サンドボックス内の自由カスタム部品 ---------- */
+.comp-custom-sandbox {
+  width: 100%;
+  border-radius: 0.85rem;
+  line-height: 1.45;
+}
+.comp-custom-sandbox button {
+  font-family: inherit;
+  cursor: pointer;
+}
 
 /* ---------- 確認シート ---------- */
 .inapp-sheet {
@@ -1099,57 +1228,6 @@ body {
   display: flex;
   flex-direction: column;
   overflow: hidden;
-}
-
-/* 改造の作業ログ（システムメッセージ領域に表示） */
-.system-worklog {
-  background: var(--paper-subtle);
-  border: 1px solid var(--ink-10);
-  border-radius: 12px;
-  padding: 8px 14px;
-  max-width: 90%;
-}
-
-.worklog-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: grid;
-  gap: 4px;
-  font-size: 0.76rem;
-}
-
-.worklog-list li {
-  display: flex;
-  gap: 6px;
-  align-items: baseline;
-  color: var(--ink-80);
-}
-
-.worklog-list li.is-active {
-  color: var(--ink-60);
-}
-
-.worklog-mark {
-  flex: 0 0 1em;
-  color: #2563eb;
-  font-weight: 800;
-}
-
-/* 作業中の行は、印の代わりに小さく回る輪を出す */
-.worklog-list li.is-active .worklog-mark::before {
-  content: '';
-  display: inline-block;
-  width: 0.7em;
-  height: 0.7em;
-  border: 2px solid #93c5fd;
-  border-top-color: #2563eb;
-  border-radius: 50%;
-  animation: worklogSpin 0.8s linear infinite;
-}
-
-@keyframes worklogSpin {
-  to { transform: rotate(360deg); }
 }
 
 .composer-pending-note {
@@ -1318,48 +1396,6 @@ body {
   border-color: #fecaca;
 }
 
-/* お助けエージェントの回答に続く返信候補 */
-.followup-chip-row {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 4px;
-}
-
-.followup-chip {
-  background: #ffffff;
-  border: 1px solid var(--ink-15);
-  border-radius: 999px;
-  padding: 4px 11px;
-  font-size: 0.74rem;
-  font-weight: 700;
-  color: var(--ink-80);
-  cursor: pointer;
-  transition: all 120ms ease;
-}
-
-.followup-chip:hover {
-  border-color: var(--accent-blue);
-  color: var(--accent-blue);
-}
-
-.followup-chip.is-evaluate-chip {
-  background: var(--accent-blue);
-  border-color: var(--accent-blue);
-  color: #ffffff;
-}
-
-.followup-chip.is-evaluate-chip:hover {
-  opacity: 0.92;
-  color: #ffffff;
-}
-
-.disposition-wrap {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
 .chat-bubble {
   max-width: 96%;
   border-radius: 16px;
@@ -1440,23 +1476,24 @@ body {
   }
 }
 
-/* 顧客層の選択・インライン理由入力 */
+/* 顧客層の選択・お助けAIの選択肢（システムメッセージ領域） */
 
 .cohort-pill-row {
   display: flex;
   flex-wrap: wrap;
+  justify-content: center;
   gap: 6px;
   width: 100%;
-  max-width: 420px;
+  max-width: 540px;
 }
 
 .cohort-pill-btn {
-  flex: 1;
+  flex: 0 1 auto;
   min-width: 0;
   background: #ffffff;
   border: 1.5px solid var(--ink-15);
   border-radius: 10px;
-  padding: 8px 10px;
+  padding: 8px 16px;
   cursor: pointer;
   font-size: 0.8rem;
   font-weight: 800;
@@ -1478,77 +1515,6 @@ body {
   border-color: var(--accent-blue);
   background: #eff6ff;
   opacity: 1;
-}
-
-.inline-reason-row {
-  display: flex;
-  gap: 6px;
-  margin-top: 2px;
-}
-
-.inline-reason-input {
-  flex: 1;
-  min-width: 0;
-  padding: 6px 10px;
-  border-radius: 8px;
-  border: 1px solid var(--ink-15);
-  background: #ffffff;
-  font-size: 0.76rem;
-  font-weight: 700;
-  color: var(--ink);
-}
-
-.inline-reason-input:focus {
-  outline: none;
-  border-color: var(--accent-blue);
-}
-
-.btn-inline-decide {
-  background: var(--ink);
-  color: #ffffff;
-  border: none;
-  border-radius: 8px;
-  padding: 6px 12px;
-  font-size: 0.74rem;
-  font-weight: 800;
-  cursor: pointer;
-  flex: none;
-}
-
-.decision-recorded-line {
-  font-size: 0.72rem;
-  font-weight: 700;
-  color: var(--accent-blue);
-  background: #eff6ff;
-  border-radius: 8px;
-  padding: 5px 9px;
-}
-
-.disposition-choice-row {
-  display: flex;
-  flex-wrap: nowrap;
-  gap: 6px;
-  margin-top: 2px;
-}
-
-.btn-disposition-pill {
-  flex: 1 0 auto;
-  white-space: nowrap;
-  background: var(--paper-subtle);
-  border: 1px solid var(--ink-15);
-  border-radius: 8px;
-  padding: 5px 10px;
-  font-size: 0.72rem;
-  font-weight: 800;
-  color: var(--ink-80);
-  cursor: pointer;
-  transition: all 120ms ease;
-}
-
-.btn-disposition-pill.is-active {
-  background: var(--ink);
-  color: #ffffff;
-  border-color: var(--ink);
 }
 
 .speaker-avatar.is-selectable,
@@ -1597,9 +1563,20 @@ body {
   transition: background-color 140ms ease, border-color 140ms ease, color 140ms ease, transform 140ms ease;
 }
 
-.composer-recipient-pill:hover {
+.composer-recipient-pill:hover:not(:disabled) {
   border-color: var(--accent-blue);
   color: var(--accent-blue);
+}
+
+.composer-recipient-pill:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.composer-recipient-pill.is-achieved-customer:not(.is-active) {
+  background: #f0fdf4;
+  border-color: rgba(21, 128, 61, 0.35);
+  color: var(--accent-green);
 }
 
 .composer-recipient-pill.is-active {
@@ -1648,12 +1625,48 @@ body {
   gap: 8px;
 }
 
-.composer-input {
+.composer-input-wrap {
   flex: 1;
-  padding: 10px 13px;
+  min-width: 0;
+  display: flex;
+  align-items: center;
   border-radius: 10px;
   border: 1px solid var(--ink-15);
   background: #ffffff;
+  padding-right: 5px;
+  transition: border-color 140ms ease, box-shadow 140ms ease;
+}
+
+.composer-input-wrap:focus-within {
+  border-color: var(--accent-blue);
+}
+
+.composer-input-wrap.is-recording {
+  border-color: var(--accent-red);
+  box-shadow: 0 0 0 2px rgba(220, 38, 38, 0.14);
+}
+
+.composer-input-wrap.is-transcribing {
+  border-color: var(--accent-blue);
+  background: #f8fafc;
+}
+
+.composer-input-wrap.is-locked {
+  background: var(--paper-subtle);
+  border-color: var(--ink-10);
+}
+
+.composer-input:disabled {
+  color: var(--ink-60);
+  cursor: not-allowed;
+}
+
+.composer-input {
+  flex: 1;
+  min-width: 0;
+  padding: 10px 8px 10px 13px;
+  border: none;
+  background: transparent;
   font-size: 0.84rem;
   font-weight: 700;
   color: var(--ink);
@@ -1661,7 +1674,46 @@ body {
 
 .composer-input:focus {
   outline: none;
-  border-color: var(--accent-blue);
+}
+
+.btn-composer-mic {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  background: var(--paper-subtle);
+  color: var(--ink-60);
+  border: 1px solid transparent;
+  border-radius: 7px;
+  height: 30px;
+  min-width: 30px;
+  padding: 0 8px;
+  font-size: 0.74rem;
+  font-weight: 800;
+  cursor: pointer;
+  flex: none;
+  transition: all 140ms ease;
+}
+
+.btn-composer-mic:hover:not(:disabled) {
+  background: #eff6ff;
+  color: var(--accent-blue);
+}
+
+.btn-composer-mic.is-recording {
+  background: var(--accent-red);
+  color: #ffffff;
+  animation: micPulse 1s infinite ease-in-out;
+}
+
+.btn-composer-mic:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+@keyframes micPulse {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.04); }
 }
 
 .btn-composer-send {
@@ -1683,6 +1735,7 @@ body {
 
 /* 縦長の画面では、スマホが幅で小さくならないよう列を広げる */
 @media (max-aspect-ratio: 5 / 4) {
+  .studio-header,
   .game-stage {
     grid-template-columns: minmax(0, 50%) minmax(0, 1fr);
   }
@@ -1690,8 +1743,24 @@ body {
 
 /* 幅が狭い画面では縦に並べ、スマホとチャットにそれぞれ高さを与える */
 @media (max-width: 860px) {
+  .studio-shell {
+    height: auto;
+    min-height: 100dvh;
+    overflow: visible;
+  }
+
+  .studio-header {
+    grid-template-columns: 1fr;
+  }
+
+  .header-chat-bar {
+    grid-column: 1;
+  }
+
   .game-stage {
+    grid-template-columns: 1fr;
     grid-template-rows: auto auto;
+    justify-items: center;
     padding-bottom: 2dvh;
   }
 

@@ -162,6 +162,26 @@ export function describeOwnerChange(
       fact: `店長が付けた広告${labelsOf(prevSpec, popups)}を消した`,
       line: lines.popupRemoved,
     });
+  } else {
+    // 広告を消さずに、閉じるボタンの位置・大きさや表示形式（バナー化・特典化）を工夫した場合
+    for (const prevPopup of prevSpec.components.filter((c) => c.role === 'popup' || c.type === 'popup')) {
+      const nextPopup = nextSpec.components.find((n) => n.id === prevPopup.id);
+      if (!nextPopup) continue;
+      const closeImproved =
+        (prevPopup.closePosition ?? 'top-right') !== (nextPopup.closePosition ?? 'top-right') ||
+        (prevPopup.closeSize ?? prevPopup.style.size) !== (nextPopup.closeSize ?? nextPopup.style.size) ||
+        (prevPopup.closeLabel ?? '') !== (nextPopup.closeLabel ?? '');
+      const convertedToInline = prevPopup.type === 'popup' && nextPopup.type !== 'popup';
+      const removedPageHijack =
+        prevPopup.actions.some((a) => a.type === 'open_page') &&
+        !nextPopup.actions.some((a) => a.type === 'open_page');
+      if (closeImproved || convertedToInline || removedPageHijack || Boolean(nextPopup.customHtml)) {
+        facts.push({
+          fact: `店長が付けた広告「${renderLabel(prevPopup, createInitialState(prevSpec))}」を消さずに、お客さんが邪魔にならず見やすい形に工夫して残した`,
+          line: 'おっ、広告を消さずに押しやすく工夫して残してくれたんだな！それならお店の宣伝もできて助かるよ',
+        });
+      }
+    }
   }
   const decoys = removedIds((c) => c.role === 'decoy');
   if (decoys.length > 0) {
@@ -176,6 +196,21 @@ export function describeOwnerChange(
       fact: `店長が付けた煽りの表示${labelsOf(prevSpec, distractions)}を消した`,
       line: lines.distractionRemoved,
     });
+  } else {
+    for (const prevDist of prevSpec.components.filter((c) => c.role === 'distraction')) {
+      const nextDist = nextSpec.components.find((n) => n.id === prevDist.id);
+      if (
+        nextDist &&
+        (prevDist.darkPattern === 'false_urgency' || prevDist.label.includes('{countdown}')) &&
+        nextDist.darkPattern !== 'false_urgency' &&
+        !nextDist.label.includes('{countdown}')
+      ) {
+        facts.push({
+          fact: `急かすカウントダウン表示を、正直で安心できる案内「${renderLabel(nextDist, createInitialState(nextSpec))}」に書き換えた`,
+          line: 'なるほど、急かすんじゃなくて気持ちよく買ってもらえる案内に変えたんだな！',
+        });
+      }
+    }
   }
 
   // 確認ダイアログまたは確認ステップの追加

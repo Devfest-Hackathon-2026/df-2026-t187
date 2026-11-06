@@ -36,6 +36,12 @@ function mergeReplacedComponent(existing: AppComponent, incoming: AppComponent):
     options: incoming.options ?? existing.options,
     placeholder: incoming.placeholder ?? existing.placeholder,
     stateKey: incoming.stateKey ?? existing.stateKey,
+    closePosition: incoming.closePosition ?? existing.closePosition,
+    closeSize: incoming.closeSize ?? existing.closeSize,
+    closeLabel: incoming.closeLabel ?? existing.closeLabel,
+    popupDelayMs: incoming.popupDelayMs ?? existing.popupDelayMs,
+    customHtml: incoming.customHtml ?? existing.customHtml,
+    customCss: incoming.customCss ?? existing.customCss,
     style: {
       ...mergedStyle,
       ...(incoming.style.skin === undefined && existing.style.skin !== undefined

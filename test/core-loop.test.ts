@@ -27,7 +27,14 @@ import {
   ALL_REVIEWER_PERSONAS,
   getReviewersByCohort,
 } from '../src/shared/initialTheme.ts';
-import { simulatePersonaComputerUse, validateSandboxSpec } from '../src/shared/sandboxValidator.ts';
+import {
+  sanitizeCssColor,
+  sanitizeCustomCss,
+  sanitizeCustomHtml,
+  simulatePersonaComputerUse,
+  validateSandboxSpec,
+} from '../src/shared/sandboxValidator.ts';
+import { detectCheckpointRevertCommand } from '../src/shared/intent.ts';
 import {
   buildOwnerChangeReaction,
   buildOwnerClosingLines,
@@ -717,5 +724,125 @@ describe('core-loop', () => {
     ]);
     assert.equal(unsafePatched.spec.state.some((s) => s.key === '__proto__'), false);
     assert.equal(unsafePatched.spec.derived?.some((d) => d.key === 'constructor'), false);
+
+    // カスタムHTML・カスタムCSS・テーマ色のサニタイズ検証
+    assert.equal(sanitizeCssColor('#ff0000', '#ffffff'), '#ff0000');
+    assert.equal(sanitizeCssColor('red; background: url(https://evil.example)', '#ffffff'), '#ffffff');
+    const sanitizedCss = sanitizeCustomCss(
+      'padding: 8px; background: url("https://evil.example/x.png"); @import "https://evil.example"; width: expression(alert(1));',
+    );
+    assert.ok(!sanitizedCss.includes('url('));
+    assert.ok(!sanitizedCss.includes('@import'));
+    assert.ok(!sanitizedCss.includes('expression('));
+    const sanitizedHtml = sanitizeCustomHtml(
+      '<div>安全<script>alert(1)</script><style>body{display:none}</style><a href="javascript:alert(1)" onclick="alert(2)">リンク</a></div>',
+    );
+    assert.ok(!sanitizedHtml.includes('<script'));
+    assert.ok(!sanitizedHtml.includes('<style'));
+    assert.ok(!sanitizedHtml.includes('javascript:'));
+    assert.ok(!sanitizedHtml.includes('onclick='));
+  });
+
+  it('広告を削除せずに閉じるボタンの位置・大きさ・文字を変えたりバナー化する工夫も通り、客も店長も納得する', () => {
+    const withPopup = withAnnoyance(cleanSpec(), 'coupon_popup');
+    // 初期状態では目が遠い客（和子）は閉じるボタンが極小で閉じられず離脱し、翔太も不満になる
+    assert.equal(outcomeOf(withPopup, 'kazuko'), 'abandoned');
+    assert.equal(outcomeOf(withPopup, 'shota'), 'bothered');
+
+    // 1. 広告を削除せず、閉じるボタンを下部バー（大きく押しやすい「あとで見る」）に改造する
+    const popupComp = findComponent(withPopup, 'popup-coupon');
+    const renovatedPopup = applyPatchesToSpecWithValidation(
+      withPopup,
+      '広告の閉じるボタンを下部に大きく配置しました',
+      [
+        {
+          op: 'replace_component',
+          component: {
+            ...popupComp,
+            closePosition: 'bottom-bar',
+            closeSize: 'lg',
+            closeLabel: 'あとで見る',
+            style: { ...popupComp.style, skin: 'native', variant: 'default' },
+            actions: [{ type: 'set_state', targetKey: 'couponApplied', value: true }],
+          },
+        },
+      ],
+    );
+    assert.equal(renovatedPopup.rolledBack, false);
+    // 作業ログに位置変更や文字変更が出ること
+    const stepTexts = (renovatedPopup.workSteps ?? []).map((s) => s.text);
+    assert.ok(stepTexts.some((t) => t.includes('閉じるボタンの位置')));
+    // 店長も広告を残して工夫したことを喜ぶ
+    assert.ok(renovatedPopup.ownerReaction?.includes('広告を消さずに押しやすく工夫して残してくれた'));
+    // 目が遠い和子も翔太も嫌な思いをせず達成できる
+    assert.equal(outcomeOf(renovatedPopup.updatedSpec, 'kazuko'), 'achieved');
+    assert.equal(outcomeOf(renovatedPopup.updatedSpec, 'shota'), 'achieved');
+
+    // 2. 広告を画面埋め尽くしポップアップからインラインの控えめなバナーに改造した場合も達成・店長納得になる
+    const bannerized = applyPatchesToSpecWithValidation(
+      withPopup,
+      '広告を画面内の控えめなクーポンバナーに変えました',
+      [
+        {
+          op: 'replace_component',
+          component: {
+            ...popupComp,
+            type: 'status_banner',
+            role: 'info',
+            label: '🎁 今なら300円OFFクーポンをご利用いただけます',
+            style: { variant: 'default', size: 'sm', skin: 'native' },
+            actions: [{ type: 'set_state', targetKey: 'couponApplied', value: true }],
+          },
+        },
+      ],
+    );
+    assert.equal(bannerized.rolledBack, false);
+    assert.ok(bannerized.ownerReaction?.includes('広告を消さずに押しやすく工夫して残してくれた'));
+    assert.equal(outcomeOf(bannerized.updatedSpec, 'kazuko'), 'achieved');
+    assert.equal(outcomeOf(bannerized.updatedSpec, 'shota'), 'achieved');
+  });
+
+  it('サンドボックス内で自由なカスタムHTML部品やワンタップ入力ショートカットを追加して検証できる', () => {
+    const base = cleanSpec();
+    // 急いでいる健太でも確認ダイアログ付きだと手数が増えて離脱するが、ワンタップで住所と支払いを埋める＋α機能を追加すると達成できる
+    findComponent(base, 'btn-order').behavior = { effect: 'confirm_dialog' };
+    assert.equal(outcomeOf(base, 'kenta'), 'abandoned');
+
+    const withShortcut = applyPatchesToSpecWithValidation(
+      base,
+      '前回と同じ設定でワンタップ入力できるカスタム部品を追加しました',
+      [
+        {
+          op: 'insert_component',
+          afterId: 'product-card',
+          component: {
+            id: 'custom-quick-preset',
+            type: 'custom',
+            role: 'info',
+            label: '⚡ いつものお届け先・支払い方法をまとめてセット',
+            customHtml:
+              '<div class="quick-box"><p>前回の設定：自宅 / クレジットカード</p><button type="button" data-set-state="deliveryAddress" data-value="自宅">ワンタップでセット</button></div>',
+            customCss: '.quick-box { padding: 8px; background: #f8fafc; border-radius: 8px; }',
+            style: { variant: 'primary', size: 'md' },
+            actions: [
+              { type: 'set_state', targetKey: 'deliveryAddress', value: '自宅' },
+              { type: 'set_state', targetKey: 'paymentMethod', value: 'クレジットカード' },
+            ],
+          },
+        },
+      ],
+    );
+    assert.equal(withShortcut.rolledBack, false);
+    assert.equal(outcomeOf(withShortcut.updatedSpec, 'kenta'), 'achieved');
+    assert.equal(outcomeOf(withShortcut.updatedSpec, 'harue'), 'achieved');
+
+    // チャット経由での画面巻き戻し判定：全体巻き戻しと特定部品の復元を区別する
+    assert.equal(detectCheckpointRevertCommand('1つ前の画面に戻して'), 'undo');
+    assert.equal(detectCheckpointRevertCommand('やっぱり元に戻して！'), 'undo');
+    assert.equal(detectCheckpointRevertCommand('さっきの変更を取り消して'), 'undo');
+    assert.equal(detectCheckpointRevertCommand('一番最初の画面に戻して'), 'reset');
+    assert.equal(detectCheckpointRevertCommand('最初からやり直して'), 'reset');
+    assert.equal(detectCheckpointRevertCommand('定期便の欄を戻して'), null);
+    assert.equal(detectCheckpointRevertCommand('消した広告を戻して'), null);
   });
 });

@@ -32,9 +32,40 @@ export function escapeHtml(raw: string): string {
 const SAFE_CSS_COLOR_RE =
   /^(#[0-9a-fA-F]{3,8}|[a-zA-Z]+|(?:rgb|hsl|oklch)a?\([0-9.,%\s/deg+-]+\))$/;
 
-function sanitizeCssColor(raw: string | undefined, fallback: string): string {
+export function sanitizeCssColor(raw: string | undefined, fallback: string): string {
   const trimmed = raw?.trim() ?? '';
   return SAFE_CSS_COLOR_RE.test(trimmed) ? trimmed : fallback;
+}
+
+/**
+ * カスタムCSS文字列から外部通信やスクリプト実行につながる危険な記述を取り除く。
+ */
+export function sanitizeCustomCss(raw: string | undefined): string {
+  if (!raw) return '';
+  return raw
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/@import\b[^;]*;?/gi, '')
+    .replace(/url\s*\([^)]*\)/gi, 'none')
+    .replace(/expression\s*\([^)]*\)/gi, 'none')
+    .replace(/(?:behavior|-moz-binding)\s*:[^;]+;?/gi, '')
+    .replace(/(?:javascript|vbscript|data)\s*:/gi, '')
+    .replace(/[<>]/g, '')
+    .trim();
+}
+
+/**
+ * カスタムHTML文字列からスクリプトや危険な埋め込みタグ・イベント属性を取り除く。
+ */
+export function sanitizeCustomHtml(raw: string): string {
+  return raw
+    .replace(/<(script|style|iframe|object|embed|applet|meta|link|base|form)\b[\s\S]*?<\/\1>/gi, '')
+    .replace(/<(script|style|iframe|object|embed|applet|meta|link|base|form)\b[^>]*\/?>/gi, '')
+    .replace(/\son[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '')
+    .replace(/\ssrcdoc\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '')
+    .replace(
+      /\s(href|src|xlink:href|action|formaction)\s*=\s*(?:"\s*(?:javascript|vbscript|data)\s*:[^"]*"|'\s*(?:javascript|vbscript|data)\s*:[^']*'|(?:\s*(?:javascript|vbscript|data)\s*:[^\s>]+))/gi,
+      '',
+    );
 }
 
 /**
@@ -123,10 +154,12 @@ export function validateSandboxSpec(
     errors.push('単一HTMLの組み立てに失敗しました');
   }
 
-  // タスク完了イベント（complete_task を持つボタン）が存在するかチェック
+  // タスク完了イベント（complete_task を持つボタン、または data-complete-task を持つカスタム部品）が存在するかチェック
   const hasTaskCompletionEvent = Array.isArray(spec.components)
     ? spec.components.some(
-        (c) => c.type === 'button' && Array.isArray(c.actions) && hasCompletionAction(c),
+        (c) =>
+          (Array.isArray(c.actions) && hasCompletionAction(c)) ||
+          Boolean(c.customHtml?.includes('data-complete-task')),
       )
     : false;
 
@@ -530,31 +563,75 @@ export function simulatePersonaComputerUse(
   /**
    * 出現時間を過ぎたポップアップを閉じる。ポップアップは操作の途中で時間差に現れるため、
    * 手早く終える人は出る前に完了できることがある。
+   * また、閉じるボタンの位置・大きさ・ラベルを工夫したり、別ページ遷移ではなくその場での特典適用に変えた場合は、
+   * ストレスなく閉じられる（または特典を活用できる）ものとして扱う。
    */
   const closeDuePopups = (): FailureReason | null => {
     const due = spec.components.filter(
       (comp) =>
-        comp.role === 'popup' &&
+        comp.type === 'popup' &&
         !closedPopups.has(comp.id) &&
         (!comp.stateKey || state[comp.stateKey] !== 'closed') &&
         elapsedMs >= (comp.popupDelayMs?.min ?? 0),
     );
     for (const popup of due) {
       closedPopups.add(popup.id);
-      steps++;
-      elapsedMs += MS_POPUP;
-      if (!canRead(popup, persona)) {
+      const closePos = popup.closePosition ?? 'top-right';
+      const effectiveCloseSize: ComponentSize =
+        popup.closeSize ?? (closePos === 'bottom-bar' ? 'lg' : popup.style.size);
+      const hasCustomCloseLabel = Boolean(popup.closeLabel && popup.closeLabel.trim() !== '×');
+      const hasFriendlyClose =
+        closePos !== 'top-right' ||
+        (SIZE_RANK[effectiveCloseSize] ?? 0) >= SIZE_RANK.md ||
+        hasCustomCloseLabel ||
+        Boolean(popup.customHtml);
+      const hasHelpfulAction =
+        popup.actions.length > 0 && !popup.actions.some((a) => a.type === 'open_page');
+
+      const closeCompForRead: AppComponent = {
+        ...popup,
+        style: {
+          ...popup.style,
+          size: effectiveCloseSize,
+          variant: hasFriendlyClose ? 'default' : popup.style.variant,
+        },
+      };
+
+      if (!canRead(closeCompForRead, persona)) {
+        steps++;
+        elapsedMs += MS_POPUP;
         actionTrace.push(`${steps}手目: ${popup.label}が画面を覆い、閉じるボタンが見えない`);
         return 'popup_unclosable';
       }
-      const closeHalf = HEIGHT_BY_SIZE[popup.style.size] / 2;
-      const { dx, dy } = computeDeterministicJitter(persona.id, steps, c.jitterPx);
-      if (Math.abs(dx) > closeHalf || Math.abs(dy) > closeHalf) {
-        actionTrace.push(`${steps}手目: 広告の小さな閉じるボタンを外し、広告を押してしまった`);
-        return 'popup_tapped';
+
+      const baseCloseHalf = HEIGHT_BY_SIZE[effectiveCloseSize] / 2;
+      const closeHalf =
+        closePos === 'bottom-bar'
+          ? 90
+          : hasFriendlyClose
+            ? Math.max(baseCloseHalf * 1.8, 22)
+            : baseCloseHalf;
+
+      // 押しやすく工夫されていない初期状態のポップアップのみ、手数消費・誤タップ・不満が発生する
+      if (!hasFriendlyClose && !hasHelpfulAction) {
+        steps++;
+        elapsedMs += MS_POPUP;
+        const { dx, dy } = computeDeterministicJitter(persona.id, steps, c.jitterPx);
+        if (Math.abs(dx) > closeHalf || Math.abs(dy) > closeHalf) {
+          actionTrace.push(`${steps}手目: 広告の小さな閉じるボタンを外し、広告を押してしまった`);
+          return 'popup_tapped';
+        }
+        actionTrace.push(`${steps}手目: ${popup.label}を閉じた`);
+        bothers.push({
+          friction: '途中で広告を閉じさせられた',
+          comment: '途中で広告が出てきて、閉じるのが面倒だった',
+        });
+      } else if (hasHelpfulAction) {
+        state = applyActions(spec, state, popup.actions).state;
+        actionTrace.push(`画面確認: ${popup.label}の特典を適用して閉じた`);
+      } else {
+        actionTrace.push(`画面確認: 押しやすい閉じるボタンで${popup.label}をさっと閉じた`);
       }
-      actionTrace.push(`${steps}手目: ${popup.label}を閉じた`);
-      bothers.push({ friction: '途中で広告を閉じさせられた', comment: '途中で広告が出てきて、閉じるのが面倒だった' });
     }
     return null;
   };
@@ -609,6 +686,30 @@ export function simulatePersonaComputerUse(
       elapsedMs += MS_KANJI_READING;
       actionTrace.push('画面確認: 漢数字の値段を読むのに時間がかかった');
       bothers.push({ friction: '値段が読みにくかった', comment: '値段が漢数字で、いくらなのか読むのに手間取った' });
+    }
+
+    // 3a. 必須入力を一括で埋めるショートカット（「前回と同じ設定」等の＋α機能）があれば活用する
+    const requiredKeys = new Set(
+      visible
+        .filter((v) => v.role === 'required_input' && !isInputFilled(v, state) && v.stateKey)
+        .map((v) => v.stateKey!),
+    );
+    if (requiredKeys.size > 0) {
+      const shortcut = visible.find(
+        (v) =>
+          v.role !== 'danger' &&
+          !hasCompletionAction(v) &&
+          !v.actions.some((a) => a.type === 'open_page' || a.type === 'reset_all') &&
+          v.actions.some((a) => a.type === 'set_state' && a.targetKey && requiredKeys.has(a.targetKey)) &&
+          canRead(v, persona),
+      );
+      if (shortcut) {
+        const box = boxOf(shortcut);
+        if (box) {
+          state = applyActions(spec, state, shortcut.actions).state;
+          actionTrace.push(`画面確認: ${shortcut.label}で入力項目をまとめて設定した`);
+        }
+      }
     }
 
     // 3. 必須の入力欄を埋める

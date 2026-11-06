@@ -94,6 +94,18 @@ function describeReplace(before: AppComponent, after: AppComponent, spec: AppSpe
     changes.push('選択肢');
   }
   if (before.caption !== after.caption) changes.push('補足の文');
+  if ((before.closePosition ?? 'top-right') !== (after.closePosition ?? 'top-right')) {
+    changes.push('閉じるボタンの位置');
+  }
+  if ((before.closeSize ?? before.style.size) !== (after.closeSize ?? after.style.size)) {
+    changes.push('閉じるボタンの大きさ');
+  }
+  if ((before.closeLabel ?? '') !== (after.closeLabel ?? '')) {
+    changes.push('閉じるボタンの文字');
+  }
+  if ((before.customHtml ?? '') !== (after.customHtml ?? '') || (before.customCss ?? '') !== (after.customCss ?? '')) {
+    changes.push('独自のデザインと動き');
+  }
   if (before.type !== after.type) changes.push('部品の種類');
   if (changes.length === 0) return `${name}を書き換え`;
   return `${name}の${changes.slice(0, 3).join('と')}を変更`;

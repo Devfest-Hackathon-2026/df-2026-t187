@@ -33,7 +33,15 @@ export type ComponentType =
   | 'slider'
   | 'button'
   | 'status_banner'
-  | 'popup';
+  | 'popup'
+  | 'custom';
+
+export type PopupClosePosition =
+  | 'top-right'
+  | 'top-left'
+  | 'bottom-right'
+  | 'bottom-left'
+  | 'bottom-bar';
 
 export type ComponentSize = 'xs' | 'sm' | 'md' | 'lg' | 'xl';
 export type ComponentVariant = 'default' | 'primary' | 'danger' | 'warning' | 'success' | 'muted';
@@ -147,6 +155,20 @@ export interface AppComponent {
   trapSafeValue?: StateValue;
   /** popup が現れるまでの時間の範囲（ミリ秒）。この範囲でランダムに現れる */
   popupDelayMs?: { min: number; max: number };
+  /** popup の閉じるボタンの位置（既定は top-right。bottom-left や bottom-bar 等に変更可能） */
+  closePosition?: PopupClosePosition;
+  /** popup の閉じるボタンの大きさ（未指定なら style.size） */
+  closeSize?: ComponentSize;
+  /** popup の閉じるボタンのラベル（既定は ×、bottom-bar のときは 閉じる） */
+  closeLabel?: string;
+  /**
+   * サンドボックス内で自由に描画するカスタムHTML。
+   * {状態キー} で状態値を表示でき、data-set-state="key:value" / data-toggle-state="key" /
+   * data-increment-state="key" / data-complete-task="message" 属性で状態変更や完了イベントを発火できる。
+   */
+  customHtml?: string;
+  /** この部品に適用する追加のカスタムCSS */
+  customCss?: string;
   actions: ComponentAction[];
 }
 
@@ -222,15 +244,6 @@ export interface ReviewerPersona {
   greeting: string;
   focusPoint: string;
   constraints: PersonaConstraints;
-}
-
-export type ReviewDisposition = 'fix' | 'rebut_keep' | 'hold';
-
-export interface ReviewerDispositionRecord {
-  reviewerId: string;
-  disposition: ReviewDisposition;
-  reason: string;
-  decidedAt: string;
 }
 
 /** 達成・離脱に加え、完了はできたが罠に気づかず後悔したケースを区別する */
@@ -425,4 +438,31 @@ export interface ChatResponse {
   applied?: ApplyResponse;
   /** intent が customer のときの返答したペルソナID */
   customerPersonaId?: string;
+}
+
+export interface TtsRequest {
+  text: string;
+  /** 声の話し手（assistant / owner / ペルソナID） */
+  speaker: string;
+}
+
+export interface TtsResponse {
+  audioContent?: string;
+  fallbackBrowserTts?: boolean;
+}
+
+/** 音声入力（STT）をノイズ除去・赤ペン対象補足して入力欄用に整形するリクエスト */
+export interface TranscribeRequest {
+  audioBase64: string;
+  audioMimeType?: string;
+  currentSpec: AppSpec;
+  targetComponentIds?: string[];
+  annotatedImageBase64?: string;
+}
+
+export interface TranscribeResponse {
+  /** 意味のある発話が含まれていたか（無音・咳払い・マイクテストのみなら false） */
+  hasMeaningfulSpeech: boolean;
+  /** フィラー・雑音を除き、赤ペン囲み対象（「これ」「ここ」）を補った入力欄用の1文 */
+  cleanedText: string;
 }
