@@ -1,6 +1,5 @@
 import { GoogleAuth } from 'google-auth-library';
 import { existsSync, readFileSync } from 'node:fs';
-import type { IncomingMessage } from 'node:http';
 import {
   classifyDeterministicArchetype,
   cosineSimilarity,
@@ -59,17 +58,6 @@ async function getGcpAccessToken(): Promise<string | null> {
   } catch {
     return null;
   }
-}
-
-/**
- * Firebase App Check トークンの検証（FIREBASE_APP_CHECK_ENFORCE=1 設定時のみ強制）。
- */
-export function verifyAppCheckHeader(req: IncomingMessage): boolean {
-  if (process.env.FIREBASE_APP_CHECK_ENFORCE !== '1') {
-    return true;
-  }
-  const token = req.headers['x-firebase-appcheck'];
-  return typeof token === 'string' && token.trim().length > 0;
 }
 
 /**

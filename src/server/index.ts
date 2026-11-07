@@ -37,8 +37,21 @@ const server = createServer(async (req, res) => {
     res.end('Method Not Allowed');
     return;
   }
-  const urlPath = (req.url ?? '/').split('?')[0];
+  const rawUrlPath = (req.url ?? '/').split('?')[0];
+  let urlPath = '/';
+  try {
+    urlPath = decodeURIComponent(rawUrlPath);
+  } catch {
+    res.writeHead(400, { ...SECURITY_HEADERS, 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('Bad Request');
+    return;
+  }
   const safeRelPath = normalize(urlPath).replace(/^(\.\.(\/|\\|$))+/, '');
+  if (safeRelPath.split(/[/\\]/).some((seg) => seg.startsWith('.') && seg !== '.')) {
+    res.writeHead(403, SECURITY_HEADERS);
+    res.end('Forbidden');
+    return;
+  }
   let targetPath = resolve(DIST_DIR, safeRelPath === '/' ? 'index.html' : `.${safeRelPath}`);
 
   if (targetPath !== DIST_DIR && !targetPath.startsWith(DIST_DIR + sep)) {

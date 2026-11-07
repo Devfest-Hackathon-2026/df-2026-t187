@@ -262,7 +262,14 @@ function describeReplaceSteps(
   }
 
   const isPopup = before.type === 'popup' && after.type === 'popup';
-  if (isPopup) {
+  if (!isPopup && before.style.size !== after.style.size) {
+    push(
+      `${name} の文字サイズを ${token(SIZE_LABELS[before.style.size])} から ${token(SIZE_LABELS[after.style.size])} に変更`,
+    );
+  }
+  // 閉じるボタンの変更は、ポップアップ同士またはポップアップと他部品の変換時のみ伝える。
+  // チェック欄などにAIが付けた、画面に出ない閉じるボタンの設定は伝えない
+  if (before.type === 'popup' || after.type === 'popup') {
     const beforeClosePos: PopupClosePosition = before.closePosition ?? 'top-right';
     const afterClosePos: PopupClosePosition = after.closePosition ?? 'top-right';
     if (beforeClosePos !== afterClosePos) {
@@ -273,36 +280,6 @@ function describeReplaceSteps(
     const beforeCloseSize: ComponentSize = before.closeSize ?? before.style.size;
     const afterCloseSize: ComponentSize = after.closeSize ?? after.style.size;
     if (beforeCloseSize !== afterCloseSize) {
-      push(
-        `${name} の閉じるボタンの大きさを ${token(SIZE_LABELS[beforeCloseSize])} から ${token(SIZE_LABELS[afterCloseSize])} に変更`,
-      );
-    }
-    if ((before.closeLabel ?? '') !== (after.closeLabel ?? '')) {
-      push(
-        `${name} の閉じるボタンの表示を ${token(before.closeLabel || '×')} から ${token(after.closeLabel || '×')} に変更`,
-      );
-    }
-  } else {
-    if (before.style.size !== after.style.size) {
-      push(
-        `${name} の文字サイズを ${token(SIZE_LABELS[before.style.size])} から ${token(SIZE_LABELS[after.style.size])} に変更`,
-      );
-    }
-  }
-  // 閉じるボタンの変更は、広告を別の部品（バナーなど）に変えたときだけ伝える。
-  // チェック欄などにAIが付けた、画面に出ない閉じるボタンの設定は伝えない
-  const convertedFromPopup = !isPopup && (before.type === 'popup' || after.type === 'popup');
-  if (convertedFromPopup) {
-    if ((before.closePosition ?? 'top-right') !== (after.closePosition ?? 'top-right')) {
-      const beforePos: PopupClosePosition = before.closePosition ?? 'top-right';
-      const afterPos: PopupClosePosition = after.closePosition ?? 'top-right';
-      push(
-        `${name} の閉じるボタンの位置を ${token(CLOSE_POS_LABELS[beforePos])} から ${token(CLOSE_POS_LABELS[afterPos])} に変更`,
-      );
-    }
-    if ((before.closeSize ?? before.style.size) !== (after.closeSize ?? after.style.size)) {
-      const beforeCloseSize: ComponentSize = before.closeSize ?? before.style.size;
-      const afterCloseSize: ComponentSize = after.closeSize ?? after.style.size;
       push(
         `${name} の閉じるボタンの大きさを ${token(SIZE_LABELS[beforeCloseSize])} から ${token(SIZE_LABELS[afterCloseSize])} に変更`,
       );

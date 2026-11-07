@@ -1,7 +1,9 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type {
   ApplyRequest,
+  AppSpec,
   ChatRequest,
+  DecisionStage,
   EvaluateRequest,
   OwnerLineRequest,
   RecordDecisionRequest,
@@ -24,10 +26,26 @@ import {
   listHumanDecisions,
   listPromptTelemetryEvents,
   synthesizeStudioSpeech,
-  verifyAppCheckHeader,
 } from './store.ts';
 
 const MAX_BODY_BYTES = 8 * 1024 * 1024; // 8MB (ペン描きスクリーンショットBase64対応)
+const MAX_TEXT_INPUT_LENGTH = 2_000;
+const VALID_DECISION_STAGES = new Set<DecisionStage>([
+  'select_cohort',
+  'apply_change',
+  'review_disposition',
+]);
+const VALID_OWNER_SITUATIONS = new Set<OwnerLineRequest['situation']>([
+  'change',
+  'closing',
+  'reply',
+]);
+
+function isValidAppSpec(value: unknown): value is AppSpec {
+  if (!value || typeof value !== 'object') return false;
+  const candidate = value as Partial<AppSpec>;
+  return Array.isArray(candidate.components) && Array.isArray(candidate.state);
+}
 
 class PayloadTooLargeError extends Error {
   readonly statusCode = 413;
@@ -71,6 +89,8 @@ function sendJson(res: ServerResponse, statusCode: number, payload: unknown): vo
     'Content-Type': 'application/json; charset=utf-8',
     'Cache-Control': 'no-store',
     'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+    'Referrer-Policy': 'strict-origin-when-cross-origin',
   });
   res.end(body);
 }
@@ -86,11 +106,6 @@ export async function handleApiRequest(
   const url = (req.url ?? '').split('?')[0];
   if (!url.startsWith('/api/')) {
     return false;
-  }
-
-  if (!verifyAppCheckHeader(req)) {
-    sendJson(res, 401, { error: 'App Check トークンが必要です' });
-    return true;
   }
 
   try {
@@ -115,40 +130,73 @@ export async function handleApiRequest(
 
     if (req.method === 'POST' && url === '/api/decision') {
       const body = await readJsonBody<RecordDecisionRequest>(req);
-      if (!body?.stage || !body?.targetId || !body?.chosenLabel) {
-        sendJson(res, 400, { error: 'stage, targetId, chosenLabel が必要です' });
+      if (
+        !body?.stage ||
+        !VALID_DECISION_STAGES.has(body.stage) ||
+        typeof body.targetId !== 'string' ||
+        !body.targetId.trim() ||
+        typeof body.chosenLabel !== 'string' ||
+        !body.chosenLabel.trim()
+      ) {
+        sendJson(res, 400, { error: '有効な stage, targetId, chosenLabel が必要です' });
         return true;
       }
-      const result = await recordHumanDecisionWithFunctionCalling(body);
+      const result = await recordHumanDecisionWithFunctionCalling({
+        ...body,
+        targetId: body.targetId.slice(0, 200),
+        chosenLabel: body.chosenLabel.slice(0, 500),
+        reason: typeof body.reason === 'string' ? body.reason.slice(0, MAX_TEXT_INPUT_LENGTH) : '',
+      });
       sendJson(res, 200, result);
       return true;
     }
 
     if (req.method === 'POST' && url === '/api/chat') {
       const body = await readJsonBody<ChatRequest>(req);
-      if (!body?.currentSpec || typeof body.userMessage !== 'string') {
+      if (!isValidAppSpec(body?.currentSpec) || typeof body.userMessage !== 'string') {
         sendJson(res, 400, { error: 'currentSpec と userMessage が必要です' });
         return true;
       }
-      const result = await chatWithStudio(body);
+      const result = await chatWithStudio({
+        ...body,
+        userMessage: body.userMessage.slice(0, MAX_TEXT_INPUT_LENGTH),
+        targetComponentIds: Array.isArray(body.targetComponentIds)
+          ? body.targetComponentIds.filter((id): id is string => typeof id === 'string').slice(0, 20)
+          : [],
+      });
       sendJson(res, 200, result);
       return true;
     }
 
     if (req.method === 'POST' && url === '/api/apply') {
       const body = await readJsonBody<ApplyRequest>(req);
-      if (!body?.currentSpec || !body?.userInstruction?.trim()) {
+      if (
+        !isValidAppSpec(body?.currentSpec) ||
+        typeof body.userInstruction !== 'string' ||
+        !body.userInstruction.trim()
+      ) {
         sendJson(res, 400, { error: 'currentSpec と手直し内容が必要です' });
         return true;
       }
-      const result = await applyOptionToSpec(body);
+      const result = await applyOptionToSpec({
+        ...body,
+        userInstruction: body.userInstruction.slice(0, MAX_TEXT_INPUT_LENGTH),
+        targetComponentIds: Array.isArray(body.targetComponentIds)
+          ? body.targetComponentIds.filter((id): id is string => typeof id === 'string').slice(0, 20)
+          : [],
+      });
       sendJson(res, 200, result);
       return true;
     }
 
     if (req.method === 'POST' && url === '/api/owner-line') {
       const body = await readJsonBody<OwnerLineRequest>(req);
-      if (!body?.situation || !Array.isArray(body.facts) || typeof body.fallback !== 'string') {
+      if (
+        !body?.situation ||
+        !VALID_OWNER_SITUATIONS.has(body.situation) ||
+        !Array.isArray(body.facts) ||
+        typeof body.fallback !== 'string'
+      ) {
         sendJson(res, 400, { error: 'situation, facts, fallback が必要です' });
         return true;
       }
@@ -158,7 +206,7 @@ export async function handleApiRequest(
 
     if (req.method === 'POST' && url === '/api/evaluate') {
       const body = await readJsonBody<EvaluateRequest>(req);
-      if (!body?.currentSpec) {
+      if (!isValidAppSpec(body?.currentSpec)) {
         sendJson(res, 400, { error: 'currentSpec が必要です' });
         return true;
       }
@@ -169,7 +217,7 @@ export async function handleApiRequest(
 
     if (req.method === 'POST' && url === '/api/tts') {
       const body = await readJsonBody<TtsRequest>(req);
-      if (!body?.text) {
+      if (typeof body?.text !== 'string' || !body.text.trim()) {
         sendJson(res, 400, { error: 'text が必要です' });
         return true;
       }
@@ -180,7 +228,11 @@ export async function handleApiRequest(
 
     if (req.method === 'POST' && url === '/api/transcribe') {
       const body = await readJsonBody<TranscribeRequest>(req);
-      if (!body?.audioBase64 || !body?.currentSpec) {
+      if (
+        typeof body?.audioBase64 !== 'string' ||
+        !body.audioBase64.trim() ||
+        !isValidAppSpec(body.currentSpec)
+      ) {
         sendJson(res, 400, { error: 'audioBase64 と currentSpec が必要です' });
         return true;
       }

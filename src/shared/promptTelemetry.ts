@@ -278,38 +278,23 @@ export function inspectAppliedChangeForTelemetry(
     }
   }
 
-  const hasSubBefore = beforeSpec.components.some(
-    (c) =>
-      c.id === 'check-subscription' ||
-      c.id === 'sub-trap' ||
-      c.stateKey === 'subscription' ||
-      c.stateKey === 'subscribe' ||
-      /定期/.test(c.label),
-  );
-  const hasSubAfter = afterSpec.components.some(
-    (c) =>
-      c.id === 'check-subscription' ||
-      c.id === 'sub-trap' ||
-      c.stateKey === 'subscription' ||
-      c.stateKey === 'subscribe' ||
-      /定期/.test(c.label),
-  );
-  const hasCouponBefore = beforeSpec.components.some(
-    (c) =>
-      c.id === 'popup-coupon' ||
-      c.id === 'coupon-Box' ||
-      c.stateKey === 'useCoupon' ||
-      /クーポン/.test(c.label) ||
-      /クーポン/.test(c.caption ?? ''),
-  );
-  const hasCouponAfter = afterSpec.components.some(
-    (c) =>
-      c.id === 'popup-coupon' ||
-      c.id === 'coupon-Box' ||
-      c.stateKey === 'useCoupon' ||
-      /クーポン/.test(c.label) ||
-      /クーポン/.test(c.caption ?? ''),
-  );
+  const isSubComp = (c: AppSpec['components'][number]) =>
+    c.id === 'check-subscription' ||
+    c.id === 'sub-trap' ||
+    c.stateKey === 'subscription' ||
+    c.stateKey === 'subscribe' ||
+    /定期/.test(c.label);
+  const isCouponComp = (c: AppSpec['components'][number]) =>
+    c.id === 'popup-coupon' ||
+    c.id === 'coupon-Box' ||
+    c.stateKey === 'useCoupon' ||
+    /クーポン/.test(c.label) ||
+    /クーポン/.test(c.caption ?? '');
+
+  const hasSubBefore = beforeSpec.components.some(isSubComp);
+  const hasSubAfter = afterSpec.components.some(isSubComp);
+  const hasCouponBefore = beforeSpec.components.some(isCouponComp);
+  const hasCouponAfter = afterSpec.components.some(isCouponComp);
 
   const removedNeededFeature =
     (hasSubBefore && !hasSubAfter) || (hasCouponBefore && !hasCouponAfter);

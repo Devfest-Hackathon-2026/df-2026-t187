@@ -207,24 +207,35 @@ function getCurrentSpec(): AppSpec {
   return getCurrentCheckpoint().spec;
 }
 
-/** 今の画面か、それより前で一番新しくお客さんの反応を見た画面の、操作の記録 */
-function buildLatestReviewRecord(): LatestReviewRecord | undefined {
-  for (let i = state.activeCheckpointIndex; i >= 0; i--) {
+/** 指定した番号以前で、いま選んでいる顧客層のお客さんの反応を見た一番新しい記録を探す */
+function findLatestCohortEvaluation(
+  fromIndex: number = state.activeCheckpointIndex,
+): { checkpoint: Checkpoint; index: number; evaluation: EvaluationResponse } | undefined {
+  for (let i = fromIndex; i >= 0; i--) {
     const cp = state.checkpoints[i];
     const evaluation = evaluationFor(cp);
-    if (!evaluation) continue;
-    return {
-      screenLabel: formatCheckpointLabel(cp),
-      isCurrentScreen: i === state.activeCheckpointIndex,
-      reviews: evaluation.results.map((r) => ({
-        name: findPersona(r.reviewerId)?.name ?? r.reviewerId,
-        outcome: r.outcome,
-        actionTrace: r.actionTrace ?? [],
-      })),
-      ownerMetrics: evaluation.owner?.metrics,
-    };
+    if (evaluation) {
+      return { checkpoint: cp, index: i, evaluation };
+    }
   }
   return undefined;
+}
+
+/** 今の画面か、それより前で一番新しくお客さんの反応を見た画面の、操作の記録 */
+function buildLatestReviewRecord(): LatestReviewRecord | undefined {
+  const found = findLatestCohortEvaluation();
+  if (!found) return undefined;
+  const { checkpoint: cp, index: i, evaluation } = found;
+  return {
+    screenLabel: formatCheckpointLabel(cp),
+    isCurrentScreen: i === state.activeCheckpointIndex,
+    reviews: evaluation.results.map((r) => ({
+      name: findPersona(r.reviewerId)?.name ?? r.reviewerId,
+      outcome: r.outcome,
+      actionTrace: r.actionTrace ?? [],
+    })),
+    ownerMetrics: evaluation.owner?.metrics,
+  };
 }
 
 function findPersona(personaId: string | undefined): ReviewerPersona | undefined {
@@ -1192,16 +1203,7 @@ function sendPendingIfReady(): void {
 
 /** 発言内で別の相手を明確にメンションしているときだけ、切り替え先の宛先キーを返す */
 function resolveExplicitRecipientSwitch(text: string): string | null {
-  const cohortPersonas = state.selectedCohortId
-    ? getReviewersByCohort(state.selectedCohortId)
-    : [];
-  const mentioned = detectExplicitRecipientMention(text, cohortPersonas);
-  if (!mentioned) return null;
-  if (mentioned === 'assistant' || mentioned === 'owner' || mentioned === 'customer') {
-    return mentioned;
-  }
-  if (cohortPersonas.some((p) => p.id === mentioned)) return 'customer';
-  return null;
+  return detectExplicitRecipientMention(text);
 }
 
 let activeMediaRecorder: MediaRecorder | null = null;
@@ -1937,14 +1939,11 @@ function appendWorkLogLines(row: HTMLElement, msg: TimelineMessage): void {
 const AGENT_NAME = 'お助けAI';
 const AGENT_ICON = '助';
 
-function getRecipientPlaceholder(
-  recipient: string,
-  cohortPersonas: ReviewerPersona[],
-): string {
+function getRecipientPlaceholder(recipient: string): string {
   if (recipient === 'owner') {
     return `${OWNER.name}に話しかける（例：定期便のチェック外してもいい？）`;
   }
-  if (recipient === 'customer' || cohortPersonas.some((p) => p.id === recipient)) {
+  if (recipient === 'customer') {
     return 'お客さんに聞く（例：どこで困ったの？ / 定期便はあった方がいい？）';
   }
   return 'お助けAIに手直しの指示や質問を入力（例：注文ボタンを動くように直して）';
@@ -2236,14 +2235,7 @@ function renderChatPanel(): HTMLElement {
   recipientLabel.textContent = '宛先';
   recipientRow.appendChild(recipientLabel);
 
-  let latestEvalForRecipients: EvaluationResponse | undefined;
-  for (let i = state.activeCheckpointIndex; i >= 0; i--) {
-    const e = evaluationFor(state.checkpoints[i]);
-    if (e) {
-      latestEvalForRecipients = e;
-      break;
-    }
-  }
+  const latestEvalForRecipients = findLatestCohortEvaluation()?.evaluation;
   const allCustomersAchieved =
     cohortPersonas.length > 0 &&
     cohortPersonas.every(
@@ -2297,11 +2289,7 @@ function renderChatPanel(): HTMLElement {
     pill.textContent = opt.label;
     pill.addEventListener('click', () => {
       if (isCohortLocked) return;
-      state.recipient = opt.key;
-      renderStudio();
-      window.requestAnimationFrame(() => {
-        shellEl?.querySelector<HTMLInputElement>('.composer-input')?.focus();
-      });
+      selectRecipientAndFocus(opt.key);
     });
     recipientRow.appendChild(pill);
   }
@@ -2330,7 +2318,7 @@ function renderChatPanel(): HTMLElement {
       ? '録音中… 話し終えたら右の停止ボタンを押してください'
       : state.isTranscribingAudio
         ? '音声から指示を整えています…'
-        : getRecipientPlaceholder(state.recipient, cohortPersonas);
+        : getRecipientPlaceholder(state.recipient);
   input.value = state.inputText;
   input.addEventListener('input', () => {
     state.inputText = input.value;
@@ -2349,7 +2337,7 @@ function renderChatPanel(): HTMLElement {
           pillEl.classList.add('is-auto-switched');
         }
       }
-      input.placeholder = getRecipientPlaceholder(state.recipient, cohortPersonas);
+      input.placeholder = getRecipientPlaceholder(state.recipient);
     }
   });
 
@@ -2480,14 +2468,10 @@ function renderStudio(): void {
     const evalRes = evaluationFor(getCurrentCheckpoint());
     const achievedOf = (e: EvaluationResponse) =>
       e.results.filter((r) => r.outcome === 'achieved').length;
-    let previous: { evalRes: EvaluationResponse; achieved: number } | undefined;
-    for (let i = state.activeCheckpointIndex - 1; i >= 0 && !evalRes; i--) {
-      const e = evaluationFor(state.checkpoints[i]);
-      if (e) {
-        previous = { evalRes: e, achieved: achievedOf(e) };
-        break;
-      }
-    }
+    const prevEval = !evalRes
+      ? findLatestCohortEvaluation(state.activeCheckpointIndex - 1)?.evaluation
+      : undefined;
+    const previous = prevEval ? { evalRes: prevEval, achieved: achievedOf(prevEval) } : undefined;
 
     const goalGroup = document.createElement('div');
     goalGroup.className = 'goal-status-group';

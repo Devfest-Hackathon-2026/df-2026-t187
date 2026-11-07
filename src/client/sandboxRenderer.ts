@@ -4,6 +4,7 @@ import {
   hasCompletionAction,
   isComponentVisible,
   isInputFilled,
+  isSafeStateKey,
   renderLabel,
   renderTemplate,
   withDerivedValues,
@@ -535,7 +536,7 @@ export function renderSandboxApp(
     }
     const specScript = iframeDoc.getElementById('ponkotsu-spec-data');
     if (specScript) {
-      specScript.textContent = JSON.stringify(spec);
+      specScript.textContent = JSON.stringify(spec).replace(/</g, '\\u003c');
     }
     mountRoot = iframeDoc.getElementById('sandbox-mount') ?? iframeDoc.body;
     // 状態が変わるたびに中身を作り直すため、スクロール位置を覚えておき、作り直したあとに戻す
@@ -676,17 +677,28 @@ export function renderSandboxApp(
       for (const attr of Array.from(node.attributes)) {
         const attrName = attr.name.toLowerCase();
         const attrVal = attr.value.replace(/[\s\u0000-\u001f]+/g, '').toLowerCase();
+        if (attrName === 'style') {
+          const cleanedCss = sanitizeCustomCss(attr.value);
+          if (cleanedCss) {
+            node.setAttribute('style', cleanedCss);
+          } else {
+            node.removeAttribute(attr.name);
+          }
+          continue;
+        }
+        const isSafeDataImage = /^data:image\/(?:png|jpeg|jpg|gif|webp);base64,/i.test(attrVal);
         if (
           attrName.startsWith('on') ||
           attrName === 'srcdoc' ||
           ((attrName === 'href' ||
             attrName === 'src' ||
+            attrName === 'srcset' ||
             attrName === 'xlink:href' ||
             attrName === 'action' ||
             attrName === 'formaction') &&
             (attrVal.startsWith('javascript:') ||
               attrVal.startsWith('vbscript:') ||
-              attrVal.startsWith('data:text/html')))
+              (attrVal.startsWith('data:') && !isSafeDataImage)))
         ) {
           node.removeAttribute(attr.name);
         }
@@ -695,8 +707,8 @@ export function renderSandboxApp(
 
     // 状態変数と双方向バインドされた input / select / textarea
     wrapper.querySelectorAll<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>('[data-state-key]').forEach((el) => {
-      const key = el.dataset.stateKey;
-      if (!key) return;
+      const key = el.dataset.stateKey?.trim();
+      if (!key || !isSafeStateKey(key)) return;
       if (el instanceof HTMLInputElement && (el.type === 'checkbox' || el.type === 'radio')) {
         const expected = el.value && el.value !== 'on' ? el.value : 'true';
         el.checked = String(liveState[key]) === expected;
@@ -719,7 +731,7 @@ export function renderSandboxApp(
       .forEach((el) => {
         el.addEventListener('click', (e) => {
           e.stopPropagation();
-          if (el.hasAttribute('data-close-popup') && comp.stateKey) {
+          if (el.hasAttribute('data-close-popup') && comp.stateKey && isSafeStateKey(comp.stateKey)) {
             callbacks.onStatePatch({ [comp.stateKey]: 'closed' });
             return;
           }
@@ -731,15 +743,23 @@ export function renderSandboxApp(
               if (eqIdx > 0) {
                 const k = pair.slice(0, eqIdx).trim();
                 const v = pair.slice(eqIdx + 1).trim();
-                acts.push({ type: 'set_state', targetKey: k, value: coerceStateValue(spec, k, v) });
+                if (isSafeStateKey(k)) {
+                  acts.push({ type: 'set_state', targetKey: k, value: coerceStateValue(spec, k, v) });
+                }
               }
             }
           }
           if (el.dataset.toggleState) {
-            acts.push({ type: 'toggle_state', targetKey: el.dataset.toggleState.trim() });
+            const k = el.dataset.toggleState.trim();
+            if (isSafeStateKey(k)) {
+              acts.push({ type: 'toggle_state', targetKey: k });
+            }
           }
           if (el.dataset.incrementState) {
-            acts.push({ type: 'increment_state', targetKey: el.dataset.incrementState.trim() });
+            const k = el.dataset.incrementState.trim();
+            if (isSafeStateKey(k)) {
+              acts.push({ type: 'increment_state', targetKey: k });
+            }
           }
           if (el.dataset.toast) {
             acts.push({ type: 'show_toast', message: el.dataset.toast });

@@ -63,9 +63,17 @@ export function sanitizeCustomHtml(raw: string): string {
     .replace(/\son[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '')
     .replace(/\ssrcdoc\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '')
     .replace(
-      /\s(href|src|xlink:href|action|formaction)\s*=\s*(?:"\s*(?:javascript|vbscript|data)\s*:[^"]*"|'\s*(?:javascript|vbscript|data)\s*:[^']*'|(?:\s*(?:javascript|vbscript|data)\s*:[^\s>]+))/gi,
+      /\s(href|src|srcset|xlink:href|action|formaction)\s*=\s*(?:"\s*(?:javascript|vbscript|data)\s*:[^"]*"|'\s*(?:javascript|vbscript|data)\s*:[^']*'|(?:\s*(?:javascript|vbscript|data)\s*:[^\s>]+))/gi,
       '',
-    );
+    )
+    .replace(/\sstyle\s*=\s*"([^"]*)"/gi, (_m, css: string) => {
+      const cleaned = sanitizeCustomCss(css);
+      return cleaned ? ` style="${escapeHtml(cleaned)}"` : '';
+    })
+    .replace(/\sstyle\s*=\s*'([^']*)'/gi, (_m, css: string) => {
+      const cleaned = sanitizeCustomCss(css);
+      return cleaned ? ` style="${escapeHtml(cleaned)}"` : '';
+    });
 }
 
 /**

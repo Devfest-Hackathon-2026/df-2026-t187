@@ -1519,10 +1519,9 @@ export async function chatWithStudio(req: ChatRequest): Promise<ChatResponse> {
   };
 
   const circledOnly = effectiveReq.mode === 'circled';
-  const cohortPersonas = getReviewersByCohort(effectiveReq.cohortId);
   const explicitMention = circledOnly
     ? null
-    : detectExplicitRecipientMention(effectiveReq.userMessage, cohortPersonas);
+    : detectExplicitRecipientMention(effectiveReq.userMessage);
   const recipient =
     explicitMention ??
     (effectiveReq.recipient && effectiveReq.recipient !== 'auto'

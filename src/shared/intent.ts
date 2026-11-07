@@ -1,7 +1,5 @@
 // 学習者の発言の振り分け。サーバーと画面の両方で使う（画面では、改造の作業ログをすぐ出すかの判断や宛先の自動切替に使う）
 
-import type { ReviewerPersona } from './types.ts';
-
 const QUESTION_PATTERN =
   /なぜ|なんで|どうして|どうなって|どうすれば|どうしたら|何から|何これ|なにこれ|何の|しくみ|仕組み|教えて|説明|意味|とは|原因|どこ|だれ|誰|べき|[?？]$/;
 const CHANGE_REQUEST_PATTERN =
@@ -28,8 +26,7 @@ const VOCATIVE_START_RE = new RegExp(
  */
 export function detectExplicitRecipientMention(
   message: string,
-  _cohortPersonas: Pick<ReviewerPersona, 'id' | 'name'>[] = [],
-): string | null {
+): 'assistant' | 'owner' | 'customer' | null {
   const trimmed = message.trim();
   if (!trimmed) return null;
 

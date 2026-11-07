@@ -675,17 +675,15 @@ describe('core-loop', () => {
   });
 
   it('明確なメンション・呼びかけだけ宛先を切り替え、文中に名前が入っているだけでは切り替えない', () => {
-    const carefulPersonas = getReviewersByCohort('careful');
-
     // 明確なメンション・呼びかけ
-    assert.equal(detectExplicitRecipientMention('店長、広告を消してもいい？', carefulPersonas), 'owner');
-    assert.equal(detectExplicitRecipientMention('@店長 定期便はどうする？', carefulPersonas), 'owner');
-    assert.equal(detectExplicitRecipientMention('ねえ店長！売上って大事？', carefulPersonas), 'owner');
-    assert.equal(detectExplicitRecipientMention('お客さん、どこで困ったの？', carefulPersonas), 'customer');
-    assert.equal(detectExplicitRecipientMention('@お客さん 何が嫌だった？', carefulPersonas), 'customer');
-    assert.equal(detectExplicitRecipientMention('目が遠いお客さん、文字は読めた？', carefulPersonas), 'customer');
-    assert.equal(detectExplicitRecipientMention('お助けAI、注文ボタンを直して', carefulPersonas), 'assistant');
-    assert.equal(detectExplicitRecipientMention('@お助けAI これ何の部品？', carefulPersonas), 'assistant');
+    assert.equal(detectExplicitRecipientMention('店長、広告を消してもいい？'), 'owner');
+    assert.equal(detectExplicitRecipientMention('@店長 定期便はどうする？'), 'owner');
+    assert.equal(detectExplicitRecipientMention('ねえ店長！売上って大事？'), 'owner');
+    assert.equal(detectExplicitRecipientMention('お客さん、どこで困ったの？'), 'customer');
+    assert.equal(detectExplicitRecipientMention('@お客さん 何が嫌だった？'), 'customer');
+    assert.equal(detectExplicitRecipientMention('目が遠いお客さん、文字は読めた？'), 'customer');
+    assert.equal(detectExplicitRecipientMention('お助けAI、注文ボタンを直して'), 'assistant');
+    assert.equal(detectExplicitRecipientMention('@お助けAI これ何の部品？'), 'assistant');
 
     // 文中に名前が入っているだけ（第三者としての言及）では切り替えない
     for (const msg of [
@@ -696,7 +694,7 @@ describe('core-loop', () => {
       'お客さんの言ってるボタンを直して',
       'お助けAIに頼む前にどう思う？',
     ]) {
-      assert.equal(detectExplicitRecipientMention(msg, carefulPersonas), null, msg);
+      assert.equal(detectExplicitRecipientMention(msg), null, msg);
     }
   });
 
