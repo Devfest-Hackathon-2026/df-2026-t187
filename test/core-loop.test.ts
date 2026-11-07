@@ -36,7 +36,7 @@ import {
   validateSandboxSpec,
 } from '../src/shared/sandboxValidator.ts';
 import { detectCheckpointRevertCommand } from '../src/shared/intent.ts';
-import { describeOtherCohortImpact } from '../src/shared/otherCohorts.ts';
+import { describeOtherCohortImpact, describeOtherCohortReport } from '../src/shared/otherCohorts.ts';
 import { splitIntoChatChunks } from '../src/shared/chatText.ts';
 import {
   buildOwnerChangeReaction,
@@ -604,6 +604,59 @@ describe('core-loop', () => {
     assert.equal(outcomeOf(spec, 'kazuko'), 'abandoned');
     // クーポンを望む人は、広告を閉じさせられて不満になる
     assert.equal(outcomeOf(spec, 'shota'), 'bothered');
+  });
+
+  it('クリアのレポートでは、選ばなかった客層のお客さん一人ひとりが今の画面をどう思いそうかを出す', () => {
+    // デモの4手を終えた画面：損をしたくない人は全員達成し、スマホに不慣れな人だけが確認できずに離脱しそう
+    const spec = buildScenarioSpec(ACTIVE_THEME, 'demo').spec;
+    findComponent(spec, 'btn-order').actions = [{ type: 'complete_task', message: 'ご購入ありがとうございます' }];
+    Object.assign(findComponent(spec, 'popup-coupon'), { closePosition: 'bottom-bar', closeSize: 'lg', closeLabel: 'あとで見る' });
+    for (const v of spec.state) if (v.key === 'subscription') v.initialValue = false;
+    Object.assign(findComponent(spec, 'check-subscription'), {
+      label: '定期便にする 毎月お届け いつでも解約OK',
+      style: { size: 'sm', variant: 'default' },
+    });
+    const others = ALL_REVIEWER_PERSONAS.filter((p) => p.cohortId !== 'thrifty');
+    const report = describeOtherCohortReport(spec, others);
+    assert.equal(report.total, 6);
+    assert.equal(report.lines.length, 6);
+    assert.equal(report.achieved, 5);
+    assert.ok(report.lines.some((l) => l === '`スマホに不慣れなお客さん` は `注文前に確認できない` ため離脱しそう'));
+    assert.ok(report.lines.some((l) => l.endsWith('は気持ちよく買えそう')));
+    for (const line of report.lines) assert.doesNotMatch(line, /[()（）「」『』]/);
+  });
+
+  it('振り返りは挑戦ごとの番号の記録だけで作り、やり直す前の挑戦やほかの人の記録を混ぜない', async () => {
+    clearPromptTelemetryEvents();
+    const base = { cohortId: 'thrifty', sessionMode: 'execute' as const, recipient: 'assistant', hasPenAnnotation: false };
+    await recordPromptTelemetryEvent({ ...base, runId: 'run-1', promptText: '定期便を消して', changedComponentIds: ['check-subscription'], removedNeededFeature: true });
+    await recordPromptTelemetryEvent({ ...base, runId: 'run-other', promptText: '広告を消して', changedComponentIds: ['popup-coupon'] });
+    const second = await recordPromptTelemetryEvent({ ...base, runId: 'run-2', promptText: '定期便の初期チェックを外して', changedComponentIds: ['check-subscription'] });
+    // 別の挑戦で同じ部品を触っていても、手戻りとは数えない
+    assert.equal(second.isReworkOnSameComponent, false);
+    const summary = finalizeTelemetryOnEvaluate('thrifty', 3, 3, 'run-2');
+    assert.equal(summary.executeTurns, 1);
+    assert.equal(summary.reworkTurns, 0);
+    assert.ok(!summary.systemLogLines.some((l) => l.includes('定期便を消して') || l.includes('広告を消して')));
+    clearPromptTelemetryEvents();
+  });
+
+  it('チェック欄にAIが付けた閉じるボタンの設定は作業ログに出さず、店長には直近の申し込み件数を伝える', () => {
+    const spec = withAnnoyance(cleanSpec(), 'subscription_trap');
+    const sub = findComponent(spec, 'check-subscription');
+    const steps = (applyPatchesToSpecWithValidation(spec, 'テスト', [
+      { op: 'replace_component', component: { ...sub, closeSize: 'md', closeLabel: '閉じる', style: { ...sub.style, size: 'sm' } } },
+    ]).workSteps ?? []).map((s) => s.text);
+    assert.ok(steps.some((t) => t.includes('文字サイズ')), steps.join('\n'));
+    assert.ok(!steps.some((t) => t.includes('閉じるボタン')), steps.join('\n'));
+
+    const facts = describeOwnerContext(spec, {
+      screenLabel: '改造1',
+      isCurrentScreen: true,
+      reviews: [{ name: '画面が割れているお客さん', outcome: 'achieved', actionTrace: [] }],
+      ownerMetrics: [{ label: '定期便', count: 2, missing: false }],
+    });
+    assert.ok(facts.some((f) => f.includes('定期便の申し込みが2件あった')), facts.join('\n'));
   });
 
   it('3つの顧客層にそれぞれ3人のペルソナがいる', () => {

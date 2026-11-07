@@ -288,6 +288,11 @@ function describeReplaceSteps(
         `${name} の文字サイズを ${token(SIZE_LABELS[before.style.size])} から ${token(SIZE_LABELS[after.style.size])} に変更`,
       );
     }
+  }
+  // 閉じるボタンの変更は、広告を別の部品（バナーなど）に変えたときだけ伝える。
+  // チェック欄などにAIが付けた、画面に出ない閉じるボタンの設定は伝えない
+  const convertedFromPopup = !isPopup && (before.type === 'popup' || after.type === 'popup');
+  if (convertedFromPopup) {
     if ((before.closePosition ?? 'top-right') !== (after.closePosition ?? 'top-right')) {
       const beforePos: PopupClosePosition = before.closePosition ?? 'top-right';
       const afterPos: PopupClosePosition = after.closePosition ?? 'top-right';

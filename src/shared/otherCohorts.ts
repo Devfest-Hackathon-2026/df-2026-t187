@@ -55,3 +55,34 @@ export function describeOtherCohortImpact(
   if (rest > 0) line += `。ほかにも \`${rest}人\` が満足していません`;
   return { total, achieved, unhappy, line };
 }
+
+const REPORT_ENDINGS: Record<ReviewOutcome, string> = {
+  achieved: '気持ちよく買えそう',
+  bothered: 'ため不満が残りそう',
+  abandoned: 'ため離脱しそう',
+  regretted: 'ため後悔しそう',
+};
+
+/**
+ * クリアしたときのレポート用に、選ばなかった客層のお客さん一人ひとりが今の画面をどう思いそうかを1行ずつ返す。
+ * 判定はコードのシミュレーションだけで行う
+ */
+export function describeOtherCohortReport(
+  spec: AppSpec,
+  otherPersonas: ReviewerPersona[],
+  bounds?: ComponentBoundsInput[],
+): { achieved: number; total: number; lines: string[] } {
+  const lines: string[] = [];
+  let achieved = 0;
+  for (const persona of otherPersonas) {
+    const result = simulatePersonaComputerUse(spec, persona, bounds);
+    if (result.outcome === 'achieved') {
+      achieved++;
+      lines.push(`\`${persona.name}\` は${REPORT_ENDINGS.achieved}`);
+    } else {
+      const reason = result.frictionPoint ?? '理由が分からない';
+      lines.push(`\`${persona.name}\` は \`${reason}\` ${REPORT_ENDINGS[result.outcome]}`);
+    }
+  }
+  return { achieved, total: otherPersonas.length, lines };
+}

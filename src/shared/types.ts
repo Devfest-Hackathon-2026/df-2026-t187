@@ -371,6 +371,8 @@ export interface ApplyRequest {
   userInstruction: string;
   selectionReason?: string;
   cohortId?: TargetCohortId;
+  /** 1回の挑戦ごとの番号。振り返りの記録を、ほかの挑戦やほかの人の記録と混ぜないために使う */
+  runId?: string;
   annotatedImageBase64?: string;
   history?: ChatHistoryEntry[];
 }
@@ -413,6 +415,8 @@ export type ComponentBoundsInput = Rect2D;
 export interface EvaluateRequest {
   currentSpec: AppSpec;
   cohortId?: TargetCohortId;
+  /** 1回の挑戦ごとの番号。振り返りの記録を、ほかの挑戦やほかの人の記録と混ぜないために使う */
+  runId?: string;
   screenshotBase64?: string;
   componentBounds?: ComponentBoundsInput[];
   /** 店長が同じ言い回しを繰り返さないための、これまでの会話 */
@@ -439,6 +443,8 @@ export interface LatestReviewRecord {
   screenLabel: string;
   isCurrentScreen: boolean;
   reviews: Array<{ name: string; outcome: ReviewOutcome; actionTrace: string[] }>;
+  /** そのとき店長が数えた数字（定期便の件数など）。店長に聞かれたときに答えられるようにする */
+  ownerMetrics?: Array<{ label: string; count: number; missing: boolean }>;
 }
 
 export interface ChatRequest {
@@ -447,6 +453,8 @@ export interface ChatRequest {
   targetComponentIds: string[];
   userMessage: string;
   cohortId?: TargetCohortId;
+  /** 1回の挑戦ごとの番号。振り返りの記録を、ほかの挑戦やほかの人の記録と混ぜないために使う */
+  runId?: string;
   annotatedImageBase64?: string;
   history?: ChatHistoryEntry[];
   /** circled は、学習者が赤ペンで囲んだだけのとき。受け止めて尋ねるだけで、画面は変えない */

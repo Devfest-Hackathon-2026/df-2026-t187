@@ -50,6 +50,8 @@ export interface EmbeddingSignal {
 export interface PromptTelemetryEvent {
   id: string;
   cohortId?: TargetCohortId;
+  /** 1回の挑戦ごとの番号 */
+  runId?: string;
   promptText: string;
   sessionMode: PromptSessionMode;
   recipient: string;

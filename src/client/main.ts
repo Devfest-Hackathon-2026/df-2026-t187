@@ -13,7 +13,7 @@ import {
 } from '../shared/intent.ts';
 import { buildOwnerClosingLines } from '../shared/owner.ts';
 import { simulatePersonaComputerUse } from '../shared/sandboxValidator.ts';
-import { describeOtherCohortImpact } from '../shared/otherCohorts.ts';
+import { describeOtherCohortImpact, describeOtherCohortReport } from '../shared/otherCohorts.ts';
 import { splitIntoChatChunks } from '../shared/chatText.ts';
 import { buildInitialSpec, buildScenarioSpec, type DifficultyLevel } from '../shared/theme.ts';
 import type {
@@ -108,6 +108,10 @@ interface StudioState {
   pendingSend: boolean;
   /** 改造の作業ログを流している間、スマホで光らせる部品 */
   justChangedIds: string[];
+  /** 選んだ3人が全員達成してレポートを出したあと。やり直すまで手直しは受け付けない */
+  runFinished: boolean;
+  /** 1回の挑戦ごとの番号。客層を選ぶたび・やり直すたびに新しくする */
+  runId: string;
   chatLoading: boolean;
   evaluateLoading: boolean;
   /** Cloud TTS による音声読み上げのON/OFF */
@@ -179,6 +183,8 @@ const state: StudioState = {
   typingMessage: undefined,
   pendingSend: false,
   justChangedIds: [],
+  runFinished: false,
+  runId: '',
   chatLoading: false,
   evaluateLoading: false,
   voiceEnabled: true,
@@ -215,6 +221,7 @@ function buildLatestReviewRecord(): LatestReviewRecord | undefined {
         outcome: r.outcome,
         actionTrace: r.actionTrace ?? [],
       })),
+      ownerMetrics: evaluation.owner?.metrics,
     };
   }
   return undefined;
@@ -860,20 +867,15 @@ function handleSelectCohort(cohortId: TargetCohortId): void {
   startCohort(cohortId);
 }
 
-/** クリア後に、直した画面のまま別の顧客層のお客さんを呼ぶ */
-function handleCallNextCohort(cohortId: TargetCohortId): void {
+/**
+ * クリア後に、画面を最初に戻してやり直す。
+ * 1回の挑戦は1つの客層だけなので、直した画面を引き継いで別の客層を呼ぶことはしない。
+ * sameCohortId を渡すと同じ客層でそのまま始め、渡さなければ客層を選び直す
+ */
+function handleRestartFromScratch(sameCohortId?: TargetCohortId): void {
   flushMessageQueue();
   clearTransientChoiceMessages();
-  state.selectedCohortId = undefined;
-  state.recipient = 'assistant';
-  recipientFirstSeenAt.clear();
-  startCohort(cohortId);
-}
-
-/** クリア後に、画面を最初に戻して顧客層を選び直す */
-function handleRestartFromScratch(): void {
-  flushMessageQueue();
-  clearTransientChoiceMessages();
+  state.runFinished = false;
   state.selectedCohortId = undefined;
   state.recipient = 'assistant';
   recipientFirstSeenAt.clear();
@@ -891,8 +893,12 @@ function handleRestartFromScratch(): void {
   state.penPoints = [];
   state.circledComponentIds = [];
   state.topicTargetIds = [];
-  const selectorLine = ACTIVE_THEME.introScript.find((l) => l.showCohortSelector);
   pushMessage({ role: 'system', text: '画面を最初の状態に戻しました' });
+  if (sameCohortId) {
+    startCohort(sameCohortId);
+    return;
+  }
+  const selectorLine = ACTIVE_THEME.introScript.find((l) => l.showCohortSelector);
   pushMessage({
     role: 'system',
     text: selectorLine?.text ?? '誰のために直しますか',
@@ -905,6 +911,7 @@ function handleRestartFromScratch(): void {
 function startCohort(cohortId: TargetCohortId): void {
   const cohort = TARGET_COHORTS.find((c) => c.id === cohortId) ?? TARGET_COHORTS[0];
   state.selectedCohortId = cohort.id;
+  state.runId = `run-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   state.recipient = 'assistant';
   recipientFirstSeenAt.clear();
 
@@ -1039,6 +1046,7 @@ async function reactToCircle(targetIds: string[]): Promise<void> {
       targetComponentIds: targetIds,
       userMessage: '',
       cohortId: state.selectedCohortId,
+      runId: state.runId,
       annotatedImageBase64,
       history: buildChatHistory(),
       mode: 'circled',
@@ -1330,6 +1338,17 @@ async function handleSendMessage(
 
   const spec = getCurrentSpec();
   const recipientSnapshot = overrideText !== undefined ? 'assistant' : state.recipient;
+  // 挑戦が終わったあとは、店長やお客さんへの質問だけを受け付ける
+  if (state.runFinished && recipientSnapshot === 'assistant') {
+    pushMessage({
+      role: 'system',
+      tone: 'warning',
+      text: 'この挑戦は終わりました。上の選択肢からやり直すと、また手直しできます。店長やお客さんには質問できます',
+    });
+    renderStudio();
+    scrollToLatestMessage();
+    return;
+  }
   const hasPenAnnotation = state.circledComponentIds.length > 0 || state.penPoints.length > 0;
   const targetIdsSnapshot = hasPenAnnotation
     ? [...state.circledComponentIds]
@@ -1425,6 +1444,7 @@ async function handleSendMessage(
       targetComponentIds: targetIdsSnapshot,
       userMessage: text,
       cohortId: state.selectedCohortId,
+      runId: state.runId,
       annotatedImageBase64,
       history,
       recipient: recipientSnapshot,
@@ -1624,6 +1644,7 @@ async function handleEvaluate(): Promise<void> {
     const evaluation = await postJson<EvaluationResponse>('/api/evaluate', {
       currentSpec,
       cohortId: state.selectedCohortId,
+      runId: state.runId,
       screenshotBase64,
       componentBounds,
       history: buildOwnerHistory(),
@@ -1649,10 +1670,11 @@ async function handleEvaluate(): Promise<void> {
     }
     // 選んだ3人のうち誰かが買えるようになったら、選ばなかった客層への影響も見せる。
     // 誰のために直したかで別の誰かが困ることに、その場で気づけるようにする
-    if (achievedCount > 0) {
-      const otherPersonas = ALL_REVIEWER_PERSONAS.filter(
-        (p) => !activePersonas.some((a) => a.id === p.id),
-      );
+    const otherPersonas = ALL_REVIEWER_PERSONAS.filter(
+      (p) => !activePersonas.some((a) => a.id === p.id),
+    );
+    // クリアしたときは、あとのレポートで1人ずつ詳しく出す
+    if (achievedCount > 0 && achievedCount < activePersonas.length) {
       queued.push({
         message: {
           role: 'system',
@@ -1679,14 +1701,13 @@ async function handleEvaluate(): Promise<void> {
       if (state.selectedCohortId && !state.clearedCohortIds.includes(state.selectedCohortId)) {
         state.clearedCohortIds.push(state.selectedCohortId);
       }
+      // 1回の挑戦は、選んだ客層の3人が全員達成したところで終わる。やり直すまで手直しは受け付けない
+      state.runFinished = true;
       const remaining = TARGET_COHORTS.filter((c) => !state.clearedCohortIds.includes(c.id));
       const closing =
         remaining.length > 0
-          ? ['おつかれさまでした！']
-          : [
-              'おつかれさまでした！すべてのお客さんでクリアです',
-              'ほかの直し方も試したくなったら、続けていつでも指示してくださいね',
-            ];
+          ? ['おつかれさまでした！今回の挑戦のレポートです']
+          : ['おつかれさまでした！これで3つの客層すべてをクリアしました', '今回の挑戦のレポートです'];
       for (const line of closing) {
         queued.push({
           message: {
@@ -1705,16 +1726,25 @@ async function handleEvaluate(): Promise<void> {
           typingMs: 0,
         });
       }
-      if (remaining.length > 0) {
-        queued.push({
-          message: {
-            role: 'system',
-            text: 'ほかのお客さんにもチャレンジしますか',
-            showNextChallenge: true,
-          },
-          typingMs: 0,
-        });
+      const report = describeOtherCohortReport(currentSpec, otherPersonas, componentBounds);
+      queued.push({
+        message: {
+          role: 'system',
+          text: `ほかの客層のお客さんは、この画面をこう思いそうです 満足しそうなのは \`${report.total}人中${report.achieved}人\``,
+        },
+        typingMs: 0,
+      });
+      for (const line of report.lines) {
+        queued.push({ message: { role: 'system', text: line }, typingMs: 0 });
       }
+      queued.push({
+        message: {
+          role: 'system',
+          text: '次はどうしますか どちらも画面を最初に戻してやり直します',
+          showNextChallenge: true,
+        },
+        typingMs: 0,
+      });
     } else {
       for (const line of [
         `3人中${achievedCount}人が満足して買えました`,
@@ -1758,20 +1788,19 @@ function renderCohortSelector(msg: TimelineMessage, isLatestSelector: boolean): 
 function renderNextChallengeSelector(msg: TimelineMessage, isLatestChallenge: boolean): HTMLElement {
   const pillRow = document.createElement('div');
   pillRow.className = 'cohort-pill-row';
-  const options: Array<{ key: string; label: string; onSelect: () => void }> = [];
-  for (const c of TARGET_COHORTS) {
-    if (state.clearedCohortIds.includes(c.id) || c.id === state.selectedCohortId) continue;
-    options.push({
-      key: `cohort:${c.id}`,
-      label: `この画面のまま${c.label}を呼ぶ`,
-      onSelect: () => handleCallNextCohort(c.id),
-    });
-  }
-  options.push({
-    key: 'restart',
-    label: '最初の画面からやり直す',
-    onSelect: () => handleRestartFromScratch(),
-  });
+  const currentCohortId = state.selectedCohortId;
+  const options: Array<{ key: string; label: string; onSelect: () => void }> = [
+    {
+      key: 'same',
+      label: '同じ客層でやり直す',
+      onSelect: () => handleRestartFromScratch(currentCohortId),
+    },
+    {
+      key: 'other',
+      label: '別の客層でやり直す',
+      onSelect: () => handleRestartFromScratch(),
+    },
+  ];
   for (const opt of options) {
     const btn = document.createElement('button');
     btn.type = 'button';
@@ -2295,7 +2324,9 @@ function renderChatPanel(): HTMLElement {
   input.disabled = isCohortLocked;
   input.placeholder = isCohortLocked
     ? 'まず上のボタンから、誰のために直すかを選んでください'
-    : state.isRecordingAudio
+    : state.runFinished
+      ? '挑戦は終わりました。やり直すとまた手直しできます（店長とお客さんには質問できます）'
+      : state.isRecordingAudio
       ? '録音中… 話し終えたら右の停止ボタンを押してください'
       : state.isTranscribingAudio
         ? '音声から指示を整えています…'
@@ -2575,7 +2606,7 @@ function renderStudio(): void {
     evalBtn.type = 'button';
     evalBtn.className = `btn-bottom-evaluate ${hasUnevaluatedChanges ? 'is-ready' : ''}`;
     // 誰のために改造するかを選ぶまでは、お客さんが来ていないので反応を見られない
-    evalBtn.disabled = state.evaluateLoading || !state.selectedCohortId;
+    evalBtn.disabled = state.evaluateLoading || !state.selectedCohortId || state.runFinished;
     // 押せない間は目立たない色にして、最初に目が行かないようにする
     evalBtn.classList.toggle('is-locked', !state.selectedCohortId);
     if (!state.selectedCohortId) evalBtn.title = '先にチャットで、誰のために直すかを選んでください';

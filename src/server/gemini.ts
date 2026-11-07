@@ -348,9 +348,14 @@ export function describeOwnerContext(
   if (latestReviews && latestReviews.reviews.length > 0) {
     const bought = latestReviews.reviews.filter((r) => r.outcome !== 'abandoned').length;
     const happy = latestReviews.reviews.filter((r) => r.outcome === 'achieved').length;
+    const where = latestReviews.isCurrentScreen ? '今の画面' : 'ひとつ前に試した画面';
     facts.push(
-      `${latestReviews.isCurrentScreen ? '今の画面' : 'ひとつ前に試した画面'}では、来たお客さん${latestReviews.reviews.length}人のうち${bought}人が買い、${happy}人が満足していた`,
+      `${where}では、来たお客さん${latestReviews.reviews.length}人のうち${bought}人が買い、${happy}人が満足していた`,
     );
+    for (const m of latestReviews.ownerMetrics ?? []) {
+      if (m.missing) continue;
+      facts.push(`${where}では、${m.label}の申し込みが${m.count}件あった`);
+    }
   } else {
     facts.push('まだお客さんに試してもらっていない');
   }
@@ -1127,6 +1132,7 @@ export async function applyOptionToSpec(req: ApplyRequest): Promise<ApplyRespons
     ]),
     recordPromptTelemetryEvent({
       cohortId: req.cohortId,
+      runId: req.runId,
       promptText: req.userInstruction,
       sessionMode: 'execute',
       recipient: 'assistant',
@@ -1314,6 +1320,7 @@ export async function evaluateAppWithPersonas(req: EvaluateRequest): Promise<Eva
     req.cohortId,
     achievedCount,
     results.length,
+    req.runId,
   );
 
   return {
@@ -1361,6 +1368,7 @@ async function applyFromChat(req: ChatRequest): Promise<ChatResponse> {
     targetComponentIds: req.targetComponentIds,
     userInstruction: req.userMessage,
     cohortId: req.cohortId,
+    runId: req.runId,
     annotatedImageBase64: req.annotatedImageBase64,
     history: req.history,
   });
@@ -1528,6 +1536,7 @@ export async function chatWithStudio(req: ChatRequest): Promise<ChatResponse> {
       }),
       recordPromptTelemetryEvent({
         cohortId: effectiveReq.cohortId,
+        runId: effectiveReq.runId,
         promptText: effectiveReq.userMessage,
         sessionMode: 'explore',
         recipient: 'owner',
@@ -1547,6 +1556,7 @@ export async function chatWithStudio(req: ChatRequest): Promise<ChatResponse> {
       voiceCohortCustomers(effectiveReq),
       recordPromptTelemetryEvent({
         cohortId: effectiveReq.cohortId,
+        runId: effectiveReq.runId,
         promptText: effectiveReq.userMessage,
         sessionMode: 'explore',
         recipient: 'customer',
@@ -1724,6 +1734,7 @@ export async function chatWithStudio(req: ChatRequest): Promise<ChatResponse> {
     !circledOnly && effectiveReq.userMessage
       ? await recordPromptTelemetryEvent({
           cohortId: effectiveReq.cohortId,
+          runId: effectiveReq.runId,
           promptText: effectiveReq.userMessage,
           sessionMode: 'explore',
           recipient: 'assistant',

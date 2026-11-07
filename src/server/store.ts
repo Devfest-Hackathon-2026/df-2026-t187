@@ -384,6 +384,7 @@ async function persistTelemetryToCloud(event: PromptTelemetryEvent): Promise<voi
  */
 export async function recordPromptTelemetryEvent(input: {
   cohortId?: TargetCohortId;
+  runId?: string;
   promptText: string;
   sessionMode: PromptSessionMode;
   recipient: string;
@@ -395,7 +396,9 @@ export async function recordPromptTelemetryEvent(input: {
   const priorExecuteEvents = inMemoryTelemetryEvents.filter(
     (e) =>
       e.sessionMode === 'execute' &&
-      (!input.cohortId || !e.cohortId || e.cohortId === input.cohortId),
+      (input.runId
+        ? e.runId === input.runId
+        : !input.cohortId || !e.cohortId || e.cohortId === input.cohortId),
   );
   const previouslyTouchedIds = new Set(priorExecuteEvents.flatMap((e) => e.changedComponentIds));
   const isReworkOnSameComponent =
@@ -410,6 +413,7 @@ export async function recordPromptTelemetryEvent(input: {
   const event: PromptTelemetryEvent = {
     id: `pt-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
     cohortId: input.cohortId,
+    runId: input.runId,
     promptText: input.promptText,
     sessionMode: input.sessionMode,
     recipient: input.recipient,
@@ -439,8 +443,13 @@ export function finalizeTelemetryOnEvaluate(
   cohortId: TargetCohortId | undefined,
   achievedCount: number,
   totalCustomers: number,
+  runId?: string,
 ): PromptSessionSummary {
-  const latest = [...inMemoryTelemetryEvents]
+  // 挑戦の番号があれば、その挑戦の記録だけで振り返る（やり直す前の挑戦や、ほかの人の記録を混ぜない）
+  const events = runId
+    ? inMemoryTelemetryEvents.filter((e) => e.runId === runId)
+    : inMemoryTelemetryEvents;
+  const latest = [...events]
     .reverse()
     .find((e) => !cohortId || !e.cohortId || e.cohortId === cohortId);
   if (latest) {
@@ -450,7 +459,7 @@ export function finalizeTelemetryOnEvaluate(
       passed: achievedCount === totalCustomers && totalCustomers > 0,
     };
   }
-  return summarizePromptTelemetry(inMemoryTelemetryEvents, cohortId);
+  return summarizePromptTelemetry(events, cohortId);
 }
 
 export function listPromptTelemetryEvents(cohortId?: TargetCohortId): PromptTelemetryEvent[] {
