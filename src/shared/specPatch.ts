@@ -11,22 +11,26 @@ export interface ApplySpecPatchesResult {
  * 同じ種類の部品を差し替える際、Gemini が省略しがちな装飾・構造項目を元の部品から引き継ぐ。
  */
 function mergeReplacedComponent(existing: AppComponent, incoming: AppComponent): AppComponent {
+  const incomingStyle = incoming.style ?? existing.style;
   const mergedStyle = {
-    ...incoming.style,
-    ...(incoming.style.sticky === undefined && existing.style.sticky !== undefined
+    ...incomingStyle,
+    ...(incomingStyle.sticky === undefined && existing.style?.sticky !== undefined
       ? { sticky: existing.style.sticky }
       : {}),
   };
+  const label = typeof incoming.label === 'string' ? incoming.label : existing.label;
 
   if (existing.type !== incoming.type) {
     return {
       ...incoming,
+      label,
       style: mergedStyle,
     };
   }
 
   return {
     ...incoming,
+    label,
     icon: incoming.icon ?? existing.icon,
     badge: incoming.badge ?? existing.badge,
     caption: incoming.caption ?? existing.caption,
@@ -44,7 +48,7 @@ function mergeReplacedComponent(existing: AppComponent, incoming: AppComponent):
     customCss: incoming.customCss ?? existing.customCss,
     style: {
       ...mergedStyle,
-      ...(incoming.style.skin === undefined && existing.style.skin !== undefined
+      ...(incomingStyle.skin === undefined && existing.style?.skin !== undefined
         ? { skin: existing.style.skin }
         : {}),
     },

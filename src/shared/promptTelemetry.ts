@@ -16,9 +16,11 @@ export type PromptSessionMode = 'explore' | 'execute';
  * - condition_design: 初期チェック解除・解約条件明記・閉じるボタン改善など条件を整える指示
  * - direct_fix: ボタンの動作修復・文字サイズ変更・表記変更など具体的な部品修正指示
  * - vague_delegate: いい感じにして・直して など対象や条件が曖昧な丸投げ指示
+ * - goal_directed: 定期便を望む人だけが選べるように など、誰がどうできるようにしたいかという目的を言葉にした指示（直し方はAIに任せてもよい）
  * - inquiry: 質問・聞き出し
  */
 export type PromptArchetype =
+  | 'goal_directed'
   | 'simple_delete'
   | 'condition_design'
   | 'direct_fix'
@@ -76,6 +78,8 @@ export interface PromptSessionSummary {
   executeTurns: number;
   /** 同じ部品への手戻り・やり直し回数 */
   reworkTurns: number;
+  /** 誰がどうできるようにしたいかという目的を言葉にした手直し指示の回数 */
+  goalDirectedTurns: number;
   /** 初回成功率（0〜100: 手戻りや機能喪失にならず意図通り機能した実行指示の割合） */
   firstShotSuccessRate: number;
   /** 単純削除や丸投げから条件指定へ改善した転換点（実プロンプト引用） */
@@ -135,6 +139,10 @@ const CONDITION_DESIGN_RE =
 const VAGUE_DELEGATE_RE =
   /^(?:いい感じに|うまく|適当に|なんとか|全部|まとめて|とりあえず|おまかせで|きれいに|使いやすく|見やすく|買いやすく)(?:直して|して|変えて|手直しして|改造して)?[！!。？?]*$/;
 
+/** 誰が（人・お客さん）どうできるようにしたいか、という目的の言い方 */
+const GOAL_DIRECTED_RE =
+  /(?:人|方|お客さん|客|誰|高齢|お年寄り|初めて)(?:が|でも|だけ|も|に|は)[^。]*?(?:ように|やすく|られる|できる|迷わ|安心)/;
+
 const NEGATIVE_SENTIMENT_TERMS = ['邪魔', 'ウザい', 'だます', '騙す', '罠', '最悪', 'ひどい', '消せ', '紛らわしい'];
 const POSITIVE_SENTIMENT_TERMS = ['安心', '親切', '見やすい', 'わかりやすい', '分かりやすい', '正直', '丁寧', '気持ちよく'];
 
@@ -191,6 +199,13 @@ export function classifyDeterministicArchetype(
     return {
       closestArchetype: 'vague_delegate',
       similarityScore: 0.88,
+      analyzedVia: 'local_deterministic',
+    };
+  }
+  if (GOAL_DIRECTED_RE.test(text)) {
+    return {
+      closestArchetype: 'goal_directed',
+      similarityScore: 0.9,
       analyzedVia: 'local_deterministic',
     };
   }
@@ -340,12 +355,17 @@ export function summarizePromptTelemetry(
         !e.changedComponentIds.some((id) => reworkedComponentIds.has(id))),
   ).length;
 
+  const goalDirectedTurns = executeEvents.filter(
+    (e) => e.embeddingSignal.closestArchetype === 'goal_directed',
+  ).length;
+
   const successfulExecutes = Math.max(0, executeTurns - reworkTurns);
   const firstShotSuccessRate =
     executeTurns > 0 ? Math.round((successfulExecutes / executeTurns) * 100) : 100;
 
   // 単純削除や手戻り指示のあとに、条件設計型・具体修正型で解決した転換点を探す
   let turningPoint: { beforePrompt: string; afterPrompt: string } | undefined;
+  let turningPointByGoal = false;
   for (let i = 0; i < executeEvents.length; i++) {
     const prev = executeEvents[i];
     const isInitialMistake =
@@ -359,6 +379,7 @@ export function summarizePromptTelemetry(
       if (
         !next.removedNeededFeature &&
         (next.embeddingSignal.closestArchetype === 'condition_design' ||
+          next.embeddingSignal.closestArchetype === 'goal_directed' ||
           next.nlSignal.hasConditionConstraint ||
           next.isReworkOnSameComponent)
       ) {
@@ -366,6 +387,7 @@ export function summarizePromptTelemetry(
           beforePrompt: cleanPromptForBadge(prev.promptText),
           afterPrompt: cleanPromptForBadge(next.promptText),
         };
+        turningPointByGoal = next.embeddingSignal.closestArchetype === 'goal_directed';
       }
     }
   }
@@ -377,7 +399,8 @@ export function summarizePromptTelemetry(
       .find(
         (e) =>
           !e.removedNeededFeature &&
-          (e.embeddingSignal.closestArchetype === 'condition_design' ||
+          (e.embeddingSignal.closestArchetype === 'goal_directed' ||
+            e.embeddingSignal.closestArchetype === 'condition_design' ||
             e.nlSignal.hasConditionConstraint),
       ) ?? [...executeEvents].reverse().find((e) => !e.removedNeededFeature);
 
@@ -386,11 +409,15 @@ export function summarizePromptTelemetry(
   const systemLogLines: string[] = [];
   if (executeTurns > 0) {
     systemLogLines.push(
-      `今回の到達記録 情報聞き出し \`${exploreTurns}回\` 手直し指示 \`${executeTurns}回\` 手戻り \`${reworkTurns}回\` 初回成功率 \`${firstShotSuccessRate}%\``,
+      `今回の到達記録 情報聞き出し \`${exploreTurns}回\` 手直し指示 \`${executeTurns}回\`${goalDirectedTurns > 0 ? ` うち目的を伝えた指示 \`${goalDirectedTurns}回\`` : ''} 手戻り \`${reworkTurns}回\` 初回成功率 \`${firstShotSuccessRate}%\``,
     );
     if (turningPoint) {
       systemLogLines.push(
-        `指示の改善 \`${turningPoint.beforePrompt}\` から条件を具体化した \`${turningPoint.afterPrompt}\` へ変えたことで客の満足と店長の納得が両立しました`,
+        `指示の改善 \`${turningPoint.beforePrompt}\` から${turningPointByGoal ? '目的を伝えた' : '条件を具体化した'} \`${turningPoint.afterPrompt}\` へ変えたことで客の満足と店長の納得が両立しました`,
+      );
+    } else if (effectivePrompt && bestExecute?.embeddingSignal.closestArchetype === 'goal_directed') {
+      systemLogLines.push(
+        `決め手になった指示 \`${effectivePrompt}\` は誰がどうできるようにしたいかを伝えていたため、直し方を任せても狙い通りに整いました`,
       );
     } else if (effectivePrompt) {
       const entityCount = bestExecute?.nlSignal.entities.length ?? 0;
@@ -411,6 +438,7 @@ export function summarizePromptTelemetry(
     exploreTurns,
     executeTurns,
     reworkTurns,
+    goalDirectedTurns,
     firstShotSuccessRate,
     turningPoint,
     effectivePrompt,

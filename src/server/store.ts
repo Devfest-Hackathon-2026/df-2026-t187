@@ -130,6 +130,8 @@ const ARCHETYPE_ANCHOR_TEXTS: Record<PromptArchetype, string> = {
     '初期チェックを外して自分で選べるようにして解約条件を分かりやすく明記して閉じるボタンを大きく下に配置して',
   direct_fix: '注文ボタンが動くように直して合計金額の数字を読みやすく変更して',
   vague_delegate: 'いい感じに全部まとめて使いやすく見やすく直しておまかせで',
+  goal_directed:
+    '定期便を望むお客さんだけが自分で選べるようにしたい クーポンを使いたい人が迷わず使えるようにして',
   inquiry: '店長やお客さんにどこで困ったか理由や狙いを質問して教えて',
 };
 
@@ -205,14 +207,19 @@ export async function analyzePromptWithCloudNaturalLanguage(
 }
 
 /**
- * Vertex AI Text Embeddings (`text-multilingual-embedding-002`) で指示文をベクトル化し、
- * 典型的な指示の型（単純削除型 / 条件設計型 / 具体修正型 / 丸投げ型 / 探索型）とのコサイン類似度で分類する。
+ * 指示の型（目的つき / 単純削除 / 条件設計 / 具体修正 / 丸投げ / 探索）を分類する。
+ * 型の定義はコードの規則で決める。規則に当てはまらず既定の具体修正に落ちた実行指示だけ、
+ * Vertex AI Text Embeddings (`text-multilingual-embedding-002`) で典型的な指示とのコサイン類似度を見て、近い型で補う。
+ * 埋め込みで常に上書きすると、近さが低い発言で規則どおりの型が覆ることがあったため（例：目的つきの指示が丸投げになる）。
  */
 export async function classifyPromptWithVertexEmbeddings(
   promptText: string,
   sessionMode: PromptSessionMode,
 ): Promise<EmbeddingSignal> {
   const base = classifyDeterministicArchetype(promptText, sessionMode);
+  if (sessionMode !== 'execute' || base.closestArchetype !== 'direct_fix') {
+    return base;
+  }
   const project = process.env.GOOGLE_CLOUD_PROJECT;
   if (!project || project === 'your-gcp-project-id' || !promptText.trim()) {
     return base;
@@ -270,8 +277,7 @@ export async function classifyPromptWithVertexEmbeddings(
     let bestArchetype: PromptArchetype = base.closestArchetype;
     let bestScore = -1;
     for (const [arch, vec] of cachedAnchorEmbeddings.entries()) {
-      if (sessionMode === 'explore' && arch !== 'inquiry') continue;
-      if (sessionMode === 'execute' && arch === 'inquiry') continue;
+      if (arch === 'inquiry') continue;
       const sim = cosineSimilarity(promptVector, vec);
       if (sim > bestScore) {
         bestScore = sim;

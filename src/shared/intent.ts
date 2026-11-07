@@ -72,11 +72,31 @@ export function detectCheckpointRevertCommand(message: string): 'undo' | 'reset'
  * 何をどう変えるかがはっきりした改造の指示だけをそのまま改修（apply）に回し、
  * 質問・感想・あいさつ・変え方が決まらない発言は、お助けエージェント（triage）に判断させる。
  * 言い回しは無数にあるため、迷うものは必ず triage 側に倒す。
+ * 「高齢の人でも買いやすくして」のように目的だけで対象の部品がない発言は、すぐ改修するとAIが直す部品を選んでしまい、
+ * どこが悪いかを学習者が見つける体験がなくなる。triage に回して、どの部品でそう感じたかを聞き返させる。
  */
+const GOAL_PHRASE_RE =
+  /(?:人|方|お客さん|客|誰|高齢|お年寄り|初めて)(?:が|でも|だけ|も|に|は)[^。]*?(?:ように|やすく|られる|できる|迷わ|安心)/;
+const TARGET_HINT_RE = new RegExp(
+  `${SPECIFIC_PART_KEYWORDS.source}|部品|クーポン|注文|カート|これ|ここ|この|それ|その|あれ|あの`,
+);
+
+/**
+ * 対象の部品名と、誰がどうできるようにしたいかという目的がそろった依頼（「定期便は、毎月届けてほしい人だけが自分で選べるようにしたい」）。
+ * 直し方を言っていなくても手直しに回す指示なので、AIの振り分けを待たずにすぐ改修する（待ち時間を2〜3秒減らす）。
+ * 「これ」「この」だけでは赤ペンで囲んだかが分からないため、部品の名前があるときに限る
+ */
+const GOAL_REQUEST_RE =
+  /(?:人|方|お客さん|客|誰)(?:が|でも|だけ|も|に|は)[^。？?]*?(?:ように|やすく)(?:して|したい|してほしい|しておいて|しといて)/;
+const PART_NAME_RE = new RegExp(`${SPECIFIC_PART_KEYWORDS.source}|部品|クーポン|注文|カート|注意書き`);
+
 export function classifyUserMessageIntent(message: string): 'apply' | 'triage' {
   const msg = message.trim();
-  if (CHANGE_REQUEST_PATTERN.test(msg) && !QUESTION_PATTERN.test(msg)) {
+  if (QUESTION_PATTERN.test(msg)) return 'triage';
+  if (CHANGE_REQUEST_PATTERN.test(msg)) {
+    if (GOAL_PHRASE_RE.test(msg) && !TARGET_HINT_RE.test(msg)) return 'triage';
     return 'apply';
   }
+  if (GOAL_REQUEST_RE.test(msg) && PART_NAME_RE.test(msg)) return 'apply';
   return 'triage';
 }

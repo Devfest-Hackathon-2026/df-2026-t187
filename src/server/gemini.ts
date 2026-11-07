@@ -916,8 +916,12 @@ export function normalizeUpdatedSpec(rawSpec: AppSpec, previousSpec: AppSpec): A
         : convertedFromPopup
           ? 'info'
           : (c.role ?? 'info');
+    // AIが部品を書き換えるときに label や style を省くことがある。画面の描画が落ちないよう、同じ id の元の部品から補う
+    const prev = previousSpec.components.find((p) => p.id === c.id);
     const normalized: AppComponent = {
       ...c,
+      label: typeof c.label === 'string' ? c.label : (prev?.label ?? ''),
+      style: c.style ?? prev?.style ?? { size: 'md', variant: 'default' },
       role,
       actions,
     };
@@ -1042,6 +1046,7 @@ export async function applyOptionToSpec(req: ApplyRequest): Promise<ApplyRespons
     'あなたは開発スタジオの実装AI（お助けAI）です。人間が指示した変更に従って、サンドボックス内のアプリを更新する最小限の差分操作（patches）を返してください。',
     '【差分操作（patches）の絶対ルール】',
     '0. 人間が頼んだ部品と、その変更のために必要な部品・状態・計算式を変えてください。頼まれていない部品を勝手に消したり書き換えたりしないでください。',
+    '0-2. 指示が対象と目的だけで直し方を言っていないとき（例：定期便を望む人だけが自分で選べるようにしたい）は、その目的をかなえる具体的な変更をあなたが選んでください。変えるのは指示された対象と、目的のために必要な部品だけです。対象の機能は、目的に反しない限り消さずに残してください（定期便やクーポンを望むお客さんもいるため）。',
     '1. 変更しない部品は patches に一切含めないでください。触らない既存の product_card, choice_cards, summary 等の型は維持しつつ、人間から改造を頼まれた部品（例：広告の閉じるボタンの位置・大きさ・文字を closePosition / closeSize / closeLabel で変える、広告を status_banner や button に変える、新しい＋α機能を type: "custom" や customHtml / customCss で追加するなど）は拒絶せず指示どおり自由に実装してください。',
     '2. 使える操作 op は次の6つです：',
     '   - remove_component: 部品を消す（id を指定）',
@@ -1322,7 +1327,7 @@ const TRIAGE_SCHEMA: Schema = {
       type: Type.STRING,
       enum: ['question', 'change', 'unclear'],
       description:
-        'question は画面や部品・お客さんの反応について聞いている、change は何をどう変えるかが1通りに決まる改造の指示、unclear は感想・不満・あいさつや、変え方が何通りも考えられる発言',
+        'question は画面や部品・お客さんの反応について聞いている、change は何をどう変えるかが決まる改造の指示か、対象の部品と目的（誰がどうできるようにしたいか）がそろった指示、unclear は感想・不満・あいさつや、対象も目的もない丸投げ、対象の部品がない目的だけの発言',
     },
     reply: {
       type: Type.STRING,
@@ -1583,7 +1588,10 @@ export async function chatWithStudio(req: ChatRequest): Promise<ChatResponse> {
     '【まず発言を次の3つのどれかに分けてください】',
     '- question: 画面や部品の仕組み・お客さんの反応・このスタジオの使い方について聞いている。「嘘じゃない？」「これ何？」のような、部品に対する問いかけも question です。',
     '- change: 何をどう変えるかが決まる手直しや機能追加の指示。例：広告を消して、閉じるボタンを左下に移動して、広告を画面内のクーポン枠に変えて、注文ボタンを動くように直す、豆の診断機能を追加して。',
+    '- change には、対象の部品と目的（誰がどうできるようにしたいか）がそろっていれば、具体的な直し方を言っていない指示も含めます。直し方を決めるのはあなたの役目です。例：定期便を望む人だけが自分で選べるようにしたい、広告はクーポンを使いたい人にだけ役立つようにして、この注意書きを目が遠い人でも読めるようにして（赤ペンで囲んでいる）。',
     '- unclear: 感想・不満・あいさつ・相づち、または変え方がまだ決まっていない発言。例：赤いボタンが邪魔、うーん、使いにくい。',
+    '- 対象も目的もない丸投げ（いい感じにして、全部直して）と、対象の部品がない目的だけの発言（高齢の人でも買いやすくして）も unclear です。どこが悪いかを見つけるのは学習者自身なので、あなたが部品を選んではいけません。',
+    '- unclear で目的は言えているときは、目的を短く受け止めてから、どの部品でそう感じたかを尋ねてください。',
     '【重要：消すだけに誘導せず、自由な工夫や＋α機能の実装を受け入れる】',
     '- ポップアップ広告や定期便、カウントダウン、ボタンなどは、ただ消すだけでなく、閉じるボタンの位置（左下・右下・下部バー等）や大きさを変える、画面内のバナーや割引ボタンに変える、独自の＋α機能（診断や特典など）を足すといったあらゆる手直しが可能です。「できません」と断ったり消すことだけに誘導したりせず、学習者の工夫をそのまま change として実装へ回してください。',
     '【question のときの絶対ルール】',

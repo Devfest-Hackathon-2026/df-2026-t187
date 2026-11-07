@@ -35,6 +35,7 @@ import {
   validateSandboxSpec,
 } from '../src/shared/sandboxValidator.ts';
 import { detectCheckpointRevertCommand } from '../src/shared/intent.ts';
+import { describeOtherCohortImpact } from '../src/shared/otherCohorts.ts';
 import {
   buildOwnerChangeReaction,
   buildOwnerClosingLines,
@@ -49,6 +50,7 @@ import {
   summarizePromptTelemetry,
 } from '../src/shared/promptTelemetry.ts';
 import {
+  classifyPromptWithVertexEmbeddings,
   clearPromptTelemetryEvents,
   finalizeTelemetryOnEvaluate,
   recordPromptTelemetryEvent,
@@ -324,6 +326,13 @@ describe('core-loop', () => {
       'この広告消して',
       '注文ボタンを動くように直す',
       '定期便のチェックを最初は外しておいて',
+      // 対象の部品と目的がそろっていれば、直し方を言っていなくてもすぐ改修してよい
+      '定期便を望む人だけが自分で選べるようにして',
+      'この注意書きを目が遠い人でも読めるようにして',
+      // 「ようにしたい」のように変える言葉がなくても、部品名と目的がそろえばAIの振り分けを待たずに改修する
+      '定期便は、毎月届けてほしい人だけが自分で選べるようにしたい',
+      'クーポン広告は、使いたい人には役立って、いらない人の邪魔にならないようにしたい',
+      '注文する前に、スマホに不慣れな人でも内容を確かめられるようにしたい',
     ]) {
       assert.equal(classifyUserMessageIntent(msg), 'apply', msg);
     }
@@ -338,8 +347,142 @@ describe('core-loop', () => {
       'うーん',
       'ありがとう',
       '説明してほしい',
+      // 目的だけで対象の部品がない発言は、AIが直す部品を選ばないよう聞き返しに回す
+      '高齢の人でも迷わず買えるようにして',
+      'お客さんが安心できるようにしてほしい',
+      // 目的の形でも、質問・感想・「これ」だけで部品名がないものはAIに判断させる
+      '定期便は望む人だけが選べるようにした方がいい？',
+      '定期便は高齢の人を迷わせると思う',
+      'これを目が遠い人でも読めるようにしたい',
     ]) {
       assert.equal(classifyUserMessageIntent(msg), 'triage', msg);
+    }
+  });
+
+  it('デモ用の問題では、損をしたくない人が4手で、消すと困る場面と目的を伝えて立て直す場面を通って全員達成する', () => {
+    const thrifty = getReviewersByCohort('thrifty');
+    const outcomes = (spec: AppSpec) =>
+      thrifty.map((p) => simulatePersonaComputerUse(spec, p));
+    const step = (spec: AppSpec, message: string, patches: SpecPatch[]) => {
+      const result = applyPatchesToSpecWithValidation(spec, message, patches);
+      assert.equal(result.rolledBack, false, message);
+      return result;
+    };
+    const demo = buildScenarioSpec(ACTIVE_THEME, 'demo').spec;
+
+    // 1手目：注文ボタンを直す
+    const order = findComponent(demo, 'btn-order');
+    const fixed = step(demo, '注文ボタンを直しました', [
+      {
+        op: 'replace_component',
+        component: { ...order, actions: [{ type: 'complete_task', message: 'ご購入ありがとうございます' }] },
+      },
+    ]).updatedSpec;
+
+    // 2手目：広告を消さずに閉じやすくすると、定期便の罠が表に出る
+    const popup = findComponent(fixed, 'popup-coupon');
+    const couponFixed = step(fixed, '広告を閉じやすくしました', [
+      {
+        op: 'replace_component',
+        component: { ...popup, closePosition: 'bottom-bar', closeSize: 'lg', closeLabel: 'あとで見る' },
+      },
+    ]).updatedSpec;
+    assert.ok(outcomes(couponFixed).some((r) => r.outcome === 'regretted'));
+
+    // 3手目：定期便を消すと、毎月届けてほしいお客さんが不満になり、店長も嘆く
+    const removed = step(couponFixed, '定期便を消しました', [
+      { op: 'remove_component', id: 'check-subscription' },
+    ]);
+    const afterRemove = outcomes(removed.updatedSpec);
+    assert.equal(afterRemove.filter((r) => r.outcome === 'achieved').length, 2);
+    assert.ok(afterRemove.some((r) => r.outcome === 'bothered' && r.frictionPoint === '定期便の設定がなかった'));
+    assert.match(removed.ownerReaction ?? '', /定期便/);
+
+    // 4手目：望む人だけが選べる正直な定期便に戻すと、全員達成になり店長も喜ぶ
+    const subscription = findComponent(demo, 'check-subscription');
+    const restored = step(removed.updatedSpec, '定期便を選べるようにしました', [
+      {
+        op: 'upsert_state',
+        variable: { key: 'subscription', label: '定期便', type: 'boolean', initialValue: false },
+      },
+      {
+        op: 'insert_component',
+        afterId: 'product-card',
+        component: {
+          ...subscription,
+          label: '定期便にする 毎月お届け いつでも解約OK',
+          style: { size: 'sm', variant: 'default' },
+        },
+      },
+    ]);
+    assert.deepEqual(
+      outcomes(restored.updatedSpec).map((r) => r.outcome),
+      ['achieved', 'achieved', 'achieved'],
+    );
+  });
+
+  it('選ばなかった客層への影響を1行で示し、確認を足すと急ぐ人が困り、前回の設定を入れておくと全員が両立する', () => {
+    const careful = getReviewersByCohort('careful');
+    const others = ALL_REVIEWER_PERSONAS.filter((p) => !careful.some((c) => c.id === p.id));
+    // 定期便を正直な選択欄にし、クーポン広告を閉じやすくした画面（定期便やクーポンを望む人も満たされる）
+    const spec = withAnnoyance(withAnnoyance(cleanSpec(), 'subscription_trap'), 'coupon_popup');
+    for (const v of spec.state) if (v.key === 'subscription') v.initialValue = false;
+    Object.assign(findComponent(spec, 'check-subscription'), {
+      label: '定期便にする 毎月お届け いつでも解約OK',
+      style: { size: 'lg', variant: 'default' },
+    });
+    Object.assign(findComponent(spec, 'popup-coupon'), {
+      closePosition: 'bottom-bar',
+      closeSize: 'lg',
+      closeLabel: 'あとで見る',
+    });
+
+    // 確認なし：ほかの客層の6人は全員買える
+    const noConfirm = describeOtherCohortImpact(spec, others);
+    assert.equal(noConfirm.achieved, 6);
+    assert.match(noConfirm.line, /`6人` も、この画面で気持ちよく買えます/);
+
+    // 確認を足すと、確実に買いたい人は助かるが、ほかの客層の急いでいる人が離脱する
+    findComponent(spec, 'btn-order').behavior = { effect: 'confirm_dialog' };
+    const withConfirm = describeOtherCohortImpact(spec, others);
+    assert.ok(withConfirm.unhappy.some((u) => u.outcome === 'abandoned'));
+    assert.match(withConfirm.line, /^ほかの客層では、`.+` が `.+` ため離脱しました/);
+    assert.doesNotMatch(withConfirm.line, /[()（）「」『』]/);
+
+    // 前回のお届け先と支払い方法を最初から入れておくと、両方が満たされる
+    for (const v of spec.state) {
+      if (v.key === 'deliveryAddress') v.initialValue = '自宅';
+      if (v.key === 'paymentMethod') v.initialValue = 'クレジットカード';
+    }
+    assert.equal(describeOtherCohortImpact(spec, others).achieved, 6);
+  });
+
+  it('指示の型はコードの規則で決まったものを優先し、埋め込みは規則で決まらない指示にだけ使う', async () => {
+    const originalFetch = globalThis.fetch;
+    const originalProject = process.env.GOOGLE_CLOUD_PROJECT;
+    let fetchCalls = 0;
+    globalThis.fetch = (async () => {
+      fetchCalls++;
+      throw new Error('埋め込みを呼んではいけない');
+    }) as typeof fetch;
+    process.env.GOOGLE_CLOUD_PROJECT = 'test-project';
+    try {
+      for (const [text, expected] of [
+        ['注文する前に、スマホに不慣れな人でも内容を確かめられるようにして', 'goal_directed'],
+        ['定期便を消して', 'simple_delete'],
+        ['定期便の初期チェックを外して解約条件を明記して', 'condition_design'],
+        ['いい感じにして', 'vague_delegate'],
+      ] as const) {
+        const signal = await classifyPromptWithVertexEmbeddings(text, 'execute');
+        assert.equal(signal.closestArchetype, expected, text);
+        assert.equal(signal.analyzedVia, 'local_deterministic', text);
+      }
+      assert.equal((await classifyPromptWithVertexEmbeddings('店長、なぜ定期便を付けたの？', 'explore')).closestArchetype, 'inquiry');
+      assert.equal(fetchCalls, 0);
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (originalProject === undefined) delete process.env.GOOGLE_CLOUD_PROJECT;
+      else process.env.GOOGLE_CLOUD_PROJECT = originalProject;
     }
   });
 
@@ -987,6 +1130,17 @@ describe('core-loop', () => {
       'condition_design',
     );
 
+    // 誰がどうできるようにしたいかという目的を言葉にした指示は goal_directed として数える
+    assert.equal(
+      classifyDeterministicArchetype('定期便を望む人だけが自分で選べるようにして', 'execute')
+        .closestArchetype,
+      'goal_directed',
+    );
+    assert.equal(
+      classifyDeterministicArchetype('いい感じに', 'execute').closestArchetype,
+      'vague_delegate',
+    );
+
     assert.equal(cosineSimilarity([1, 0], [1, 0]), 1);
     assert.equal(cosineSimilarity([1, 0], [0, 1]), 0);
 
@@ -1105,5 +1259,45 @@ describe('core-loop', () => {
     ]);
     assert.equal(oneShotSummary.firstShotSuccessRate, 100);
     assert.match(oneShotSummary.systemLogLines[0], /初回成功率 `100%`/);
+    // 目的を伝えた指示がないときは、その回数を到達記録に出さない
+    assert.doesNotMatch(oneShotSummary.systemLogLines[0], /目的を伝えた指示/);
+
+    // 目的だけを伝えると、AIが部品を書き換えるときに label や style を省くことがある。元の部品から補い、描画が落ちない
+    const couponComp = findComponent(initial, 'popup-coupon');
+    const { label: _omitLabel, style: _omitStyle, ...couponWithoutLabel } = couponComp;
+    const partialResult = applyPatchesToSpecWithValidation(initial, 'クーポンを整えました', [
+      { op: 'replace_component', component: couponWithoutLabel as typeof couponComp },
+    ]);
+    const patchedCoupon = findComponent(partialResult.updatedSpec, 'popup-coupon');
+    assert.equal(patchedCoupon.label, couponComp.label);
+    assert.deepEqual(patchedCoupon.style, couponComp.style);
+
+    // 7. 単純削除のあと、目的を伝えた指示で直したケース
+    const goalPrompt = '定期便を望む人だけが自分で選べるようにして';
+    const goalSummary = summarizePromptTelemetry([
+      {
+        ...secondExecEvent,
+        promptText: '定期便を消して',
+        embeddingSignal: classifyDeterministicArchetype('定期便を消して', 'execute'),
+        isReworkOnSameComponent: false,
+        removedNeededFeature: true,
+      },
+      {
+        ...secondExecEvent,
+        promptText: goalPrompt,
+        embeddingSignal: classifyDeterministicArchetype(goalPrompt, 'execute'),
+        isReworkOnSameComponent: true,
+        removedNeededFeature: false,
+      },
+    ]);
+    assert.equal(goalSummary.goalDirectedTurns, 1);
+    assert.match(goalSummary.systemLogLines[0], /うち目的を伝えた指示 `1回`/);
+    assert.match(
+      goalSummary.systemLogLines[1],
+      /`定期便を消して` から目的を伝えた `定期便を望む人だけが自分で選べるようにして`/,
+    );
+    for (const line of goalSummary.systemLogLines) {
+      assert.doesNotMatch(line, /[()（）「」『』]/);
+    }
   });
 });

@@ -737,6 +737,14 @@ export const COFFEE_BEANS_THEME: ThemeDefinition = {
         'coupon_popup',
       ],
     },
+    // 発表のデモ用。sales_push から煽りとおとりを外し、広告と定期便の板挟みだけを短く見せる。
+    // 「損をしたくない人」を選ぶと、注文ボタン → 広告 → 定期便を消す → 目的を伝えて戻す、の4手で全員達成になる
+    demo: {
+      title: '広告と定期便で売上を伸ばしたい店長の画面（デモ用）',
+      description:
+        '本番の問題から煽りとおとりを外した、発表用の短い画面。広告を直すと定期便の罠が表に出て、定期便を消すと毎月届けてほしいお客さんと店長が困る。',
+      annoyanceIds: ['broken_order_button', 'subscription_trap', 'coupon_popup'],
+    },
   },
   defaultScenarioId: 'sales_push',
   baseSpec: BASE_SPEC,

@@ -13,6 +13,7 @@ import {
 } from '../shared/intent.ts';
 import { buildOwnerClosingLines } from '../shared/owner.ts';
 import { simulatePersonaComputerUse } from '../shared/sandboxValidator.ts';
+import { describeOtherCohortImpact } from '../shared/otherCohorts.ts';
 import { buildInitialSpec, buildScenarioSpec, type DifficultyLevel } from '../shared/theme.ts';
 import type {
   AppSpec,
@@ -1669,6 +1670,20 @@ async function handleEvaluate(): Promise<void> {
           review: { outcome: result.outcome },
         },
         typingMs: typingDurationFor(result.comment),
+      });
+    }
+    // 選んだ3人のうち誰かが買えるようになったら、選ばなかった客層への影響も見せる。
+    // 誰のために直したかで別の誰かが困ることに、その場で気づけるようにする
+    if (achievedCount > 0) {
+      const otherPersonas = ALL_REVIEWER_PERSONAS.filter(
+        (p) => !activePersonas.some((a) => a.id === p.id),
+      );
+      queued.push({
+        message: {
+          role: 'system',
+          text: describeOtherCohortImpact(currentSpec, otherPersonas, componentBounds).line,
+        },
+        typingMs: 0,
       });
     }
     if (achievedCount === activePersonas.length) {
