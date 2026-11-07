@@ -322,7 +322,70 @@ export function inspectAppliedChangeForTelemetry(
 
 function cleanPromptForBadge(text: string): string {
   const cleaned = text.replace(/`/g, '').replace(/\s+/g, ' ').trim();
-  return cleaned.length > 36 ? `${cleaned.slice(0, 35)}…` : cleaned;
+  return cleaned.length > 60 ? `${cleaned.slice(0, 59)}…` : cleaned;
+}
+
+const GENERIC_MODIFIER_ENTITIES = new Set([
+  'ボタン',
+  'チェック',
+  '文字',
+  'サイズ',
+  '大きさ',
+  '色',
+  '数字',
+  '確認',
+  '金額',
+]);
+
+function extractTargetTopics(event: PromptTelemetryEvent): Set<string> {
+  const topics = new Set<string>();
+  for (const id of event.changedComponentIds) {
+    if (/sub/i.test(id)) topics.add('topic:subscription');
+    if (/coupon|popup/i.test(id)) topics.add('topic:coupon');
+    if (/countdown|timer/i.test(id)) topics.add('topic:countdown');
+  }
+  for (const ent of event.nlSignal.entities) {
+    if (GENERIC_MODIFIER_ENTITIES.has(ent)) continue;
+    if (ent === '定期便' || ent === 'おトク定期便' || ent === '解約条件' || ent === '注意書き') {
+      topics.add('topic:subscription');
+    } else if (
+      ent === 'クーポン' ||
+      ent === '割引' ||
+      ent === '広告' ||
+      ent === 'ポップアップ' ||
+      ent === 'バナー' ||
+      ent === '閉じるボタン'
+    ) {
+      topics.add('topic:coupon');
+    } else if (ent === 'カウントダウン' || ent === '残り時間' || ent === 'タイマー') {
+      topics.add('topic:countdown');
+    } else {
+      topics.add(`ent:${ent}`);
+    }
+  }
+  return topics;
+}
+
+function sharesTurningPointTarget(
+  prev: PromptTelemetryEvent,
+  next: PromptTelemetryEvent,
+): boolean {
+  if (prev.embeddingSignal.closestArchetype === 'vague_delegate') {
+    return true;
+  }
+  if (
+    prev.changedComponentIds.length > 0 &&
+    next.changedComponentIds.length > 0 &&
+    prev.changedComponentIds.some((id) => next.changedComponentIds.includes(id))
+  ) {
+    return true;
+  }
+  const prevTopics = extractTargetTopics(prev);
+  const nextTopics = extractTargetTopics(next);
+  for (const t of prevTopics) {
+    if (nextTopics.has(t)) return true;
+  }
+  return false;
 }
 
 /**
@@ -380,6 +443,8 @@ export function summarizePromptTelemetry(
       const next = executeEvents[j];
       if (
         !next.removedNeededFeature &&
+        next.embeddingSignal.closestArchetype !== 'simple_delete' &&
+        sharesTurningPointTarget(prev, next) &&
         (next.embeddingSignal.closestArchetype === 'condition_design' ||
           next.embeddingSignal.closestArchetype === 'goal_directed' ||
           next.nlSignal.hasConditionConstraint ||

@@ -1472,5 +1472,28 @@ describe('core-loop', () => {
     for (const line of goalSummary.systemLogLines) {
       assert.doesNotMatch(line, /[()（）「」『』]/);
     }
+
+    // 8. 別の部品（広告の単純削除 → 定期便の条件設計）は転換点として結ばない
+    const unrelatedSummary = summarizePromptTelemetry([
+      {
+        ...secondExecEvent,
+        promptText: 'あと最初に出てくる500円OFFの広告もじゃまだから出ないようにして',
+        changedComponentIds: ['popup-coupon'],
+        nlSignal: extractDeterministicNlSignal('あと最初に出てくる500円OFFの広告もじゃまだから出ないようにして'),
+        embeddingSignal: classifyDeterministicArchetype('あと最初に出てくる500円OFFの広告もじゃまだから出ないようにして', 'execute'),
+        isReworkOnSameComponent: false,
+        removedNeededFeature: true,
+      },
+      {
+        ...secondExecEvent,
+        promptText: '勝手に定期便になるのひどい。チェックは最初外して、字ももっと大きくして',
+        changedComponentIds: ['check-subscription'],
+        nlSignal: extractDeterministicNlSignal('勝手に定期便になるのひどい。チェックは最初外して、字ももっと大きくして'),
+        embeddingSignal: classifyDeterministicArchetype('勝手に定期便になるのひどい。チェックは最初外して、字ももっと大きくして', 'execute'),
+        isReworkOnSameComponent: false,
+        removedNeededFeature: false,
+      },
+    ]);
+    assert.equal(unrelatedSummary.turningPoint, undefined);
   });
 });

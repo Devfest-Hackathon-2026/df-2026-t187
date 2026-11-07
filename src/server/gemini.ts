@@ -194,6 +194,7 @@ async function generateContentWithTimeout(
   params: GenerateContentParameters,
   { timeoutMs, retries }: { timeoutMs: number; retries: number },
 ): Promise<GenerateContentResponse> {
+  let rateLimitRetried = false;
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
       return await aiInfo.client.models.generateContent({
@@ -201,6 +202,17 @@ async function generateContentWithTimeout(
         config: { ...params.config, abortSignal: AbortSignal.timeout(timeoutMs) },
       });
     } catch (err) {
+      const status = (err as { status?: number })?.status;
+      const msg = String((err as Error)?.message ?? err);
+      const isRateLimited =
+        status === 429 || msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED');
+      if (isRateLimited && !rateLimitRetried) {
+        rateLimitRetried = true;
+        attempt--;
+        console.warn('[gemini] 利用枠（429）に当たったため2秒待って1回やり直します');
+        await new Promise((resolve) => setTimeout(resolve, 2_000));
+        continue;
+      }
       const name = (err as Error)?.name;
       const timedOut = name === 'TimeoutError' || name === 'AbortError';
       if (!timedOut) throw err;
@@ -568,7 +580,10 @@ export async function recordHumanDecisionWithFunctionCalling(
   const originalReason = (req.reason ?? '').trim();
   let normalizedReason = originalReason;
 
-  if (aiInfo) {
+  // 手直し（applyOptionToSpec）のたびに理由なしで並列呼び出しすると、利用枠（429）の消費が2倍になり、
+  // しかも返り値の引数は使われないため、客層選択（/api/decision）や理由があるときだけ Gemini を呼ぶ
+  const shouldCallGeminiFunction = req.stage !== 'apply_change' || Boolean(originalReason);
+  if (aiInfo && shouldCallGeminiFunction) {
     try {
       const response = await generateContentWithTimeout(aiInfo, {
         model: aiInfo.model,
@@ -1212,21 +1227,13 @@ export async function evaluateAppWithPersonas(req: EvaluateRequest): Promise<Eva
   const hasCustomComponents = req.currentSpec.components.some(
     (c) => c.type === 'custom' || Boolean(c.customHtml),
   );
-  const hasCustomOrRenovatedFeatures =
-    hasCustomComponents ||
-    req.currentSpec.components.some(
-      (c) =>
-        Boolean(c.customCss) ||
-        Boolean(c.closePosition && c.closePosition !== 'top-right') ||
-        Boolean(c.closeSize) ||
-        Boolean(c.closeLabel),
-    );
 
   const prompt = [
     `あなたは${ACTIVE_THEME.appName}で${ACTIVE_THEME.taskLabel}ことを試した3人の顧客です。改修の意図やこれまでの議論は一切知りません。`,
-    '添付された画面のスクリーンショット（視覚情報）・現在のUI部品仕様・各顧客が実際に画面を操作したログと基準結果（codeDeterminedOutcome）に基づき、本人になりきった感想（comment）、困った点・良かった点（frictionPoint）、および体験結果（outcome）を生成してください。',
+    '添付された画面のスクリーンショット（視覚情報）・現在のUI部品仕様・各顧客が実際に画面を操作したログ（actionTrace）と基準結果（codeDeterminedOutcome / codeDeterminedFriction）に基づき、本人になりきった感想（comment）、困った点・良かった点（frictionPoint）、および体験結果（outcome）を生成してください。',
     '結果は achieved が達成、abandoned が途中でやめた、regretted が完了はできたが余計な契約などにあとで気づいて後悔した、bothered が買えたが途中で嫌な思いをした、です。',
-    '基準結果（codeDeterminedOutcome）は原則尊重しつつ、画面に追加された独自の＋α機能（customHtml等）や視覚デザイン・広告の工夫によって「この顧客の性格・制約なら大喜びで achieved になる」「逆に手数や情報が増えてこの顧客には bothered になる」といった違いがあれば outcome と感想に反映してください（ただし注文ボタン自体が壊れていて買えない abandoned の場合は必ず abandoned のままにしてください）。',
+    'outcome は原則として codeDeterminedOutcome をそのまま使い、comment と frictionPoint も必ずその人の actionTrace と codeDeterminedFriction にある事実だけを本人の口調で言い換えてください（独自の追加部品 customHtml が画面にある場合のみ、その部品による満足・不満を反映してよいです）。',
+    'actionTrace に書かれていないこと（例：定期便を申し込んでいない人が定期便を申し込んだと言う、記録にない文字の重なりや画面崩れを指摘する、電話解約でやめたのに満足したことにする等）は絶対に作らないでください。',
     'regretted の人は、あとから気づいたがっかりした気持ちを話してください。bothered の人は、買えたことと途中の嫌だったことの両方が伝わるように話してください。achieved の人は、素直に満足や工夫への好感を話してください。',
     '',
     '【絶対ルール：短く・直し方は絶対に言わない・括弧は使わない】',
@@ -1285,18 +1292,16 @@ export async function evaluateAppWithPersonas(req: EvaluateRequest): Promise<Eva
   const results: ReviewerEvaluation[] = reviewers.map((p) => {
     const sim = simMap.get(p.id)!;
     const aiComment = parsed.comments.find((c) => c.reviewerId === p.id);
-    // 注文完了できない状態（abandoned）や罠による後悔（regretted）、
-    // および定期便・クーポン等の希望機能そのものが削除されて不満になった判定はコード判定を厳守し、
-    // 自由な＋α機能やカスタム改修が入っている場合のみAIのマルチモーダル評価（achieved / bothered）も反映する
+    // 勝敗はコードのシミュレーター判定（sim.outcome）を厳守する。
+    // 独自の＋α部品（customHtml）が追加されている場合のみ、注文不能・後悔・希望機能欠落でない限りAI判定も反映する
     const missingDesiredFeature =
-      !hasCustomComponents &&
-      (sim.frictionPoint.includes('定期便の設定がなかった') ||
-        sim.frictionPoint.includes('クーポンがなくなっていた'));
+      sim.frictionPoint.includes('定期便の設定がなかった') ||
+      sim.frictionPoint.includes('クーポンがなくなっていた');
     const resolvedOutcome: ReviewOutcome =
+      hasCustomComponents &&
       sim.outcome !== 'abandoned' &&
       sim.outcome !== 'regretted' &&
       !missingDesiredFeature &&
-      hasCustomOrRenovatedFeatures &&
       (aiComment?.outcome === 'achieved' || aiComment?.outcome === 'bothered')
         ? aiComment.outcome
         : sim.outcome;
