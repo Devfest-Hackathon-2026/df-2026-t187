@@ -14,6 +14,7 @@ import {
 import { buildOwnerClosingLines } from '../shared/owner.ts';
 import { simulatePersonaComputerUse } from '../shared/sandboxValidator.ts';
 import { describeOtherCohortImpact } from '../shared/otherCohorts.ts';
+import { splitIntoChatChunks } from '../shared/chatText.ts';
 import { buildInitialSpec, buildScenarioSpec, type DifficultyLevel } from '../shared/theme.ts';
 import type {
   AppSpec,
@@ -476,32 +477,6 @@ function sleepWithQueueTimer(ms: number): Promise<void> {
 /** 発言の長さに応じた書き込み時間（音声OFF時のテンポ） */
 function typingDurationFor(text: string): number {
   return Math.min(2000, 850 + text.length * 38);
-}
-
-/** 長い発言を句点や改行で短く区切り、チャットらしく1文ずつ送れるようにする */
-function splitIntoChatChunks(text: string): string[] {
-  // 「★今だけ！今すぐ購入★」のように、★や括弧の内側にある！や。では区切らない
-  const parts: string[] = [];
-  let current = '';
-  let inStar = false;
-  let bracketDepth = 0;
-  for (const ch of text) {
-    if (ch === '\n') {
-      if (current.trim()) parts.push(current.trim());
-      current = '';
-      continue;
-    }
-    current += ch;
-    if (ch === '★') inStar = !inStar;
-    else if ('「『（('.includes(ch)) bracketDepth++;
-    else if ('」』）)'.includes(ch)) bracketDepth = Math.max(0, bracketDepth - 1);
-    else if ('。！？!?'.includes(ch) && !inStar && bracketDepth === 0) {
-      parts.push(current.trim());
-      current = '';
-    }
-  }
-  if (current.trim()) parts.push(current.trim());
-  return parts.length > 0 ? parts : [text.trim()];
 }
 
 function enqueueMessages(items: QueuedMessage[]): void {
@@ -2628,6 +2603,8 @@ function renderStudio(): void {
     spec,
     liveAppState: state.liveAppState,
     circled: state.circledComponentIds,
+    // 作業ログの行を押したときに部品を光らせるため、光らせる部品が変わったときも描き直す
+    justChanged: state.justChangedIds,
   });
   if (sandboxAppMountEl && nextSandboxKey !== lastSandboxRenderKey) {
     lastSandboxRenderKey = nextSandboxKey;

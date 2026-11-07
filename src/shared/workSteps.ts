@@ -155,6 +155,11 @@ function formatStateValue(val: StateValue, key?: string): string {
   return trimmed === '' ? '未選択' : trimmed;
 }
 
+/** 「input」「confirm」のような、学習者に意味の通じない英字だけの内部の値か */
+function isInternalValue(text: string): boolean {
+  return /^[A-Za-z_][A-Za-z0-9_-]*$/.test(text);
+}
+
 function humanizeExpression(expression: string, spec: AppSpec): string {
   return expression
     .replace(/\b([A-Za-z_][A-Za-z0-9_]*)\b/g, (id) => {
@@ -429,13 +434,24 @@ export function describeWorkSteps(
         const label = friendlyKeyLabel(key, nextSpec, patch.variable.label);
         // その状態を使う部品があれば光らせる（例: 定期便のチェック欄）
         const user = nextSpec.components.find((c) => c.stateKey === key);
-        const afterVal = formatStateValue(patch.variable.initialValue, key);
+        // AIが文字列で返した値（"false" など）ではなく、型をそろえたあとの値で言葉にする
+        const nextValue =
+          nextSpec.state.find((s) => s.key === key)?.initialValue ?? patch.variable.initialValue;
+        const afterVal = formatStateValue(nextValue, key);
         if (prevState) {
+          // 値が変わっていなければ、変更として出さない
+          if (prevState.initialValue === nextValue) break;
           const beforeVal = formatStateValue(prevState.initialValue, key);
-          steps.push({
-            text: `${token(label)} の最初の状態を ${token(beforeVal)} から ${token(afterVal)} に変更`,
-            componentId: user?.id,
-          });
+          if (isInternalValue(beforeVal) || isInternalValue(afterVal)) {
+            steps.push({ text: `${token(label)} の最初の状態を変更`, componentId: user?.id });
+          } else {
+            steps.push({
+              text: `${token(label)} の最初の状態を ${token(beforeVal)} から ${token(afterVal)} に変更`,
+              componentId: user?.id,
+            });
+          }
+        } else if (isInternalValue(afterVal)) {
+          steps.push({ text: `${token(label)} を覚える欄を追加`, componentId: user?.id });
         } else {
           steps.push({
             text: `${token(label)} を覚える欄を追加して最初の状態を ${token(afterVal)} に設定`,

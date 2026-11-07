@@ -71,6 +71,8 @@ export function applySpecPatches(
   const spec = structuredClone(baseSpec);
   const warnings: string[] = [];
   const touchedComponentIds = new Set<string>();
+  const removedTraps: AppComponent[] = [];
+  const explicitlySetStateKeys = new Set<string>();
 
   for (const patch of patches ?? []) {
     if (!patch || typeof patch !== 'object') continue;
@@ -86,7 +88,8 @@ export function applySpecPatches(
           warnings.push(`存在しない部品IDの削除を無視しました: ${patch.id}`);
           break;
         }
-        spec.components.splice(idx, 1);
+        const [removed] = spec.components.splice(idx, 1);
+        if (removed.stateKey && removed.trapSafeValue !== undefined) removedTraps.push(removed);
         touchedComponentIds.add(patch.id);
         break;
       }
@@ -185,6 +188,7 @@ export function applySpecPatches(
           warnings.push('upsert_state に有効な variable.key がありません');
           break;
         }
+        explicitlySetStateKeys.add(v.key);
         const existing = spec.state.find((s) => s.key === v.key);
         if (existing) {
           existing.label = v.label || existing.label;
@@ -211,6 +215,17 @@ export function applySpecPatches(
         break;
       }
     }
+  }
+
+  // 罠の部品（最初からチェック入りの定期便など）を消しても、状態の値が罠のまま残ると、
+  // 画面にない申し込みに全員が気づかず申し込むことになる。その状態を使う部品がもうなく、
+  // 同じ手直しで値を指定していなければ、罠を外した値に戻す。変数自体は「店にあった」印として残す
+  for (const trap of removedTraps) {
+    const key = trap.stateKey!;
+    if (explicitlySetStateKeys.has(key)) continue;
+    if (spec.components.some((c) => c.stateKey === key)) continue;
+    const variable = spec.state.find((s) => s.key === key);
+    if (variable) variable.initialValue = trap.trapSafeValue!;
   }
 
   return { spec, warnings, touchedComponentIds };

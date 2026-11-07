@@ -541,7 +541,8 @@ export function simulatePersonaComputerUse(
   const appliedInlineCouponIds = new Set<string>();
   let pressureNoticed = false;
   let sawSubscriptionOption = false;
-  let sawCouponFeature = spec.components.some((comp) => isCouponComponent(comp));
+  // クーポンは実際に目にしたときだけ「見た」とする（画面内の表示を見たか、クーポン広告が出たとき）
+  let sawCouponFeature = false;
   /** 買えたとしても嫌な思いをしたこと。1つでもあれば「買えたけど不満」になる */
   const bothers: Array<{ friction: string; comment: string }> = [];
 
@@ -599,15 +600,19 @@ export function simulatePersonaComputerUse(
    * ストレスなく閉じられる（または特典を活用できる）ものとして扱う。
    */
   const closeDuePopups = (): FailureReason | null => {
+    // 次に指が画面に触れる時点（1手ぶん先）で出ているかを見る。
+    // 画面を開いてから最初のタップまでに出る広告を、すぐに押した人だけがすり抜けないようにする
+    const touchAtMs = elapsedMs + MS_PER_STEP;
     const due = spec.components.filter(
       (comp) =>
         comp.type === 'popup' &&
         !closedPopups.has(comp.id) &&
         (!comp.stateKey || state[comp.stateKey] !== 'closed') &&
-        elapsedMs >= (comp.popupDelayMs?.min ?? 0),
+        touchAtMs >= (comp.popupDelayMs?.min ?? 0),
     );
     for (const popup of due) {
       closedPopups.add(popup.id);
+      if (isCouponComponent(popup)) sawCouponFeature = true;
       const closePos = popup.closePosition ?? 'top-right';
       const effectiveCloseSize: ComponentSize =
         popup.closeSize ?? (closePos === 'bottom-bar' ? 'lg' : popup.style.size);
@@ -887,6 +892,9 @@ export function simulatePersonaComputerUse(
       steps += 1;
       elapsedMs += MS_PER_STEP;
     } else if (confirmsOnTap) {
+      // 確認の1手の前にも、出てきた広告に当たる
+      const popupBeforeConfirm = closeDuePopups();
+      if (popupBeforeConfirm) return fail(popupBeforeConfirm);
       steps += 1;
       elapsedMs += MS_PER_STEP;
     }
@@ -940,7 +948,10 @@ export function simulatePersonaComputerUse(
         };
       }
       actionTrace.push(`${steps}手目: ${target.comp.label}を押してタスク完了イベントを検知`);
-      if (c.wantsSubscription && !sawSubscriptionOption) {
+      // 定期便もクーポンも、お客さんの希望は「あれば使いたい」。店に最初からないものには不満を言わず、
+      // 店にあったのに消されたときだけ不満にする。部品を消しても状態の変数は残るので、そこから店にあったかを見る
+      const hadSubscriptionInShop = spec.state.some((s) => s.key.toLowerCase().includes('subscription'));
+      if (c.wantsSubscription && hadSubscriptionInShop && !sawSubscriptionOption) {
         actionTrace.push('画面確認: 毎月届く定期便を選びたかったが設定が見当たらなかった');
         bothers.push({
           friction: '定期便の設定がなかった',
@@ -948,7 +959,6 @@ export function simulatePersonaComputerUse(
         });
       }
       const hadCouponInShop =
-        persona.id === 'hina' ||
         spec.state.some((s) => s.key === 'couponPopup' || s.key.toLowerCase().includes('coupon'));
       if (c.wantsCoupon && hadCouponInShop && !sawCouponFeature) {
         actionTrace.push('画面確認: クーポンを使いたかったが見当たらなかった');

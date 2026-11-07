@@ -35,16 +35,20 @@ export function buildOwnerReport(
 ): OwnerReport {
   // 不満があっても後悔していても、買ってくれたことに変わりはない
   const ordered = results.filter((r) => r.outcome !== 'abandoned');
+  // 店にあったか（状態の変数があるか）と、今も画面で選べるか（その状態を使う部品があるか）を分けて見る。
+  // 部品を消しても変数は残るため、変数だけで判断すると、消した欄の申し込みを数えてしまう
   const stateKeys = new Set(spec.state.map((s) => s.key));
+  const boundKeys = new Set(spec.components.map((c) => c.stateKey).filter(Boolean));
 
   const metrics = owner.metrics
+    .filter((m) => stateKeys.has(m.stateKey))
     .map((m) => ({
       label: m.label,
-      missing: !stateKeys.has(m.stateKey),
+      missing: !boundKeys.has(m.stateKey),
       reportWhenMissing: m.reportWhenMissing ?? false,
       count: ordered.filter((r) => matchesMetric(r.finalState?.[m.stateKey], m.countWhen)).length,
     }))
-    // 画面にない項目は、なくなったことに触れる指定があるものだけ残す
+    // 画面からなくなった項目は、なくなったことに触れる指定があるものだけ残す
     .filter((m) => !m.missing || m.reportWhenMissing);
 
   const lines = owner.lines;

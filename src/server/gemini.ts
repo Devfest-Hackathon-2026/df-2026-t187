@@ -320,11 +320,16 @@ const OWNER_REPLY_FALLBACK = 'うーん、言いたいことは分かるんだ�
  * 店長が話しかけられたときに使う、今のお店の状況の事実。数字や事実をでっちあげないよう、
  * 画面とお客さんの結果から分かることだけをコードでまとめる
  */
-function describeOwnerContext(spec: AppSpec, latestReviews: LatestReviewRecord | undefined): string[] {
+export function describeOwnerContext(
+  spec: AppSpec,
+  latestReviews: LatestReviewRecord | undefined,
+): string[] {
   const owner = ACTIVE_THEME.owner;
   const facts: string[] = [];
   const state = Object.fromEntries(spec.state.map((s) => [s.key, s.initialValue]));
   for (const m of owner.metrics) {
+    // 店にもともとない項目（状態の変数がない）は伝えない。消された欄を嘆くのは、店にあったものだけ
+    if (!(m.stateKey in state)) continue;
     const comp = spec.components.find((c) => c.stateKey === m.stateKey);
     if (!comp) {
       facts.push(`今の画面には、店長が売上のために付けた${m.label}の欄がない`);

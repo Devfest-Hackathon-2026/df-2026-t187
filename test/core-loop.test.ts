@@ -6,6 +6,7 @@ import {
   applyPatchesToSpecWithValidation,
   chatWithStudio,
   classifyUserMessageIntent,
+  describeOwnerContext,
   detectExplicitRecipientMention,
   evaluateAppWithPersonas,
   getAiConnectionStatus,
@@ -36,6 +37,7 @@ import {
 } from '../src/shared/sandboxValidator.ts';
 import { detectCheckpointRevertCommand } from '../src/shared/intent.ts';
 import { describeOtherCohortImpact } from '../src/shared/otherCohorts.ts';
+import { splitIntoChatChunks } from '../src/shared/chatText.ts';
 import {
   buildOwnerChangeReaction,
   buildOwnerClosingLines,
@@ -311,7 +313,15 @@ describe('core-loop', () => {
     assert.match(fixed.owner.comment, /定期便も\d+件取れたぞ/);
 
     // 定期便の欄や広告をただ消すと後悔はなくなるが、定期便やクーポンを希望していた客は設定がなくて不満（bothered）になり、店長も嘆く
-    const noTrap = build(['broken_order_button', 'coupon_popup', 'countdown_pressure', 'decoy_buy_now', 'subscription_trap']);
+    // 実際のプレイと同じく、店にあった部品を手直しで消す（最初から入れない画面は「店になかった」扱いになり不満は出ない）
+    const noTrap = applyPatchesToSpecWithValidation(
+      build(['broken_order_button', 'countdown_pressure', 'decoy_buy_now']),
+      '定期便と広告を消しました',
+      [
+        { op: 'remove_component', id: 'check-subscription' },
+        { op: 'remove_component', id: 'popup-coupon' },
+      ],
+    ).updatedSpec;
     const cleaned = report(noTrap);
     assert.ok(!cleaned.outcomes.includes('regretted'));
     assert.ok(cleaned.outcomes.includes('bothered'));
@@ -484,6 +494,116 @@ describe('core-loop', () => {
       if (originalProject === undefined) delete process.env.GOOGLE_CLOUD_PROJECT;
       else process.env.GOOGLE_CLOUD_PROJECT = originalProject;
     }
+  });
+
+  it('定期便やクーポンは、店に最初からなければ望む人も不満にならず、あったのに消されたときだけ不満になる', () => {
+    // 最初から定期便もクーポンもない、まともな画面
+    for (const p of getReviewersByCohort('thrifty')) {
+      assert.equal(outcomeOf(cleanSpec(), p.id), 'achieved', p.name);
+    }
+    // 店にあった定期便とクーポン広告を消すと、望んでいた人は不満になる
+    const withBoth = withAnnoyance(withAnnoyance(cleanSpec(), 'subscription_trap'), 'coupon_popup');
+    const removed = applyPatchesToSpecWithValidation(withBoth, '定期便と広告を消しました', [
+      { op: 'remove_component', id: 'check-subscription' },
+      { op: 'remove_component', id: 'popup-coupon' },
+    ]).updatedSpec;
+    const frictions = getReviewersByCohort('thrifty').map(
+      (p) => simulatePersonaComputerUse(removed, p).frictionPoint,
+    );
+    assert.ok(frictions.includes('定期便の設定がなかった'));
+    assert.ok(frictions.includes('クーポンがなくなっていた'));
+
+    // 罠の定期便を消すと、状態は罠を外した値に戻る。画面にない定期便に気づかず申し込む人はいない
+    assert.equal(removed.state.find((v) => v.key === 'subscription')?.initialValue, false);
+    for (const p of ALL_REVIEWER_PERSONAS) {
+      assert.notEqual(simulatePersonaComputerUse(removed, p).finalState?.subscription, true, p.name);
+    }
+    const ownerReport = buildOwnerReport(
+      ACTIVE_THEME.owner,
+      removed,
+      ALL_REVIEWER_PERSONAS.map((p) => simulatePersonaComputerUse(removed, p)),
+    );
+    const subscriptionMetric = ownerReport.metrics.find((m) => m.label === '定期便');
+    assert.equal(subscriptionMetric?.missing, true);
+    assert.equal(subscriptionMetric?.count, 0);
+
+    // 同じ手直しで状態の値をはっきり指定したときは、その指定を優先する
+    const explicit = applyPatchesToSpecWithValidation(withBoth, '定期便を消して状態を指定しました', [
+      { op: 'remove_component', id: 'check-subscription' },
+      {
+        op: 'upsert_state',
+        variable: { key: 'subscription', label: '定期便', type: 'boolean', initialValue: true },
+      },
+    ]).updatedSpec;
+    assert.equal(explicit.state.find((v) => v.key === 'subscription')?.initialValue, true);
+  });
+
+  it('店長には、店にもともとない欄は伝えず、あったのに消された欄だけを「ない」と伝える', () => {
+    const spec = buildScenarioSpec(ACTIVE_THEME, ACTIVE_THEME.defaultScenarioId).spec;
+    // 本番の問題に会員登録の欄はもともとない
+    assert.ok(!describeOwnerContext(spec, undefined).some((f) => f.includes('会員登録')));
+    assert.ok(describeOwnerContext(spec, undefined).some((f) => f.includes('定期便に最初からチェックが入っている')));
+    // 定期便の欄を消すと、なくなったことが伝わる
+    const removed = applyPatchesToSpecWithValidation(spec, '定期便を消しました', [
+      { op: 'remove_component', id: 'check-subscription' },
+    ]).updatedSpec;
+    assert.ok(describeOwnerContext(removed, undefined).some((f) => f.includes('定期便の欄がない')));
+  });
+
+  it('作業ログは型をそろえた値で言葉にし、変わっていない値や英字だけの内部の値は出さない', () => {
+    const spec = withAnnoyance(cleanSpec(), 'subscription_trap');
+    const stepTexts = (patches: SpecPatch[], base = spec) =>
+      (applyPatchesToSpecWithValidation(base, 'テスト', patches).workSteps ?? []).map((s) => s.text);
+    const subscriptionFalse = {
+      op: 'upsert_state',
+      // Geminiは真偽値を文字列で返すことがある
+      variable: { key: 'subscription', label: '定期便', type: 'boolean', initialValue: 'false' },
+    } as unknown as SpecPatch;
+
+    // チェックあり → チェックなし は、文字列の "false" でも言葉で出す
+    const changed = stepTexts([subscriptionFalse]);
+    assert.ok(changed.some((t) => t.includes('`チェックあり` から `チェックなし`')), changed.join('\n'));
+    assert.ok(!changed.some((t) => t.includes('false')));
+
+    // すでにチェックなしなら、変更として出さない
+    const unchecked = applyPatchesToSpecWithValidation(spec, 'テスト', [subscriptionFalse]).updatedSpec;
+    assert.ok(!stepTexts([subscriptionFalse], unchecked).some((t) => t.includes('最初の状態')));
+
+    // 英字だけの内部の値は出さない
+    const added = stepTexts([
+      { op: 'upsert_state', variable: { key: 'step', label: '進捗ステップ', type: 'string', initialValue: 'input' } },
+    ]);
+    assert.ok(added.some((t) => t.includes('を覚える欄を追加')));
+    assert.ok(!added.some((t) => t.includes('input')));
+  });
+
+  it('吹き出しは句点で区切るが、「！？」のように続く句点は同じ吹き出しに入れる', () => {
+    assert.deepEqual(splitIntoChatChunks('おいおい、消しちゃったのかい！？売上が不安だよ'), [
+      'おいおい、消しちゃったのかい！？',
+      '売上が不安だよ',
+    ]);
+    assert.deepEqual(splitIntoChatChunks('ありがとう。助かったよ！'), ['ありがとう。', '助かったよ！']);
+    assert.deepEqual(splitIntoChatChunks('★今だけ！今すぐ購入★を消したのか'), ['★今だけ！今すぐ購入★を消したのか']);
+  });
+
+  it('手早く注文できるようにしても、広告に手を付けなければ広告に当たり、見ていないクーポンは見た扱いにしない', () => {
+    // 前回の支払い方法を入れて確認画面を足し、定期便を正直にした。広告には手を付けていない
+    const spec = buildScenarioSpec(ACTIVE_THEME, 'demo').spec;
+    findComponent(spec, 'btn-order').actions = [{ type: 'complete_task', message: 'ご購入ありがとうございます' }];
+    findComponent(spec, 'btn-order').behavior = { effect: 'confirm_dialog' };
+    for (const v of spec.state) {
+      if (v.key === 'subscription') v.initialValue = false;
+      if (v.key === 'paymentMethod') v.initialValue = 'クレジットカード';
+    }
+    Object.assign(findComponent(spec, 'check-subscription'), {
+      label: '定期便にする 毎月お届け いつでも解約OK',
+      style: { size: 'lg', variant: 'default' },
+    });
+    // 広告の閉じるボタンが見えない人は、手早く注文できても広告ですり抜けられない
+    assert.equal(outcomeOf(spec, 'ren'), 'abandoned');
+    assert.equal(outcomeOf(spec, 'kazuko'), 'abandoned');
+    // クーポンを望む人は、広告を閉じさせられて不満になる
+    assert.equal(outcomeOf(spec, 'shota'), 'bothered');
   });
 
   it('3つの顧客層にそれぞれ3人のペルソナがいる', () => {
