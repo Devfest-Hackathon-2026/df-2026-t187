@@ -216,6 +216,32 @@ export function withDerivedValues(spec: AppSpec, state: AppState): AppState {
   return next;
 }
 
+/** 文字で書かれた値を、状態の型（数値・真偽・文字）に合わせて直す */
+export function coerceStateValue(spec: AppSpec, key: string, raw: string): StateValue {
+  const def = spec.state.find((s) => s.key === key);
+  if (def?.type === 'number') {
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : 0;
+  }
+  if (def?.type === 'boolean') return raw === 'true';
+  return raw;
+}
+
+/** 独自の部品の data-set-state（`キー:値;キー:値`）を、set_state の動きの並びに直す。安全でないキーは捨てる */
+export function parseSetStateAttribute(spec: AppSpec, raw: string): ComponentAction[] {
+  const acts: ComponentAction[] = [];
+  for (const pair of raw.split(';')) {
+    const eqIdx = pair.indexOf(':');
+    if (eqIdx <= 0) continue;
+    const k = pair.slice(0, eqIdx).trim();
+    const v = pair.slice(eqIdx + 1).trim();
+    if (isSafeStateKey(k)) {
+      acts.push({ type: 'set_state', targetKey: k, value: coerceStateValue(spec, k, v) });
+    }
+  }
+  return acts;
+}
+
 export function createInitialState(spec: AppSpec): AppState {
   const state: AppState = {};
   for (const s of spec.state) {

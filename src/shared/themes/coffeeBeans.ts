@@ -158,6 +158,13 @@ const ANNOYANCES: AnnoyanceDefinition[] = [
     exclusiveGroup: 'popup',
     apply: (spec) => {
       upsertState(spec, { key: 'couponPopup', label: 'クーポン広告', type: 'string', initialValue: 'waiting' });
+      // クーポンを使える形に作り変えたとき、部品に「割引額を入れる」動きを付けるだけで合計が下がるよう、
+      // 割引額の受け皿を用意して合計の式から引いておく
+      upsertState(spec, { key: 'couponDiscount', label: 'クーポン割引', type: 'number', initialValue: 0 });
+      const total = spec.derived?.find((d) => d.key === 'total');
+      if (total && !total.expression.includes('couponDiscount')) {
+        total.expression = `${total.expression} - couponDiscount`;
+      }
       spec.components.push({
         id: 'popup-coupon',
         type: 'popup',
@@ -764,7 +771,7 @@ export const COFFEE_BEANS_THEME: ThemeDefinition = {
   ],
   implementerNotes: [
     '注文を確定するボタンには role を primary_action にし、actions に { "type": "complete_task", "message": "ご購入ありがとうございます" } を必ず残してください。',
-    '合計金額などの計算は derived に式で書き、表示はラベルに {total} のように状態キーを差し込んでください。割引や特典を足すときは upsert_state と upsert_derived で total の計算式にも反映してください。',
+    '合計金額などの計算は derived に式で書き、表示はラベルに {total} のように状態キーを差し込んでください。割引や特典を足すときは upsert_state と upsert_derived で total の計算式にも反映してください。ただし状態 couponDiscount（クーポン割引、最初は0）があるときは、total の式がすでにそれを引いているので、クーポンを使う部品には { "type": "set_state", "targetKey": "couponDiscount", "value": 500 } のような動きを付けるだけにし、計算式は変えないでください。',
     '確認画面を作るときは、状態 step を追加し、visibleWhen で入力画面と確認画面を切り替えてください。確認画面へ進むボタンも role は primary_action です。',
     '合計金額と注文を確定するボタンは style.sticky を true にして画面下に固定してください。',
     '部品の style.skin（intrusive や native）や style.variant は、人間から「見た目を落ち着かせて」「元のデザインに揃えて」「色を変えて」など見た目を変える指示があったときだけ変更し、動きや文字だけの指示では元の値をそのまま残してください。',

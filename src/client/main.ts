@@ -1,4 +1,10 @@
-import { detectHitComponents, type Point2D, type Rect2D } from '../shared/hitTest.ts';
+import {
+  clipToVisibleRects,
+  detectHitComponents,
+  type LayeredRect2D,
+  type Point2D,
+  type Rect2D,
+} from '../shared/hitTest.ts';
 import { createInitialState, hasCompletionAction, withDerivedValues } from '../shared/appRuntime.ts';
 import {
   ACTIVE_THEME,
@@ -207,7 +213,7 @@ function getCurrentSpec(): AppSpec {
   return getCurrentCheckpoint().spec;
 }
 
-/** 指定した番号以前で、いま選んでいる顧客層のお客さんの反応を見た一番新しい記録を探す */
+/** 指定した番号以前で、お客さんの反応を見た一番新しい記録を探す（1回の挑戦は1つの客層なので、客層では絞らない） */
 function findLatestCohortEvaluation(
   fromIndex: number = state.activeCheckpointIndex,
 ): { checkpoint: Checkpoint; index: number; evaluation: EvaluationResponse } | undefined {
@@ -707,22 +713,29 @@ function isPartlyVisible(el: HTMLElement, r: DOMRect): boolean {
 function collectComponentRects(container: HTMLElement): Rect2D[] {
   const containerRect = container.getBoundingClientRect();
   const elements = querySandboxComponentElements(container);
-  const rects: Rect2D[] = [];
+  const rects: LayeredRect2D[] = [];
+  let viewport = { width: containerRect.width, height: containerRect.height };
   for (const el of elements) {
     const id = el.dataset.componentId;
     if (!id) continue;
     const r = el.getBoundingClientRect();
     if (!isPartlyVisible(el, r)) continue;
     const isInsideIframe = el.ownerDocument !== document;
+    const view = el.ownerDocument.defaultView;
+    if (isInsideIframe && view) viewport = { width: view.innerWidth, height: view.innerHeight };
     rects.push({
       id,
       left: isInsideIframe ? r.left : r.left - containerRect.left,
       top: isInsideIframe ? r.top : r.top - containerRect.top,
       right: isInsideIframe ? r.right : r.right - containerRect.left,
       bottom: isInsideIframe ? r.bottom : r.bottom - containerRect.top,
+      // 画面下に固定した帯と広告は、その下の部品を隠す
+      occludes: el.classList.contains('is-sticky') || el.classList.contains('inapp-popup-card'),
+      pinned: el.classList.contains('is-sticky'),
     });
   }
-  return rects;
+  // 隠れた部分や画面の外の部分は囲みの判定に使わない
+  return clipToVisibleRects(rects, viewport);
 }
 
 function redrawPenCanvas(): void {
@@ -1029,6 +1042,68 @@ function buildChatHistory(): ChatHistoryEntry[] {
 /** 赤ペンで囲んだ部品について、お助けエージェントが受け止めて尋ねる。画面は変えず、囲みも残す */
 let circleRequestSeq = 0;
 let circleInFlight = false;
+
+// ============================================================================
+// 待ち時間の表示
+// ============================================================================
+
+/** 返事を待ち始めてからこの秒数を過ぎたら、経過した秒数を出す */
+const WAIT_NOTE_AFTER_SEC = 5;
+/** この秒数を過ぎたら、混み合っているかもしれないことと、送り直してよいことを添える */
+const WAIT_BUSY_AFTER_SEC = 15;
+/** 今の待ちが始まった時刻。待っていないときは null */
+let waitStartedAt: number | null = null;
+
+function isWaitingForAi(): boolean {
+  return state.chatLoading || state.evaluateLoading;
+}
+
+/** 待っている間の1行。止まったのか動いているのかが分かるよう、経過した秒数を出す */
+function waitNoteText(elapsedSec: number): string {
+  const seconds = `\`${elapsedSec}秒\``;
+  if (elapsedSec < WAIT_BUSY_AFTER_SEC) return `待っています ${seconds}`;
+  const retry = state.evaluateLoading
+    ? '少しして、もう一度お客さんの反応を見てください'
+    : '少しして、もう一度送ってください';
+  return `混み合っているようです。このまま待つか、${retry} ${seconds}`;
+}
+
+function waitElapsedSec(): number {
+  return waitStartedAt === null ? 0 : Math.floor((performance.now() - waitStartedAt) / 1000);
+}
+
+function buildWaitNoteRow(): HTMLElement {
+  const row = document.createElement('div');
+  row.className = 'chat-system-row chat-wait-note';
+  const line = document.createElement('div');
+  line.className = 'chat-system-line is-wait';
+  appendFormattedSystemText(line, waitNoteText(waitElapsedSec()));
+  row.appendChild(line);
+  return row;
+}
+
+/** 1秒ごとに待ち時間を数え、チャットの表示を作り直さずに、待っている間の1行だけを書き換える */
+function tickWaitNote(): void {
+  if (!isWaitingForAi()) {
+    waitStartedAt = null;
+    chatScrollEl?.querySelector('.chat-wait-note')?.remove();
+    return;
+  }
+  if (waitStartedAt === null) waitStartedAt = performance.now();
+  if (waitElapsedSec() < WAIT_NOTE_AFTER_SEC) return;
+  const stream = chatScrollEl;
+  if (!stream) return;
+  const existing = stream.querySelector('.chat-wait-note');
+  const next = buildWaitNoteRow();
+  if (existing) {
+    existing.replaceWith(next);
+  } else {
+    stream.appendChild(next);
+    scrollToLatestMessage();
+  }
+}
+
+window.setInterval(tickWaitNote, 1000);
 
 async function reactToCircle(targetIds: string[]): Promise<void> {
   // 誰のために直すかを選ぶ前や、改造中・質問への回答待ちのときは割り込まない
@@ -1728,7 +1803,12 @@ async function handleEvaluate(): Promise<void> {
           typingMs: 0,
         });
       }
-      const report = describeOtherCohortReport(currentSpec, otherPersonas, componentBounds);
+      const report = describeOtherCohortReport(
+        currentSpec,
+        otherPersonas,
+        componentBounds,
+        TARGET_COHORTS,
+      );
       queued.push({
         message: {
           role: 'system',
@@ -1736,8 +1816,18 @@ async function handleEvaluate(): Promise<void> {
         },
         typingMs: 0,
       });
-      for (const line of report.lines) {
-        queued.push({ message: { role: 'system', text: line }, typingMs: 0 });
+      // 客層ごとに見出しを付け、次にどの客層を選べばその人のために直せるかが分かるようにする
+      for (const group of report.groups) {
+        queued.push({
+          message: {
+            role: 'system',
+            text: `\`${group.label}\` の客層 満足しそうなのは \`${group.total}人中${group.achieved}人\``,
+          },
+          typingMs: 0,
+        });
+        for (const line of group.lines) {
+          queued.push({ message: { role: 'system', text: line }, typingMs: 0 });
+        }
       }
       queued.push({
         message: {
@@ -1767,6 +1857,31 @@ async function handleEvaluate(): Promise<void> {
     renderStudio();
     scrollToLatestMessage();
   }
+}
+
+/**
+ * 誰のために直すかを選ぶ前の案内。紹介の会話が流れている間は、まだ選ぶボタンが出ていないので待つように伝え、
+ * ボタンが出たら、チャットの中のボタンから選ぶように伝える
+ */
+function cohortSelectionGuidance(): string {
+  const selectorShown = state.messages.some((m) => m.showCohortSelector);
+  return selectorShown
+    ? 'チャットのボタンから、誰のために直すかを選んでください'
+    : '店長の話のあとで、誰のために直すかを選びます';
+}
+
+/** 「対象 未選択」を押したとき、チャットの選ぶボタンまでスクロールして光らせる。まだ出ていなければ会話の最後へ */
+function focusCohortSelector(): void {
+  const rows = chatScrollEl?.querySelectorAll<HTMLElement>('.cohort-pill-row');
+  const row = rows && rows.length > 0 ? rows[rows.length - 1] : null;
+  if (!row) {
+    scrollToLatestMessage();
+    return;
+  }
+  row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  row.classList.remove('is-attention');
+  void row.offsetWidth;
+  row.classList.add('is-attention');
 }
 
 function renderCohortSelector(msg: TimelineMessage, isLatestSelector: boolean): HTMLElement {
@@ -2223,6 +2338,11 @@ function renderChatPanel(): HTMLElement {
     stream.appendChild(row);
   }
 
+  // 返事が遅いときは、経過した秒数を出す（以降は1秒ごとに tickWaitNote が書き換える）
+  if (isWaitingForAi() && waitElapsedSec() >= WAIT_NOTE_AFTER_SEC) {
+    stream.appendChild(buildWaitNoteRow());
+  }
+
   chatCard.appendChild(stream);
 
   const composer = document.createElement('div');
@@ -2311,7 +2431,7 @@ function renderChatPanel(): HTMLElement {
   input.className = 'composer-input';
   input.disabled = isCohortLocked;
   input.placeholder = isCohortLocked
-    ? 'まず上のボタンから、誰のために直すかを選んでください'
+    ? cohortSelectionGuidance()
     : state.runFinished
       ? '挑戦は終わりました。やり直すとまた手直しできます（店長とお客さんには質問できます）'
       : state.isRecordingAudio
@@ -2346,7 +2466,7 @@ function renderChatPanel(): HTMLElement {
   micBtn.className = `btn-composer-mic${state.isRecordingAudio ? ' is-recording' : ''}`;
   micBtn.disabled = isCohortLocked || state.chatLoading || state.isTranscribingAudio;
   micBtn.title = isCohortLocked
-    ? '先に上のボタンから、誰のために直すかを選んでください'
+    ? cohortSelectionGuidance()
     : state.isRecordingAudio
       ? '録音を終えて入力欄に反映する'
       : state.isTranscribingAudio
@@ -2476,8 +2596,14 @@ function renderStudio(): void {
     const goalGroup = document.createElement('div');
     goalGroup.className = 'goal-status-group';
 
-    const cohortBadge = document.createElement('div');
-    cohortBadge.className = `goal-cohort-badge${cohort ? '' : ' is-empty'}`;
+    // まだ選んでいないときは押せるようにし、押すとチャットの選ぶボタンへ案内する
+    const cohortBadge = document.createElement(cohort ? 'div' : 'button');
+    cohortBadge.className = `goal-cohort-badge${cohort ? '' : ' is-empty is-clickable'}`;
+    if (!cohort) {
+      (cohortBadge as HTMLButtonElement).type = 'button';
+      cohortBadge.title = cohortSelectionGuidance();
+      cohortBadge.addEventListener('click', focusCohortSelector);
+    }
     const cohortLabelEl = document.createElement('span');
     cohortLabelEl.className = 'goal-badge-prefix';
     cohortLabelEl.textContent = '対象';
@@ -2573,7 +2699,7 @@ function renderStudio(): void {
     penModeBtn.className = `header-mode-btn is-pen ${state.interactionMode === 'pen' ? 'is-active' : ''}`;
     penModeBtn.disabled = !state.selectedCohortId;
     if (!state.selectedCohortId) {
-      penModeBtn.title = '先にチャットで、誰のために直すかを選んでください';
+      penModeBtn.title = cohortSelectionGuidance();
     }
     penModeBtn.innerHTML = `${ICONS.pen}<span>赤ペンで囲む</span>`;
     penModeBtn.addEventListener('click', () => {
@@ -2593,7 +2719,7 @@ function renderStudio(): void {
     evalBtn.disabled = state.evaluateLoading || !state.selectedCohortId || state.runFinished;
     // 押せない間は目立たない色にして、最初に目が行かないようにする
     evalBtn.classList.toggle('is-locked', !state.selectedCohortId);
-    if (!state.selectedCohortId) evalBtn.title = '先にチャットで、誰のために直すかを選んでください';
+    if (!state.selectedCohortId) evalBtn.title = cohortSelectionGuidance();
     evalBtn.innerHTML = `${ICONS.evaluate}<span>${
       state.evaluateLoading ? '反応を確認中...' : 'お客さんの反応を見る'
     }</span>`;

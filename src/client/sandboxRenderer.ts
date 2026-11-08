@@ -4,7 +4,9 @@ import {
   hasCompletionAction,
   isComponentVisible,
   isInputFilled,
+  coerceStateValue,
   isSafeStateKey,
+  parseSetStateAttribute,
   renderLabel,
   renderTemplate,
   withDerivedValues,
@@ -17,7 +19,7 @@ import {
   sanitizeCustomCss,
   sanitizeCustomHtml,
 } from '../shared/sandboxValidator.ts';
-import type { AppComponent, AppSpec, ComponentAction, StateValue } from '../shared/types.ts';
+import type { AppComponent, AppSpec, ComponentAction } from '../shared/types.ts';
 
 export interface SandboxCallbacks {
   /** 状態をまるごと置き換える */
@@ -66,16 +68,6 @@ function watchParentStyles(iframe: HTMLIFrameElement): void {
 }
 
 /** 状態変数の型に合わせて入力値を変換する */
-function coerceStateValue(spec: AppSpec, key: string, raw: string): StateValue {
-  const def = spec.state.find((s) => s.key === key);
-  if (def?.type === 'number') {
-    const n = Number(raw);
-    return Number.isFinite(n) ? n : 0;
-  }
-  if (def?.type === 'boolean') return raw === 'true';
-  return raw;
-}
-
 /**
  * 購入完了・別ページへの移動の演出用の内部状態。
  * お題アプリの状態とは別に、キー名の先頭を __ にして持つ（初期状態に戻すと消える）。
@@ -738,16 +730,7 @@ export function renderSandboxApp(
           const acts: ComponentAction[] = [];
           const setSpec = el.dataset.setState;
           if (setSpec) {
-            for (const pair of setSpec.split(';')) {
-              const eqIdx = pair.indexOf(':');
-              if (eqIdx > 0) {
-                const k = pair.slice(0, eqIdx).trim();
-                const v = pair.slice(eqIdx + 1).trim();
-                if (isSafeStateKey(k)) {
-                  acts.push({ type: 'set_state', targetKey: k, value: coerceStateValue(spec, k, v) });
-                }
-              }
-            }
+            acts.push(...parseSetStateAttribute(spec, setSpec));
           }
           if (el.dataset.toggleState) {
             const k = el.dataset.toggleState.trim();

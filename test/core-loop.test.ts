@@ -22,7 +22,7 @@ import {
   toKanjiNumber,
   withDerivedValues,
 } from '../src/shared/appRuntime.ts';
-import { detectHitComponents, type Rect2D } from '../src/shared/hitTest.ts';
+import { clipToVisibleRects, detectHitComponents, type Rect2D } from '../src/shared/hitTest.ts';
 import {
   ACTIVE_THEME,
   ALL_REVIEWER_PERSONAS,
@@ -32,6 +32,7 @@ import {
   sanitizeCssColor,
   sanitizeCustomCss,
   sanitizeCustomHtml,
+  COUPON_FRICTIONS,
   simulatePersonaComputerUse,
   validateSandboxSpec,
 } from '../src/shared/sandboxValidator.ts';
@@ -58,7 +59,7 @@ import {
   recordPromptTelemetryEvent,
 } from '../src/server/store.ts';
 import { buildInitialSpec, buildScenarioSpec, findComponent } from '../src/shared/theme.ts';
-import type { AppSpec, ReviewOutcome, SpecPatch } from '../src/shared/types.ts';
+import type { AppComponent, AppSpec, ReviewOutcome, SpecPatch } from '../src/shared/types.ts';
 
 // テストは AI に接続しない前提で実行する（package.json の test スクリプトで接続設定を空にしている）
 
@@ -118,6 +119,43 @@ describe('core-loop', () => {
       { x: 30, y: 50 },
     ];
     assert.deepEqual(detectHitComponents(partial, rects), ['product-hero']);
+  });
+
+  it('画面下に固定した帯の裏に隠れた部品は、帯の注文ボタンを囲んでもいっしょに選ばない', () => {
+    // ブラウザで測った配置：お支払い方法（644〜839）の中心が、画面下に固定した合計と注文ボタンの帯の裏にある
+    const viewport = { width: 442, height: 806 };
+    const layered = [
+      { id: 'btn-buy-now', left: 16, top: 342, right: 426, bottom: 417 },
+      { id: 'choice-payment', left: 16, top: 644, right: 426, bottom: 839 },
+      { id: 'check-subscription', left: 16, top: 851, right: 426, bottom: 865 },
+      { id: 'total-price', left: 18, top: 736, right: 75, bottom: 774, occludes: true, pinned: true },
+      { id: 'btn-order', left: 89, top: 724, right: 424, bottom: 786, occludes: true, pinned: true },
+    ];
+    const visible = clipToVisibleRects(layered, viewport);
+    // 画面の外の部品は外れ、帯に下の端を隠された部品は見えている部分だけになる
+    assert.equal(visible.some((r) => r.id === 'check-subscription'), false);
+    assert.deepEqual(visible.find((r) => r.id === 'choice-payment'), {
+      id: 'choice-payment',
+      left: 16,
+      top: 644,
+      right: 426,
+      bottom: 724,
+    });
+    // 注文ボタンを楕円で囲む
+    const loop = Array.from({ length: 37 }, (_, i) => {
+      const a = (i / 36) * 2 * Math.PI;
+      return { x: 256 + 190 * Math.cos(a), y: 755 + 45 * Math.sin(a) };
+    });
+    assert.ok(detectHitComponents(loop, layered).includes('choice-payment'), '隠れた部分を除かないと選ばれてしまう');
+    assert.deepEqual(detectHitComponents(loop, visible), ['btn-order']);
+    // 見えている部分を囲めば、隠れかけた部品も選べる
+    const paymentLoop = [
+      { x: 20, y: 650 },
+      { x: 420, y: 650 },
+      { x: 420, y: 715 },
+      { x: 20, y: 715 },
+    ];
+    assert.deepEqual(detectHitComponents(paymentLoop, visible), ['choice-payment']);
   });
 
   it('計算式で合計金額を求め、漢数字でも表示できる', () => {
@@ -389,12 +427,18 @@ describe('core-loop', () => {
       },
     ]).updatedSpec;
 
-    // 2手目：広告を消さずに閉じやすくすると、定期便の罠が表に出る
+    // 2手目：広告を消さずに、閉じやすく、その場で500円引きになるクーポンにすると、定期便の罠が表に出る
     const popup = findComponent(fixed, 'popup-coupon');
-    const couponFixed = step(fixed, '広告を閉じやすくしました', [
+    const couponFixed = step(fixed, '広告をその場で使えるクーポンにしました', [
       {
         op: 'replace_component',
-        component: { ...popup, closePosition: 'bottom-bar', closeSize: 'lg', closeLabel: 'あとで見る' },
+        component: {
+          ...popup,
+          closePosition: 'bottom-bar',
+          closeSize: 'lg',
+          closeLabel: '500円引きを使う',
+          actions: [{ type: 'set_state', targetKey: 'couponDiscount', value: 500 }],
+        },
       },
     ]).updatedSpec;
     assert.ok(outcomes(couponFixed).some((r) => r.outcome === 'regretted'));
@@ -444,7 +488,8 @@ describe('core-loop', () => {
     Object.assign(findComponent(spec, 'popup-coupon'), {
       closePosition: 'bottom-bar',
       closeSize: 'lg',
-      closeLabel: 'あとで見る',
+      closeLabel: '500円引きを使う',
+      actions: [{ type: 'set_state', targetKey: 'couponDiscount', value: 500 }],
     });
 
     // 確認なし：ほかの客層の6人は全員買える
@@ -617,11 +662,24 @@ describe('core-loop', () => {
       style: { size: 'sm', variant: 'default' },
     });
     const others = ALL_REVIEWER_PERSONAS.filter((p) => p.cohortId !== 'thrifty');
-    const report = describeOtherCohortReport(spec, others);
+    const report = describeOtherCohortReport(spec, others, undefined, ACTIVE_THEME.cohorts);
     assert.equal(report.total, 6);
     assert.equal(report.lines.length, 6);
     assert.equal(report.achieved, 5);
-    assert.ok(report.lines.some((l) => l === '`スマホに不慣れなお客さん` は `注文前に確認できない` ため離脱しそう'));
+    assert.ok(
+      report.lines.some(
+        (l) => l === '`スマホに不慣れなお客さん` は `注文を確定する前に内容を確かめる画面がなかった` ため離脱しそう',
+      ),
+    );
+    // 客層ごとにまとまり、客層の名前が付く。次にどの客層を選べばその人のために直せるかが分かる
+    assert.deepEqual(
+      report.groups.map((g) => [g.label, g.total, g.achieved]),
+      [
+        ['確実に買いたい人', 3, 2],
+        ['さっと買いたい人', 3, 3],
+      ],
+    );
+    assert.ok(report.groups[0].lines.some((l) => l.startsWith('`スマホに不慣れなお客さん`')));
     assert.ok(report.lines.some((l) => l.endsWith('は気持ちよく買えそう')));
     for (const line of report.lines) assert.doesNotMatch(line, /[()（）「」『』]/);
   });
@@ -1095,7 +1153,7 @@ describe('core-loop', () => {
             closeSize: 'lg',
             closeLabel: 'あとで見る',
             style: { ...popupComp.style, skin: 'native', variant: 'default' },
-            actions: [{ type: 'set_state', targetKey: 'couponApplied', value: true }],
+            actions: [{ type: 'set_state', targetKey: 'couponDiscount', value: 500 }],
           },
         },
       ],
@@ -1123,7 +1181,7 @@ describe('core-loop', () => {
             role: 'info',
             label: '🎁 今なら300円OFFクーポンをご利用いただけます',
             style: { variant: 'default', size: 'sm', skin: 'native' },
-            actions: [{ type: 'set_state', targetKey: 'couponApplied', value: true }],
+            actions: [{ type: 'set_state', targetKey: 'couponDiscount', value: 500 }],
           },
         },
       ],
@@ -1132,6 +1190,50 @@ describe('core-loop', () => {
     assert.ok(bannerized.ownerReaction?.includes('広告を消さずに押しやすく工夫して残してくれた'));
     assert.equal(outcomeOf(bannerized.updatedSpec, 'kazuko'), 'achieved');
     assert.equal(outcomeOf(bannerized.updatedSpec, 'shota'), 'achieved');
+  });
+
+  it('クーポンを使いたい人は、クーポンで実際に合計が下がったときだけ満足する', () => {
+    // クーポン広告があるときだけ、割引額の受け皿が用意され、合計の式から引かれる
+    assert.equal(cleanSpec().state.some((v) => v.key === 'couponDiscount'), false);
+    const withPopup = withAnnoyance(cleanSpec(), 'coupon_popup');
+    assert.equal(withPopup.state.find((v) => v.key === 'couponDiscount')?.initialValue, 0);
+    assert.match(withPopup.derived?.find((d) => d.key === 'total')?.expression ?? '', /- couponDiscount$/);
+    const popupComp = findComponent(withPopup, 'popup-coupon');
+    const replacePopup = (component: AppComponent) =>
+      applyPatchesToSpecWithValidation(withPopup, 'クーポンを直しました', [
+        { op: 'replace_component', component },
+      ]).updatedSpec;
+    const shota = (spec: AppSpec) => simulatePersonaComputerUse(spec, persona('shota'));
+
+    // 閉じやすくしただけで、押すと会員登録に飛ぶままなら、使えない
+    const closableOnly = replacePopup({ ...popupComp, closePosition: 'bottom-bar', closeSize: 'lg' });
+    assert.equal(shota(closableOnly).outcome, 'bothered');
+    assert.equal(shota(closableOnly).frictionPoint, COUPON_FRICTIONS.unusable);
+
+    // 押せるが合計が変わらないクーポンでは、満足しない
+    const noDiscount = replacePopup({
+      ...popupComp,
+      type: 'status_banner',
+      role: 'info',
+      style: { variant: 'default', size: 'sm', skin: 'native' },
+      actions: [{ type: 'set_state', targetKey: 'couponApplied', value: true }],
+    });
+    assert.equal(shota(noDiscount).outcome, 'bothered');
+    assert.equal(shota(noDiscount).frictionPoint, COUPON_FRICTIONS.noDiscount);
+
+    // 独自の部品でも、data-set-state で割引額を入れれば合計が下がり、満足する
+    const custom = replacePopup({
+      ...popupComp,
+      type: 'custom',
+      role: 'info',
+      label: '500円OFFクーポン',
+      style: { variant: 'default', size: 'md', skin: 'native' },
+      customHtml: '<button type="button" data-set-state="couponDiscount:500">500円OFFクーポンを使う</button>',
+      actions: [],
+    });
+    const result = shota(custom);
+    assert.equal(result.outcome, 'achieved');
+    assert.equal(result.finalState?.total, (withPopup.state.find((v) => v.key === 'unitPrice')?.initialValue as number) + 600 - 500);
   });
 
   it('サンドボックス内で自由なカスタムHTML部品やワンタップ入力ショートカットを追加して検証できる', () => {
@@ -1234,8 +1336,9 @@ describe('core-loop', () => {
             ...popupComp,
             closePosition: 'bottom-bar',
             closeSize: 'lg',
-            closeLabel: 'あとで見る',
+            closeLabel: '500円引きを使う',
             style: { ...popupComp.style, skin: 'native', variant: 'default' },
+            actions: [{ type: 'set_state', targetKey: 'couponDiscount', value: 500 }],
           },
         },
         {

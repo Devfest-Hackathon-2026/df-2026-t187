@@ -63,26 +63,49 @@ const REPORT_ENDINGS: Record<ReviewOutcome, string> = {
   regretted: 'ため後悔しそう',
 };
 
+export interface OtherCohortReportGroup {
+  cohortId: string;
+  /** 客層の名前。分からないときは客層のID */
+  label: string;
+  achieved: number;
+  total: number;
+  lines: string[];
+}
+
 /**
  * クリアしたときのレポート用に、選ばなかった客層のお客さん一人ひとりが今の画面をどう思いそうかを1行ずつ返す。
+ * 次にどの客層を選べばその人のために直せるかが分かるよう、客層ごとのまとまり（groups）も返す。
  * 判定はコードのシミュレーションだけで行う
  */
 export function describeOtherCohortReport(
   spec: AppSpec,
   otherPersonas: ReviewerPersona[],
   bounds?: ComponentBoundsInput[],
-): { achieved: number; total: number; lines: string[] } {
+  cohorts: Array<{ id: string; label: string }> = [],
+): { achieved: number; total: number; lines: string[]; groups: OtherCohortReportGroup[] } {
   const lines: string[] = [];
+  const groups: OtherCohortReportGroup[] = [];
   let achieved = 0;
   for (const persona of otherPersonas) {
     const result = simulatePersonaComputerUse(spec, persona, bounds);
+    let line: string;
     if (result.outcome === 'achieved') {
       achieved++;
-      lines.push(`\`${persona.name}\` は${REPORT_ENDINGS.achieved}`);
+      line = `\`${persona.name}\` は${REPORT_ENDINGS.achieved}`;
     } else {
       const reason = result.frictionPoint ?? '理由が分からない';
-      lines.push(`\`${persona.name}\` は \`${reason}\` ${REPORT_ENDINGS[result.outcome]}`);
+      line = `\`${persona.name}\` は \`${reason}\` ${REPORT_ENDINGS[result.outcome]}`;
     }
+    lines.push(line);
+    let group = groups.find((g) => g.cohortId === persona.cohortId);
+    if (!group) {
+      const label = cohorts.find((c) => c.id === persona.cohortId)?.label ?? persona.cohortId;
+      group = { cohortId: persona.cohortId, label, achieved: 0, total: 0, lines: [] };
+      groups.push(group);
+    }
+    group.total++;
+    if (result.outcome === 'achieved') group.achieved++;
+    group.lines.push(line);
   }
-  return { achieved, total: otherPersonas.length, lines };
+  return { achieved, total: otherPersonas.length, lines, groups };
 }

@@ -7,12 +7,15 @@ import {
   isHonestOptInComponent,
   isInputFilled,
   matchesCondition,
+  parseSetStateAttribute,
   renderLabel,
+  withDerivedValues,
   type AppState,
 } from './appRuntime.ts';
 import type {
   AppComponent,
   AppSpec,
+  ComponentAction,
   ComponentBoundsInput,
   ComponentSize,
   ReviewerPersona,
@@ -465,7 +468,7 @@ const FAILURE_TEXT: Record<FailureReason, { friction: string; comment: string }>
     comment: '時間がかかりすぎて、途中でやめてしまった',
   },
   no_confirmation: {
-    friction: '注文前に確認できない',
+    friction: '注文を確定する前に内容を確かめる画面がなかった',
     comment: '確かめられないまま注文するのが怖くて、押せなかった',
   },
   total_unreadable: {
@@ -500,6 +503,26 @@ function isSubscriptionComponent(comp: AppComponent): boolean {
     comp.label.includes('定期') ||
     Boolean(comp.customHtml && (comp.customHtml.includes('定期') || comp.customHtml.includes('subscription')))
   );
+}
+
+/** クーポンを使いたかった人の不満。使えなかったか、使っても安くならなかったか、無くなっていたか */
+export const COUPON_FRICTIONS = {
+  missing: 'クーポンがなくなっていた',
+  unusable: 'クーポンがあったのに使えなかった',
+  noDiscount: 'クーポンを使っても安くならなかった',
+} as const;
+
+/**
+ * クーポンの部品を押したときの動き。独自の部品（customHtml）で動きが部品の外に書かれていないときは、
+ * HTMLの data-set-state から読む
+ */
+function couponActionsOf(spec: AppSpec, comp: AppComponent): ComponentAction[] {
+  if (comp.actions.length > 0 || !comp.customHtml) return comp.actions;
+  const acts: ComponentAction[] = [];
+  for (const m of comp.customHtml.matchAll(/data-set-state\s*=\s*(?:"([^"]*)"|'([^']*)')/gi)) {
+    acts.push(...parseSetStateAttribute(spec, m[1] ?? m[2] ?? ''));
+  }
+  return acts;
 }
 
 function isCouponComponent(comp: AppComponent): boolean {
@@ -551,6 +574,19 @@ export function simulatePersonaComputerUse(
   let sawSubscriptionOption = false;
   // クーポンは実際に目にしたときだけ「見た」とする（画面内の表示を見たか、クーポン広告が出たとき）
   let sawCouponFeature = false;
+  // クーポンを押してみたか、押して実際に合計が下がったか。下がらなければ、使いたかった人は満足しない
+  let triedCoupon = false;
+  let couponLoweredTotal = false;
+  /** クーポンの動きを適用し、合計が下がったかを記録する。合計の計算がない題材では、適用できたことをもって使えたとする */
+  const useCoupon = (actions: ComponentAction[]): void => {
+    triedCoupon = true;
+    const before = withDerivedValues(spec, state).total;
+    state = applyActions(spec, state, actions).state;
+    const after = state.total;
+    if (typeof before !== 'number' || typeof after !== 'number' || after < before) {
+      couponLoweredTotal = true;
+    }
+  };
   /** 買えたとしても嫌な思いをしたこと。1つでもあれば「買えたけど不満」になる */
   const bothers: Array<{ friction: string; comment: string }> = [];
 
@@ -630,8 +666,9 @@ export function simulatePersonaComputerUse(
         (SIZE_RANK[effectiveCloseSize] ?? 0) >= SIZE_RANK.md ||
         hasCustomCloseLabel ||
         Boolean(popup.customHtml);
+      const popupActions = isCouponComponent(popup) ? couponActionsOf(spec, popup) : popup.actions;
       const hasHelpfulAction =
-        popup.actions.length > 0 && !popup.actions.some((a) => a.type === 'open_page');
+        popupActions.length > 0 && !popupActions.some((a) => a.type === 'open_page');
 
       const closeCompForRead: AppComponent = {
         ...popup,
@@ -672,7 +709,11 @@ export function simulatePersonaComputerUse(
           comment: '途中で広告が出てきて、閉じるのが面倒だった',
         });
       } else if (hasHelpfulAction) {
-        state = applyActions(spec, state, popup.actions).state;
+        if (isCouponComponent(popup)) {
+          useCoupon(popupActions);
+        } else {
+          state = applyActions(spec, state, popupActions).state;
+        }
         actionTrace.push(`画面確認: ${popup.label}の特典を適用して閉じた`);
       } else {
         actionTrace.push(`画面確認: 押しやすい閉じるボタンで${popup.label}をさっと閉じた`);
@@ -816,15 +857,16 @@ export function simulatePersonaComputerUse(
     // 4c. 画面内に残されたクーポンバナーや特典ボタンがあれば確認・適用する
     for (const comp of visible.filter((v) => v.type !== 'popup' && isCouponComponent(v))) {
       sawCouponFeature = true;
+      const actions = couponActionsOf(spec, comp);
       if (
         !appliedInlineCouponIds.has(comp.id) &&
-        comp.actions.length > 0 &&
+        actions.length > 0 &&
         !hasCompletionAction(comp) &&
-        !comp.actions.some((a) => a.type === 'open_page' || a.type === 'reset_all') &&
+        !actions.some((a) => a.type === 'open_page' || a.type === 'reset_all') &&
         canRead(comp, persona)
       ) {
         appliedInlineCouponIds.add(comp.id);
-        state = applyActions(spec, state, comp.actions).state;
+        useCoupon(actions);
         actionTrace.push(`画面確認: ${comp.label}の特典を適用した`);
       }
     }
@@ -971,9 +1013,23 @@ export function simulatePersonaComputerUse(
       if (c.wantsCoupon && hadCouponInShop && !sawCouponFeature) {
         actionTrace.push('画面確認: クーポンを使いたかったが見当たらなかった');
         bothers.push({
-          friction: 'クーポンがなくなっていた',
+          friction: COUPON_FRICTIONS.missing,
           comment: 'クーポンは無くなってしまったのか、使いたかったのに残念',
         });
+      } else if (c.wantsCoupon && hadCouponInShop && !couponLoweredTotal) {
+        if (triedCoupon) {
+          actionTrace.push('画面確認: クーポンを使ったが、合計金額が変わっていなかった');
+          bothers.push({
+            friction: COUPON_FRICTIONS.noDiscount,
+            comment: 'クーポンを使ったのに、合計が安くなっていなかった',
+          });
+        } else {
+          actionTrace.push('画面確認: クーポンの表示はあったが、この画面で使う方法がなかった');
+          bothers.push({
+            friction: COUPON_FRICTIONS.unusable,
+            comment: 'クーポンがあるのに、ここで使えなくて残念',
+          });
+        }
       }
       if (bothers.length > 0) {
         return {

@@ -40,7 +40,7 @@
    - 依頼主の店長が事情を話したあと、システムメッセージで「誰のために手直ししますか」と尋ねます。選んだ顧客層の3人（客A・客B・客C）が来店し、それぞれの希望や困りごとを話します。
 2. **ダメ出しと質問・対話**
    - スマートフォン実機プレビューの気になる部品を赤ペンで囲むか、チャット入力欄から自然言語で送信します（マイク音声入力にも対応）。
-   - 宛先ピル（`お助けAI`・`店長`・`客A`・`客B`・`客C` の切り替え、または `@店長` `お客さん、` などの呼びかけ）で直接質問・相談できます。
+   - 宛先ピル（`お助けAI`・`店長`・`お客さん` の切り替え、または `@店長` `お客さん、` などの呼びかけ）で直接質問・相談できます。
    - 質問にはお助けAIが画面の実際の仕様にある事実だけで短く答え、誰が喜ぶか・困るかといった判断は代弁しません。
 3. **手直しする**
    - 「どう直すか」の具体的な指示だけでなく、「誰のために・どうしたいか（例：うっかり定期便になるのを防ぎつつ、望む人は申し込めるようにしたい）」という目的つきの指示も送れます。実装AIが最小限の差分パッチ（部品の削除・差し替え・追加・移動と状態の変更）を生成し、画面を書き換えます。触っていない部品は変わらないため、手直ししてもデザインが崩れません。
@@ -55,8 +55,9 @@
    - あわせて、**選ばなかった残りの客層（6人）が今の画面を触ったらどうなるか**も1行のシステムメッセージで表示され、「誰のために直したかで別の誰かにどんな影響が出たか」を確認できます。
 5. **トレードオフを判断して次の改善を回す**
    - まだ満足できていないお客さんに理由を聞いたり、売上が減って困っている店長の意見を聞いたりしながら、「ただ消す」のではなく「誰のためにどう整えて残すか」を判断して次の手直しへ進みます。
-   - プレイ中の発言は、店長や顧客への質問（探索型）と画面の手直し指示（実行型）に分離して記録されます。指示の型（単純削除型・条件設計型・具体修正型・丸投げ型）は決定論的ルールを優先して分類し、定型ルールで決まらない指示を Vertex AI Text Embeddings (`text-multilingual-embedding-002`) の類似度で補完します。また、対象語・条件の抽出や判断履歴・行動テレメトリの記録はコード内での決定論的抽出・メモリ保持を基本とし、Google Cloud 設定時には Cloud Natural Language API・Cloud Firestore・BigQuery と連携します。
-   - 選んだ顧客層3人全員が満足してステージをクリアした瞬間、LLMの主観採点ではなく「情報聞き出し回数・手直し指示回数・同じ部品への手戻り回数・初回成功率」と「どの指示への改善が決め手になったか」が実プロンプト引用つきでレポート表示されます。クリア後に別の顧客層へ挑戦するときは画面を初期状態にリセットし、客層ごとのトレードオフを改めて体験できます。
+   - プレイ中の発言は、店長や顧客への質問（探索型）と画面の手直し指示（実行型）に分離して記録されます。指示の型（単純削除型・条件設計型・具体修正型・丸投げ型）は決定論的ルールを優先して分類し、定型ルールで決まらない指示を Vertex AI Text Embeddings (`text-multilingual-embedding-002`) の類似度で補完します。対象語・条件の抽出はコード内の規則で行い、Cloud Natural Language API が有効なプロジェクトではその抽出結果で補います（無効・失敗時は規則の結果だけを使います）。判断履歴・行動テレメトリはメモリに保持し、Cloud Firestore・BigQuery が設定されていればそちらにも送ります。
+   - 選んだ顧客層3人全員が満足してクリアすると、LLMの主観採点ではなく「情報聞き出し回数・手直し指示回数・同じ部品への手戻り回数・初回成功率」と、同じ部品や話題について指示の出し方が変わった転換点が、実際の指示の引用つきでレポート表示されます。あわせて、選ばなかった客層の6人それぞれがその画面をどう思いそうかも1行ずつ表示されます。
+   - 1回の挑戦は1つの客層で終わります。クリア後は「同じ客層でやり直す」か「別の客層でやり直す」を選び、画面を初期状態に戻してもう一度挑戦します。客層ごとのトレードオフや、指示の出し方の違いを比べられます。
 
 ## 3つのAIの役割分担
 
@@ -93,13 +94,13 @@
 - [`src/shared/sandboxValidator.ts`](src/shared/sandboxValidator.ts)：単一HTMLサンドボックスの整合性検査と、部品の役割に基づく操作シミュレーション
 - [`src/shared/promptTelemetry.ts`](src/shared/promptTelemetry.ts)：探索型・実行型の分離、指示の型分類、手戻り判定、クリア時の行動指標集計
 - [`src/server/gemini.ts`](src/server/gemini.ts)：3つのAIのプロンプト設計、Structured Outputs スキーマ、発言の意図判定、Function Calling による判断記録
-- [`src/server/store.ts`](src/server/store.ts)：決定論的分類・抽出をベースとした Vertex AI Text Embeddings・Cloud Natural Language API・Cloud Text-to-Speech・BigQuery・Cloud Firestore 連携
+- [`src/server/store.ts`](src/server/store.ts)：規則による分類・抽出と、それを補う Vertex AI Text Embeddings・Cloud Natural Language API（有効なプロジェクトのみ）、Cloud Text-to-Speech・BigQuery・Cloud Firestore 連携
 
 ## 技術構成
 
 - **フロントエンド**：TypeScript / Vite / HTML5 Canvas / Sandbox `iframe`
-- **生成AI・音声**：`@google/genai` (Vertex AI / Gemini) によるマルチモーダル入力（赤ペン囲み画像・画面スクリーンショット）・Structured Outputs・Function Calling (`record_human_decision`) / Google Cloud Text-to-Speech API (全11キャラクター別ボイス合成・固定せりふプリセット同梱)
-- **非LLM分析・テレメトリ基盤**：決定論的ルール分類＋Vertex AI Text Embeddings (`text-multilingual-embedding-002` による未確定指示の類似度分類) / 決定論的キーワード抽出＋Google Cloud Natural Language API / インメモリ保持＋Cloud Firestore・BigQuery 連携
+- **生成AI・音声**：`@google/genai` (Vertex AI / Gemini) によるマルチモーダル入力（赤ペン囲み画像・画面スクリーンショット）・Structured Outputs・Function Calling (`record_human_decision`。客層の選択など、人間の判断を記録する。応答がないときは入力どおりに保存) / Google Cloud Text-to-Speech API (全11キャラクター別ボイス合成・固定せりふプリセット同梱)
+- **非LLM分析・テレメトリ基盤**：決定論的ルール分類＋Vertex AI Text Embeddings (`text-multilingual-embedding-002` による未確定指示の類似度分類) / 決定論的キーワード抽出（Google Cloud Natural Language API が有効なプロジェクトでは補完に使用）/ インメモリ保持＋Cloud Firestore・BigQuery 連携
 - **実行環境・安全性検証**：Google Cloud Run 対応コンテナ構成 / CSP ヘッダー・Sandbox `iframe` 分離・差分パッチの対象外コンポーネント不変検証および自動ロールバック
 - **品質・衛生管理**：Node.js Test Runner / `scripts/check-hygiene.mjs` によるコミット・機密情報・パス混入検査
 

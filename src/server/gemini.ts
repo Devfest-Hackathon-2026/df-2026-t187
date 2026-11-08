@@ -19,6 +19,7 @@ import {
   describeOwnerChange,
 } from '../shared/owner.ts';
 import {
+  COUPON_FRICTIONS,
   simulatePersonaComputerUse,
   validateSandboxSpec,
 } from '../shared/sandboxValidator.ts';
@@ -1296,7 +1297,7 @@ export async function evaluateAppWithPersonas(req: EvaluateRequest): Promise<Eva
     // 独自の＋α部品（customHtml）が追加されている場合のみ、注文不能・後悔・希望機能欠落でない限りAI判定も反映する
     const missingDesiredFeature =
       sim.frictionPoint.includes('定期便の設定がなかった') ||
-      sim.frictionPoint.includes('クーポンがなくなっていた');
+      Object.values(COUPON_FRICTIONS).some((f) => sim.frictionPoint.includes(f));
     const resolvedOutcome: ReviewOutcome =
       hasCustomComponents &&
       sim.outcome !== 'abandoned' &&
