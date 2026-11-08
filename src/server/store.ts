@@ -4,6 +4,7 @@ import {
   classifyDeterministicArchetype,
   cosineSimilarity,
   extractDeterministicNlSignal,
+  limitEntitiesToVocabulary,
   summarizePromptTelemetry,
 } from '../shared/promptTelemetry.ts';
 import type {
@@ -23,7 +24,6 @@ const MAX_IN_MEMORY_DECISIONS = 200;
 const inMemoryDecisions: HumanDecisionRecord[] = [];
 const MAX_IN_MEMORY_TELEMETRY = 300;
 const inMemoryTelemetryEvents: PromptTelemetryEvent[] = [];
-const MAX_TTS_CACHE_ENTRIES = 300;
 const ttsAudioCache = new Map<string, string>();
 let presetsLoaded = false;
 
@@ -46,7 +46,7 @@ function ensureTtsPresetsLoaded(): void {
 
 let googleAuth: GoogleAuth | null = null;
 
-async function getGcpAccessToken(): Promise<string | null> {
+export async function getGcpAccessToken(): Promise<string | null> {
   try {
     if (!googleAuth) {
       googleAuth = new GoogleAuth({
@@ -166,13 +166,11 @@ export async function analyzePromptWithCloudNaturalLanguage(
       documentSentiment?: { score?: number };
     };
 
-    const mergedEntities = [...base.entities];
-    for (const ent of data.entities ?? []) {
-      const name = ent.name?.trim();
-      if (name && name.length >= 2 && !mergedEntities.some((e) => e.includes(name) || name.includes(e))) {
-        mergedEntities.push(name);
-      }
-    }
+    // 取り出した語は題材の語彙に限る。人名などが混ざっても残さない
+    const mergedEntities = limitEntitiesToVocabulary([
+      ...base.entities,
+      ...(data.entities ?? []).map((ent) => ent.name?.trim() ?? '').filter(Boolean),
+    ]);
 
     const sentimentScore =
       typeof data.documentSentiment?.score === 'number'
@@ -279,7 +277,15 @@ export async function classifyPromptWithAgentPlatformEmbeddings(
   }
 }
 
-async function persistTelemetryToCloud(event: PromptTelemetryEvent): Promise<void> {
+/** Firestore の記録を自動で消すまでの時間。消す処理は Firestore の TTL ポリシーで expireAt を見て行う */
+const TELEMETRY_TTL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * 記録をクラウドに送る。指示の本文は送らない。
+ * Firestore には、挑戦の振り返りに使う値を挑戦ごとの番号で一時的に置く（期限で自動的に消える）。
+ * BigQuery には、学習者が集計に加えることに同意した挑戦の値だけを送る
+ */
+async function persistTelemetryToCloud(event: PromptTelemetryEvent, shareForAggregate: boolean): Promise<void> {
   const project = process.env.GOOGLE_CLOUD_PROJECT;
   if (!project || project === 'your-gcp-project-id') return;
 
@@ -301,7 +307,8 @@ async function persistTelemetryToCloud(event: PromptTelemetryEvent): Promise<voi
         body: JSON.stringify({
           fields: {
             cohortId: { stringValue: event.cohortId ?? '' },
-            promptText: { stringValue: event.promptText },
+            runId: { stringValue: event.runId ?? '' },
+            turnIndex: { integerValue: String(event.turnIndex) },
             sessionMode: { stringValue: event.sessionMode },
             recipient: { stringValue: event.recipient },
             hasPenAnnotation: { booleanValue: event.hasPenAnnotation },
@@ -313,13 +320,15 @@ async function persistTelemetryToCloud(event: PromptTelemetryEvent): Promise<voi
             entities: { stringValue: event.nlSignal.entities.join(',') },
             sentimentScore: { doubleValue: event.nlSignal.sentimentScore },
             createdAt: { stringValue: event.createdAt },
+            expireAt: { timestampValue: new Date(Date.parse(event.createdAt) + TELEMETRY_TTL_MS).toISOString() },
           },
         }),
         signal: AbortSignal.timeout(1500),
       }).catch(() => {});
     }
 
-    // 2. BigQuery Streaming Insert への保存
+    // 2. BigQuery Streaming Insert への保存。集計に加えることに同意した挑戦だけ
+    if (!shareForAggregate) return;
     const dataset = process.env.BIGQUERY_DATASET || 'studio_telemetry';
     const table = process.env.BIGQUERY_TABLE || 'prompt_events';
     const bqUrl = `https://bigquery.googleapis.com/bigquery/v2/projects/${encodeURIComponent(project)}/datasets/${encodeURIComponent(dataset)}/tables/${encodeURIComponent(table)}/insertAll`;
@@ -336,7 +345,8 @@ async function persistTelemetryToCloud(event: PromptTelemetryEvent): Promise<voi
             json: {
               id: event.id,
               cohort_id: event.cohortId ?? null,
-              prompt_text: event.promptText,
+              run_id: event.runId ?? null,
+              turn_index: event.turnIndex,
               session_mode: event.sessionMode,
               recipient: event.recipient,
               has_pen_annotation: event.hasPenAnnotation,
@@ -362,6 +372,65 @@ async function persistTelemetryToCloud(event: PromptTelemetryEvent): Promise<voi
   }
 }
 
+export interface RunEventInput {
+  runId: string;
+  eventType: 'start' | 'end';
+  endReason?: 'cleared' | 'reset' | 'closed' | 'idle';
+  cohortId?: string;
+  scenario?: string;
+  turnCount?: number;
+  achievedCount?: number;
+  totalCustomers?: number;
+}
+
+/**
+ * 挑戦の始まりと終わりを BigQuery に送る。画面は、集計に加えることに同意した挑戦のときだけ呼ぶ。
+ * 途中でやめた挑戦も数えるため、終わり方（クリア・やり直し・タブを閉じた・操作がなかった）を残す。
+ * 送るのは挑戦の番号と決まった値だけで、発言の本文や接続元は送らない
+ */
+export async function recordRunEvent(input: RunEventInput): Promise<void> {
+  const project = process.env.GOOGLE_CLOUD_PROJECT;
+  if (!project || project === 'your-gcp-project-id') return;
+  try {
+    const token = await getGcpAccessToken();
+    if (!token) return;
+    const dataset = process.env.BIGQUERY_DATASET || 'studio_telemetry';
+    const table = process.env.BIGQUERY_RUN_TABLE || 'run_events';
+    const createdAt = new Date().toISOString();
+    await fetch(
+      `https://bigquery.googleapis.com/bigquery/v2/projects/${encodeURIComponent(project)}/datasets/${encodeURIComponent(dataset)}/tables/${encodeURIComponent(table)}/insertAll`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          kind: 'bigquery#tableDataInsertAllRequest',
+          skipInvalidRows: true,
+          ignoreUnknownValues: true,
+          rows: [
+            {
+              insertId: `${input.runId}:${input.eventType}`,
+              json: {
+                run_id: input.runId,
+                event_type: input.eventType,
+                end_reason: input.endReason ?? null,
+                cohort_id: input.cohortId ?? null,
+                scenario: input.scenario ?? null,
+                turn_count: input.turnCount ?? null,
+                achieved_count: input.achievedCount ?? null,
+                total_customers: input.totalCustomers ?? null,
+                created_at: createdAt,
+              },
+            },
+          ],
+        }),
+        signal: AbortSignal.timeout(1500),
+      },
+    );
+  } catch {
+    // 記録に失敗しても体験は止めない
+  }
+}
+
 /**
  * 学習者の1回の発言・指示を Cloud Natural Language API + Agent Platform の埋め込みで分析し、
  * 行動テレメトリとして記録する。
@@ -369,12 +438,17 @@ async function persistTelemetryToCloud(event: PromptTelemetryEvent): Promise<voi
 export async function recordPromptTelemetryEvent(input: {
   cohortId?: TargetCohortId;
   runId?: string;
+  /** その挑戦の中で何番目の発言か。ブラウザが数える */
+  turnIndex?: number;
+  /** 分析にだけ使い、記録には残さない */
   promptText: string;
   sessionMode: PromptSessionMode;
   recipient: string;
   hasPenAnnotation: boolean;
   changedComponentIds?: string[];
   removedNeededFeature?: boolean;
+  /** 学習者が集計に加えることに同意した挑戦か。同意したときだけ BigQuery に送る */
+  shareForAggregate?: boolean;
 }): Promise<PromptTelemetryEvent> {
   const changedComponentIds = input.changedComponentIds ?? [];
   const priorExecuteEvents = inMemoryTelemetryEvents.filter(
@@ -398,7 +472,7 @@ export async function recordPromptTelemetryEvent(input: {
     id: `pt-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
     cohortId: input.cohortId,
     runId: input.runId,
-    promptText: input.promptText,
+    turnIndex: input.turnIndex ?? -1,
     sessionMode: input.sessionMode,
     recipient: input.recipient,
     hasPenAnnotation: input.hasPenAnnotation,
@@ -415,7 +489,7 @@ export async function recordPromptTelemetryEvent(input: {
     inMemoryTelemetryEvents.splice(0, inMemoryTelemetryEvents.length - MAX_IN_MEMORY_TELEMETRY);
   }
 
-  void persistTelemetryToCloud(event);
+  void persistTelemetryToCloud(event, Boolean(input.shareForAggregate));
   return event;
 }
 
@@ -533,11 +607,8 @@ export async function synthesizeStudioSpeech(req: TtsRequest): Promise<TtsRespon
     }
     const data = (await res.json()) as { audioContent?: string };
     if (data.audioContent) {
-      if (ttsAudioCache.size >= MAX_TTS_CACHE_ENTRIES) {
-        const oldestKey = ttsAudioCache.keys().next().value;
-        if (oldestKey) ttsAudioCache.delete(oldestKey);
-      }
-      ttsAudioCache.set(cacheKey, data.audioContent);
+      // 読み上げる文には、AIの返事を通して学習者の言葉が混ざることがあるので、合成した音声は覚えておかない。
+      // 覚えておくのは、同梱した決まったせりふの音声だけ
       return { audioContent: data.audioContent };
     }
     return { fallbackBrowserTts: true };

@@ -21,6 +21,7 @@ import { buildOwnerClosingLines } from '../shared/owner.ts';
 import { simulatePersonaComputerUse } from '../shared/sandboxValidator.ts';
 import { describeOtherCohortImpact, describeOtherCohortReport } from '../shared/otherCohorts.ts';
 import { splitIntoChatChunks } from '../shared/chatText.ts';
+import { fillTurnRefs } from '../shared/promptTelemetry.ts';
 import { buildInitialSpec, buildScenarioSpec, type DifficultyLevel } from '../shared/theme.ts';
 import type {
   AppSpec,
@@ -118,6 +119,17 @@ interface StudioState {
   runFinished: boolean;
   /** 1回の挑戦ごとの番号。客層を選ぶたび・やり直すたびに新しくする */
   runId: string;
+  /**
+   * この挑戦で学習者が送った発言の本文。添字が発言の番号。本文はこのブラウザだけが持ち、サーバーには残さない。
+   * 振り返りで指示を引用するときに、サーバーが返す目印をこの本文に置き換える
+   */
+  runTurnTexts: string[];
+  /** 記録をみんなの集計に加えることに同意したか。まだ答えていなければ undefined（加えないとして扱う） */
+  aggregateConsent?: boolean;
+  /** 今の挑戦の記録を集計に加えるか。同意の切り替えは次の挑戦から効くので、挑戦の始まりに決める */
+  runShareForAggregate: boolean;
+  /** 今の挑戦の終わり（クリア・離脱）をもう記録したか */
+  runEnded: boolean;
   chatLoading: boolean;
   evaluateLoading: boolean;
   /** Cloud TTS による音声読み上げのON/OFF */
@@ -134,6 +146,284 @@ const OWNER = ACTIVE_THEME.owner;
 function formatCheckpointLabel(cp: Pick<Checkpoint, 'stepNumber'>): string {
   return cp.stepNumber === 0 ? '最初' : `手直し${cp.stepNumber}`;
 }
+
+// ============================================================================
+// 記録をみんなの集計に加えるかの同意と、挑戦の始まり・終わりの記録
+// ============================================================================
+
+const CONSENT_STORAGE_KEY = 'ponkotsu:aggregateConsent';
+/** この時間なにも操作しなければ、挑戦をやめたとみなす */
+const IDLE_END_MS = 30 * 60 * 1000;
+let lastActivityAt = Date.now();
+
+/** 同意はこのブラウザにだけ覚えておく。読めなくても、まだ答えていないとして動く */
+function loadAggregateConsent(): boolean | undefined {
+  try {
+    const v = window.localStorage.getItem(CONSENT_STORAGE_KEY);
+    return v === 'yes' ? true : v === 'no' ? false : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function saveAggregateConsent(consent: boolean): void {
+  state.aggregateConsent = consent;
+  try {
+    window.localStorage.setItem(CONSENT_STORAGE_KEY, consent ? 'yes' : 'no');
+  } catch {
+    // 覚えておけなくても、この画面を開いている間は state の値で動く
+  }
+}
+
+// ============================================================================
+// 最初に開いたときのウィンドウ：利用上の注意と、集計への協力
+// ============================================================================
+
+/** 注意の内容を変えたら版を上げ、もう一度読んでもらう */
+const TERMS_VERSION = '2026-11-08.10';
+const TERMS_STORAGE_KEY = 'ponkotsu:termsAccepted';
+
+const TERMS_SUMMARY = '学習用の架空のお店の注文画面を、AIと一緒に直すツールです。';
+
+/** 運営者と問い合わせ先 */
+const OPERATOR = {
+  team: 'YukiD',
+  representative: 'Hinata Wakabayashi',
+  email: 'yukid-df-hack@hinata.works',
+};
+
+/** 利用上の注意。1項目を1行に収まる長さにする。リンクを含む項目は、文字とリンクを並べて書く */
+type TermsPart = string | { text: string; href: string; external?: boolean };
+const TERMS_ITEMS: TermsPart[][] = [
+  ['DevFest Hackathon 2026 提出用の学習用試作品で、商用サービスではありません'],
+  ['実際の注文や支払いは起きません'],
+  ['指示と画面の画像は Google Cloud の Gemini に送られます。文章は保存しません'],
+  ['名前や連絡先など、個人を特定できる情報は入力しないでください'],
+  ['お客さんや店長の返事はAIが作ったもので、誤りを含むことがあります'],
+  ['不審なリクエストは、予告なく制限・拒否することがあります'],
+  // 決勝に進んだ場合の Demo Day（11月27日）と GDG DevFest Tokyo（11月29日）まで動かせるよう、最初から長めにしておく
+  ['公開は11月29日までの予定です。予告なく止めたり変えたりすることがあります'],
+];
+
+/** 運営者と問い合わせ先。条文とは分けて、注意のすぐ下に番号なしの1行で置く */
+const OPERATOR_LINE: TermsPart[] = [
+  `運営: ${OPERATOR.team}, 代表者: ${OPERATOR.representative}, 問い合わせ: `,
+  { text: OPERATOR.email, href: `mailto:${OPERATOR.email}` },
+];
+
+/** 文字とリンクを並べて、1つの要素に書き込む */
+function appendTermsParts(target: HTMLElement, parts: TermsPart[]): void {
+  for (const part of parts) {
+    if (typeof part === 'string') {
+      target.append(part);
+      continue;
+    }
+    const a = document.createElement('a');
+    a.href = part.href;
+    a.textContent = part.text;
+    if (part.external) {
+      a.target = '_blank';
+      a.rel = 'noopener noreferrer';
+    }
+    target.appendChild(a);
+  }
+}
+
+const AGGREGATE_NOTES = [
+  '送るのは指示の型・回数・結果・途中でやめたかだけ。',
+  '文章や個人を特定できる情報は送りません。',
+  '画面の下でいつでも変えられ、次の挑戦から反映されます。',
+];
+
+function hasAcceptedTerms(): boolean {
+  try {
+    return window.localStorage.getItem(TERMS_STORAGE_KEY) === TERMS_VERSION;
+  } catch {
+    return false;
+  }
+}
+
+function saveTermsAccepted(): void {
+  try {
+    window.localStorage.setItem(TERMS_STORAGE_KEY, TERMS_VERSION);
+  } catch {
+    // 覚えておけなくても、この画面を開いている間は先へ進める
+  }
+}
+
+/**
+ * 利用上の注意と、集計への協力のウィンドウを出す。
+ * first：最初に開いたとき。同意して始めるを押すまで閉じられず、押すと店長の紹介が始まる
+ * review：画面の下の「このツールについて」から開いたとき。閉じると、集計への協力の変更を反映する
+ */
+function openTermsDialog(mode: 'first' | 'review', onAccepted?: () => void): void {
+  if (document.querySelector('.terms-overlay')) return;
+  const overlay = document.createElement('div');
+  overlay.className = 'terms-overlay';
+
+  const dialog = document.createElement('div');
+  dialog.className = 'terms-dialog';
+  dialog.setAttribute('role', 'dialog');
+  dialog.setAttribute('aria-modal', 'true');
+  dialog.setAttribute('aria-labelledby', 'terms-title');
+
+  const title = document.createElement('h2');
+  title.id = 'terms-title';
+  title.className = 'terms-title';
+  title.textContent = mode === 'first' ? 'はじめに' : 'このツールについて';
+  const summary = document.createElement('p');
+  summary.className = 'terms-summary';
+  summary.textContent = TERMS_SUMMARY;
+
+  const noticeHeading = document.createElement('h3');
+  noticeHeading.className = 'terms-heading';
+  noticeHeading.textContent = '利用上の注意';
+  const noticeList = document.createElement('ol');
+  noticeList.className = 'terms-list';
+  for (const parts of TERMS_ITEMS) {
+    const li = document.createElement('li');
+    appendTermsParts(li, parts);
+    noticeList.appendChild(li);
+  }
+  const operatorLine = document.createElement('p');
+  operatorLine.className = 'terms-operator';
+  appendTermsParts(operatorLine, OPERATOR_LINE);
+
+  // 自分で選ぶ所。枠で囲んで目立たせ、チェックは最初は外しておく
+  const consentBox = document.createElement('div');
+  consentBox.className = 'terms-consent';
+  const checkLabel = document.createElement('label');
+  checkLabel.className = 'terms-check';
+  const checkbox = document.createElement('input');
+  checkbox.type = 'checkbox';
+  checkbox.checked = mode === 'review' && state.aggregateConsent === true;
+  const checkText = document.createElement('span');
+  checkText.textContent = '私の挑戦の記録を、みんなの集計に加える';
+  const optionalBadge = document.createElement('span');
+  optionalBadge.className = 'terms-optional';
+  optionalBadge.textContent = '任意';
+  checkLabel.append(checkbox, checkText, optionalBadge);
+  const notes = document.createElement('p');
+  notes.className = 'terms-notes';
+  notes.textContent = AGGREGATE_NOTES.join('');
+  consentBox.append(checkLabel, notes);
+
+  const actionBtn = document.createElement('button');
+  actionBtn.type = 'button';
+  actionBtn.className = 'terms-action';
+  actionBtn.textContent = mode === 'first' ? '同意して始める' : '閉じる';
+
+  const close = () => {
+    document.removeEventListener('keydown', onKeydown);
+    overlay.remove();
+  };
+  const finish = () => {
+    if (mode === 'first') {
+      saveTermsAccepted();
+      saveAggregateConsent(checkbox.checked);
+      close();
+      onAccepted?.();
+      return;
+    }
+    const changed = checkbox.checked !== (state.aggregateConsent === true);
+    close();
+    if (changed) toggleAggregateConsent();
+  };
+  const onKeydown = (e: KeyboardEvent) => {
+    // 最初のウィンドウは、同意して始めるを押すまで閉じない
+    if (e.key === 'Escape' && mode === 'review') finish();
+  };
+  actionBtn.addEventListener('click', finish);
+  document.addEventListener('keydown', onKeydown);
+  if (mode === 'review') {
+    overlay.addEventListener('click', (e) => {
+      if (e.target === overlay) finish();
+    });
+  }
+
+  dialog.append(title, summary, noticeHeading, noticeList, operatorLine, consentBox, actionBtn);
+  overlay.appendChild(dialog);
+  document.body.appendChild(overlay);
+  actionBtn.focus();
+}
+
+/** 画面の下の切り替え。押すたびに、加える・加えないが入れ替わる。今の挑戦ではなく次の挑戦から効く */
+function toggleAggregateConsent(): void {
+  const next = state.aggregateConsent !== true;
+  saveAggregateConsent(next);
+  pushMessage({
+    role: 'system',
+    text: next
+      ? '記録をみんなの集計に加えます。次の挑戦から反映されます'
+      : '記録をみんなの集計に加えるのをやめます。次の挑戦から反映されます',
+  });
+  renderStudio();
+  scrollToLatestMessage();
+}
+
+/** 集計で、どの問題の画面で遊んだかを分けるための名前 */
+function sessionScenarioLabel(): string {
+  const params = new URLSearchParams(window.location.search);
+  if (params.has('clean')) return 'clean';
+  if (params.get('mode') === 'random') return `random:${params.get('level') ?? 'normal'}`;
+  const scenarioParam = params.get('scenario');
+  return scenarioParam && ACTIVE_THEME.scenarios[scenarioParam] ? scenarioParam : ACTIVE_THEME.defaultScenarioId;
+}
+
+type RunEndReason = 'cleared' | 'reset' | 'closed' | 'idle';
+
+/**
+ * 挑戦の始まりと終わりを記録する。集計に加えることに同意した挑戦だけ送る。
+ * 送るのは、挑戦の番号・客層・問題・終わり方・人数だけで、発言の本文は送らない
+ */
+function sendRunEvent(
+  eventType: 'start' | 'end',
+  endReason?: RunEndReason,
+  extra: { achievedCount?: number; totalCustomers?: number } = {},
+): void {
+  if (!state.runShareForAggregate || !state.runId) return;
+  if (eventType === 'end') {
+    if (state.runEnded) return;
+    state.runEnded = true;
+  }
+  const body = JSON.stringify({
+    runId: state.runId,
+    eventType,
+    endReason,
+    cohortId: state.selectedCohortId,
+    scenario: sessionScenarioLabel(),
+    turnCount: state.runTurnTexts.length,
+    ...extra,
+  });
+  // タブを閉じるときは、ページが消えても届く sendBeacon を使う
+  if (endReason === 'closed' && navigator.sendBeacon) {
+    navigator.sendBeacon('/api/run-event', new Blob([body], { type: 'application/json' }));
+    return;
+  }
+  void fetch('/api/run-event', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body,
+    keepalive: true,
+  }).catch(() => {});
+}
+
+/** 挑戦の途中かどうか。客層を選んでから、クリアするか離脱するまで */
+function isRunInProgress(): boolean {
+  return Boolean(state.selectedCohortId && state.runId && !state.runEnded);
+}
+
+window.addEventListener('pagehide', () => {
+  if (isRunInProgress()) sendRunEvent('end', 'closed');
+});
+for (const type of ['pointerdown', 'keydown'] as const) {
+  window.addEventListener(type, () => {
+    lastActivityAt = Date.now();
+  }, { passive: true });
+}
+window.setInterval(() => {
+  if (isRunInProgress() && Date.now() - lastActivityAt > IDLE_END_MS) sendRunEvent('end', 'idle');
+}, 60_000);
 
 /**
  * 体験の画面を決める。
@@ -191,6 +481,10 @@ const state: StudioState = {
   justChangedIds: [],
   runFinished: false,
   runId: '',
+  runTurnTexts: [],
+  aggregateConsent: loadAggregateConsent(),
+  runShareForAggregate: false,
+  runEnded: true,
   chatLoading: false,
   evaluateLoading: false,
   voiceEnabled: true,
@@ -437,9 +731,11 @@ async function postJson<T>(url: string, body: unknown): Promise<T> {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
-  const data = (await res.json().catch(() => ({}))) as T & { error?: string };
+  const data = (await res.json().catch(() => ({}))) as T & { error?: string; code?: string };
   if (!res.ok) {
-    throw new Error(data.error ?? `通信エラーが発生しました (${res.status})`);
+    const error = new Error(data.error ?? `通信エラーが発生しました (${res.status})`) as Error & { code?: string };
+    error.code = data.code;
+    throw error;
   }
   return data;
 }
@@ -462,6 +758,8 @@ let penCanvasEl: HTMLCanvasElement | null = null;
 let bottomBarEl: HTMLElement | null = null;
 let chatSlotEl: HTMLElement | null = null;
 let chatScrollEl: HTMLElement | null = null;
+/** 画面の下部にある、集計への協力の切り替え。表示は renderStudio で今の設定に合わせる */
+let footerConsentEl: HTMLButtonElement | null = null;
 let lastSandboxRenderKey = '';
 const seenMessageIds = new Set<string>();
 const recipientFirstSeenAt = new Map<string, number>();
@@ -649,8 +947,9 @@ function playInitialWelcomeSequence(): void {
   if (lines !== ACTIVE_THEME.introScript) {
     pushMessage({ role: 'system', text: first.text });
   }
-  enqueueMessages(
-    lines.map((line) => ({
+  const queued: QueuedMessage[] = [];
+  for (const line of lines) {
+    queued.push({
       message: {
         role: line.speaker,
         text: line.text,
@@ -660,8 +959,9 @@ function playInitialWelcomeSequence(): void {
         line.speaker === 'owner' || line.speaker === 'assistant'
           ? typingDurationFor(line.text)
           : 0,
-    })),
-  );
+    });
+  }
+  enqueueMessages(queued);
 }
 
 function scrollToLatestMessage(): void {
@@ -897,6 +1197,7 @@ function handleSelectCohort(cohortId: TargetCohortId): void {
  * sameCohortId を渡すと同じ客層でそのまま始め、渡さなければ客層を選び直す
  */
 function handleRestartFromScratch(sameCohortId?: TargetCohortId): void {
+  if (isRunInProgress()) sendRunEvent('end', 'reset');
   flushMessageQueue();
   clearTransientChoiceMessages();
   state.runFinished = false;
@@ -936,6 +1237,12 @@ function startCohort(cohortId: TargetCohortId): void {
   const cohort = TARGET_COHORTS.find((c) => c.id === cohortId) ?? TARGET_COHORTS[0];
   state.selectedCohortId = cohort.id;
   state.runId = `run-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  state.runTurnTexts = [];
+  // 同意の切り替えは、次の挑戦から効く
+  state.runShareForAggregate = state.aggregateConsent === true;
+  state.runEnded = false;
+  lastActivityAt = Date.now();
+  sendRunEvent('start');
   state.recipient = 'assistant';
   recipientFirstSeenAt.clear();
 
@@ -1438,7 +1745,7 @@ async function handleSendMessage(
       ? captureSandboxSnapshot(spec, state.liveAppState, sandboxStageEl, penCanvasEl)
       : undefined;
 
-  pushMessage({
+  const userMessage = pushMessage({
     role: 'user',
     text,
     targetComponentIds: targetIdsSnapshot,
@@ -1515,6 +1822,8 @@ async function handleSendMessage(
   scrollToLatestMessage();
 
   try {
+    // 発言の本文はこのブラウザに残し、サーバーには何番目の発言かだけを伝える
+    const turnIndex = state.runTurnTexts.push(text) - 1;
     const data = await postJson<ChatResponse>('/api/chat', {
       currentSpec: spec,
       latestReviews: buildLatestReviewRecord(),
@@ -1522,6 +1831,8 @@ async function handleSendMessage(
       userMessage: text,
       cohortId: state.selectedCohortId,
       runId: state.runId,
+      turnIndex,
+      shareForAggregate: state.runShareForAggregate,
       annotatedImageBase64,
       history,
       recipient: recipientSnapshot,
@@ -1654,6 +1965,13 @@ async function handleSendMessage(
     if (logMessage?.workLog && !logMessage.workLog.finished) {
       state.messages = state.messages.filter((m) => m !== logMessage);
     }
+    if ((err as { code?: string }).code === 'input_rejected') {
+      // 送らなかった発言は、会話の履歴から外して以後 Gemini に渡さない。直せるように入力欄へ戻す
+      state.messages = state.messages.filter((m) => m !== userMessage);
+      const sentIndex = state.runTurnTexts.lastIndexOf(text);
+      if (sentIndex >= 0) state.runTurnTexts[sentIndex] = '';
+      if (!state.inputText.trim()) state.inputText = text;
+    }
     pushMessage({ role: 'system', tone: 'warning', text: describeError(err) });
   } finally {
     state.justChangedIds = [];
@@ -1780,6 +2098,10 @@ async function handleEvaluate(): Promise<void> {
       }
       // 1回の挑戦は、選んだ客層の3人が全員達成したところで終わる。やり直すまで手直しは受け付けない
       state.runFinished = true;
+      sendRunEvent('end', 'cleared', {
+        achievedCount: achievedCount,
+        totalCustomers: activePersonas.length,
+      });
       const remaining = TARGET_COHORTS.filter((c) => !state.clearedCohortIds.includes(c.id));
       const closing =
         remaining.length > 0
@@ -1798,7 +2120,8 @@ async function handleEvaluate(): Promise<void> {
         queued.push({
           message: {
             role: 'system',
-            text: telemetryLine,
+            // 指示の引用は目印で届くので、このブラウザにある本文に置き換える
+            text: fillTurnRefs(telemetryLine, state.runTurnTexts),
           },
           typingMs: 0,
         });
@@ -2551,10 +2874,29 @@ function ensureStudioShellInitialized(): void {
   stage.append(deviceColumn, chatSlotEl);
   shellEl.appendChild(stage);
 
-  const watermark = document.createElement('footer');
+  // 画面の下部：タイトルと、集計への協力の切り替え、利用上の注意の読み直し
+  const footer = document.createElement('footer');
+  footer.className = 'studio-footer';
+  const watermark = document.createElement('span');
   watermark.className = 'studio-watermark';
   watermark.textContent = 'ポンコツ工房';
-  shellEl.appendChild(watermark);
+
+  // 記録をみんなの集計に加えるかの切り替え。次の挑戦から効く
+  footerConsentEl = document.createElement('button');
+  footerConsentEl.type = 'button';
+  footerConsentEl.className = 'footer-link consent-toggle';
+  footerConsentEl.title = '押すと切り替わります。次の挑戦から反映されます。指示の文章や、あなたを特定できる情報は送りません';
+  footerConsentEl.addEventListener('click', toggleAggregateConsent);
+
+  // 利用上の注意と集計への協力を、いつでも読み直せる
+  const aboutBtn = document.createElement('button');
+  aboutBtn.type = 'button';
+  aboutBtn.className = 'footer-link about-btn';
+  aboutBtn.textContent = 'このツールについて';
+  aboutBtn.addEventListener('click', () => openTermsDialog('review'));
+
+  footer.append(watermark, footerConsentEl, aboutBtn);
+  shellEl.appendChild(footer);
 
   appRoot.innerHTML = '';
   appRoot.appendChild(shellEl);
@@ -2563,6 +2905,10 @@ function ensureStudioShellInitialized(): void {
 function renderStudio(): void {
   if (!appRoot) return;
   ensureStudioShellInitialized();
+  if (footerConsentEl) {
+    footerConsentEl.textContent = `集計への協力 ${state.aggregateConsent ? '加える' : '加えない'}`;
+    footerConsentEl.classList.toggle('is-on', state.aggregateConsent === true);
+  }
   const spec = getCurrentSpec();
 
   const activeEl = document.activeElement;
@@ -2791,4 +3137,11 @@ window.addEventListener('resize', () => {
   redrawPenCanvas();
 });
 
-playInitialWelcomeSequence();
+// 利用上の注意に同意してから、店長の紹介を始める。一度同意したブラウザでは、すぐに始める
+if (hasAcceptedTerms()) {
+  playInitialWelcomeSequence();
+} else {
+  // 後ろに画面を出しておき、何のツールかが見える状態で読んでもらう
+  renderStudio();
+  openTermsDialog('first', playInitialWelcomeSequence);
+}

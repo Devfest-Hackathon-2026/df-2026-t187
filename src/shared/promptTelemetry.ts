@@ -52,7 +52,11 @@ export interface PromptTelemetryEvent {
   cohortId?: TargetCohortId;
   /** 1回の挑戦ごとの番号 */
   runId?: string;
-  promptText: string;
+  /**
+   * その挑戦の中で何番目の発言か。指示の本文はサーバーにもクラウドにも残さず、学習者のブラウザだけが持つ。
+   * 振り返りで指示を引用するときは、この番号を目印にブラウザが手元の本文を差し込む
+   */
+  turnIndex: number;
   sessionMode: PromptSessionMode;
   recipient: string;
   hasPenAnnotation: boolean;
@@ -84,14 +88,17 @@ export interface PromptSessionSummary {
   goalDirectedTurns: number;
   /** 初回成功率（0〜100: 手戻りや機能喪失にならず意図通り機能した実行指示の割合） */
   firstShotSuccessRate: number;
-  /** 単純削除や丸投げから条件指定へ改善した転換点（実プロンプト引用） */
+  /** 単純削除や丸投げから条件指定へ改善した転換点。何番目の発言かで示す */
   turningPoint?: {
-    beforePrompt: string;
-    afterPrompt: string;
+    beforeTurn: number;
+    afterTurn: number;
   };
-  /** クリアに貢献した代表的な実プロンプト */
-  effectivePrompt?: string;
-  /** チャットのシステムメッセージ行としてそのまま表示できる振り返り文（括弧なし・インラインコード付き） */
+  /** クリアに貢献した代表的な発言が何番目か */
+  effectiveTurn?: number;
+  /**
+   * チャットのシステムメッセージ行にする振り返り文（括弧なし・インラインコード付き）。
+   * 指示の引用は turnRef の目印になっていて、ブラウザが fillTurnRefs で本文に置き換える
+   */
   systemLogLines: string[];
 }
 
@@ -305,7 +312,33 @@ export function inspectAppliedChangeForTelemetry(
   };
 }
 
-function cleanPromptForBadge(text: string): string {
+/** 振り返り文の中で、何番目の発言を引用するかの目印 */
+export function turnRef(turnIndex: number): string {
+  return `{{turn:${turnIndex}}}`;
+}
+
+/**
+ * 振り返り文の目印を、学習者のブラウザにある発言の本文に置き換える。
+ * 本文が手元にないとき（画面を開き直したときなど）は、その指示、と書く
+ */
+export function fillTurnRefs(line: string, turnTexts: ReadonlyArray<string | undefined>): string {
+  return line.replace(/\{\{turn:(\d+)\}\}/g, (_m, n: string) => {
+    const text = turnTexts[Number(n)];
+    return text && text.trim() ? cleanPromptForBadge(text) : 'その指示';
+  });
+}
+
+/** 対象語は題材の語彙に限る。Natural Language API が取り出した語に人名などが混ざっても残さない */
+export function limitEntitiesToVocabulary(entities: string[]): string[] {
+  const kept: string[] = [];
+  for (const entity of entities) {
+    const term = UI_ENTITY_TERMS.find((t) => entity === t || entity.includes(t));
+    if (term && !kept.includes(term)) kept.push(term);
+  }
+  return kept;
+}
+
+export function cleanPromptForBadge(text: string): string {
   const cleaned = text.replace(/`/g, '').replace(/\s+/g, ' ').trim();
   return cleaned.length > 60 ? `${cleaned.slice(0, 59)}…` : cleaned;
 }
@@ -414,7 +447,7 @@ export function summarizePromptTelemetry(
     executeTurns > 0 ? Math.round((successfulExecutes / executeTurns) * 100) : 100;
 
   // 単純削除や手戻り指示のあとに、条件設計型・具体修正型で解決した転換点を探す
-  let turningPoint: { beforePrompt: string; afterPrompt: string } | undefined;
+  let turningPoint: { beforeTurn: number; afterTurn: number } | undefined;
   let turningPointByGoal = false;
   for (let i = 0; i < executeEvents.length; i++) {
     const prev = executeEvents[i];
@@ -435,10 +468,7 @@ export function summarizePromptTelemetry(
           next.nlSignal.hasConditionConstraint ||
           next.isReworkOnSameComponent)
       ) {
-        turningPoint = {
-          beforePrompt: cleanPromptForBadge(prev.promptText),
-          afterPrompt: cleanPromptForBadge(next.promptText),
-        };
+        turningPoint = { beforeTurn: prev.turnIndex, afterTurn: next.turnIndex };
         turningPointByGoal = next.embeddingSignal.closestArchetype === 'goal_directed';
       }
     }
@@ -456,7 +486,8 @@ export function summarizePromptTelemetry(
             e.nlSignal.hasConditionConstraint),
       ) ?? [...executeEvents].reverse().find((e) => !e.removedNeededFeature);
 
-  const effectivePrompt = bestExecute ? cleanPromptForBadge(bestExecute.promptText) : undefined;
+  const effectiveTurn = bestExecute?.turnIndex;
+  const effectivePrompt = effectiveTurn !== undefined ? turnRef(effectiveTurn) : undefined;
 
   const systemLogLines: string[] = [];
   if (executeTurns > 0) {
@@ -467,7 +498,7 @@ export function summarizePromptTelemetry(
     );
     if (turningPoint) {
       systemLogLines.push(
-        `指示の改善 \`${turningPoint.beforePrompt}\` から${turningPointByGoal ? '目的を伝えた' : '条件を具体化した'} \`${turningPoint.afterPrompt}\` へ変えたことで客の満足と店長の納得が両立しました`,
+        `指示の改善 \`${turnRef(turningPoint.beforeTurn)}\` から${turningPointByGoal ? '目的を伝えた' : '条件を具体化した'} \`${turnRef(turningPoint.afterTurn)}\` へ変えたことで客の満足と店長の納得が両立しました`,
       );
     } else if (effectivePrompt && bestExecute?.embeddingSignal.closestArchetype === 'goal_directed') {
       systemLogLines.push(
@@ -495,7 +526,7 @@ export function summarizePromptTelemetry(
     goalDirectedTurns,
     firstShotSuccessRate,
     turningPoint,
-    effectivePrompt,
+    effectiveTurn,
     systemLogLines,
   };
 }

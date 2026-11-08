@@ -24,6 +24,7 @@ import {
 } from '../src/shared/appRuntime.ts';
 import { clipToVisibleRects, detectHitComponents, type Rect2D } from '../src/shared/hitTest.ts';
 import { RateLimiter, clientKeyOf, rateLimitGroupOf } from '../src/server/rateLimit.ts';
+import { PromptRejectedError, assertPromptAllowed, findPersonalInfoByRules, reasonFromModelArmorResult } from '../src/server/modelArmor.ts';
 import {
   ACTIVE_THEME,
   ALL_REVIEWER_PERSONAS,
@@ -50,7 +51,9 @@ import {
   classifyDeterministicArchetype,
   cosineSimilarity,
   extractDeterministicNlSignal,
+  fillTurnRefs,
   inspectAppliedChangeForTelemetry,
+  limitEntitiesToVocabulary,
   summarizePromptTelemetry,
 } from '../src/shared/promptTelemetry.ts';
 import {
@@ -122,10 +125,37 @@ describe('core-loop', () => {
     assert.deepEqual(detectHitComponents(partial, rects), ['product-hero']);
   });
 
+  it('Gemini に送る前に、個人情報らしき内容やAIへの指示の乗っ取りを止める', async () => {
+    // コードの規則：メールアドレスと電話番号
+    assert.equal(findPersonalInfoByRules('連絡は taro.yamada@example.com までお願いします'), true);
+    assert.equal(findPersonalInfoByRules('電話は090-1234-5678です'), true);
+    assert.equal(findPersonalInfoByRules('０３－１２３４－５６７８にかけて'), true);
+    assert.equal(findPersonalInfoByRules('0312345678'), true);
+    // 値段・時刻・割引などは当たらない
+    for (const ok of ['500円OFFのクーポンにして', '合計2,580円を大きく', '残り2:59の表示を消して', '1980円の豆を2袋', '定期便のチェックを外して']) {
+      assert.equal(findPersonalInfoByRules(ok), false, ok);
+    }
+    await assert.rejects(assertPromptAllowed('私のメールは a@b.co です'), (err: unknown) => err instanceof PromptRejectedError && err.reason === 'personal_info');
+    // Model Armor の設定がないときは、規則に当たらなければ通す
+    await assertPromptAllowed('注文ボタンを押したら注文できるようにして');
+
+    // Model Armor の結果の読み方
+    const base = { sanitizationResult: { filterMatchState: 'MATCH_FOUND', invocationResult: 'SUCCESS', filterResults: {} as Record<string, unknown> } };
+    const withFilter = (key: string, inner: string, value: unknown) => ({
+      sanitizationResult: { ...base.sanitizationResult, filterResults: { [key]: { [inner]: value } } },
+    });
+    assert.equal(reasonFromModelArmorResult(withFilter('sdp', 'sdpFilterResult', { inspectResult: { matchState: 'MATCH_FOUND' } })), 'personal_info');
+    assert.equal(reasonFromModelArmorResult(withFilter('pi_and_jailbreak', 'piAndJailbreakFilterResult', { matchState: 'MATCH_FOUND' })), 'prompt_injection');
+    assert.equal(reasonFromModelArmorResult(withFilter('rai', 'raiFilterResult', { matchState: 'MATCH_FOUND' })), 'harmful');
+    assert.equal(reasonFromModelArmorResult({ sanitizationResult: { filterMatchState: 'NO_MATCH_FOUND' } }), null);
+    // 止めたときの文は、引っかかった文字そのものを繰り返さない
+    assert.doesNotMatch(new PromptRejectedError('personal_info').message, /@|\d{3}/);
+  });
+
   it('Gemini や読み上げを呼ぶAPIは、接続元ごととサーバー全体の両方で1分あたりの回数を超えたら断る', () => {
     let t = 0;
     const limiter = new RateLimiter(
-      { gemini: { perClient: 3, global: 5 }, tts: { perClient: 2, global: 10 } },
+      { gemini: { perClient: 3, global: 5 }, tts: { perClient: 2, global: 10 }, record: { perClient: 2, global: 10 } },
       60_000,
       () => t,
     );
@@ -722,15 +752,15 @@ describe('core-loop', () => {
   it('振り返りは挑戦ごとの番号の記録だけで作り、やり直す前の挑戦やほかの人の記録を混ぜない', async () => {
     clearPromptTelemetryEvents();
     const base = { cohortId: 'thrifty', sessionMode: 'execute' as const, recipient: 'assistant', hasPenAnnotation: false };
-    await recordPromptTelemetryEvent({ ...base, runId: 'run-1', promptText: '定期便を消して', changedComponentIds: ['check-subscription'], removedNeededFeature: true });
-    await recordPromptTelemetryEvent({ ...base, runId: 'run-other', promptText: '広告を消して', changedComponentIds: ['popup-coupon'] });
-    const second = await recordPromptTelemetryEvent({ ...base, runId: 'run-2', promptText: '定期便の初期チェックを外して', changedComponentIds: ['check-subscription'] });
+    await recordPromptTelemetryEvent({ ...base, runId: 'run-1', turnIndex: 5, promptText: '定期便を消して', changedComponentIds: ['check-subscription'], removedNeededFeature: true });
+    await recordPromptTelemetryEvent({ ...base, runId: 'run-other', turnIndex: 7, promptText: '広告を消して', changedComponentIds: ['popup-coupon'] });
+    const second = await recordPromptTelemetryEvent({ ...base, runId: 'run-2', turnIndex: 0, promptText: '定期便の初期チェックを外して', changedComponentIds: ['check-subscription'] });
     // 別の挑戦で同じ部品を触っていても、手戻りとは数えない
     assert.equal(second.isReworkOnSameComponent, false);
     const summary = finalizeTelemetryOnEvaluate('thrifty', 3, 3, 'run-2');
     assert.equal(summary.executeTurns, 1);
     assert.equal(summary.reworkTurns, 0);
-    assert.ok(!summary.systemLogLines.some((l) => l.includes('定期便を消して') || l.includes('広告を消して')));
+    assert.ok(!summary.systemLogLines.some((l) => l.includes('{{turn:5}}') || l.includes('{{turn:7}}')));
     clearPromptTelemetryEvents();
   });
 
@@ -815,7 +845,8 @@ describe('core-loop', () => {
     assert.deepEqual(normalized.derived, previous.derived);
   });
 
-  it('判断記録は理由が空でも勝手に補わない', async () => {
+  it('判断記録は決まった値だけを残し、自由に書かれた理由は保存しない', async () => {
+    // 理由の文には学習者を特定できる言葉が混ざりうるので、渡されても残さない
     const decisionRes = await recordHumanDecisionWithFunctionCalling({
       stage: 'review_disposition',
       targetId: 'kazuko',
@@ -824,7 +855,7 @@ describe('core-loop', () => {
       cohortId: 'careful',
     });
     assert.equal(decisionRes.decision.stage, 'review_disposition');
-    assert.ok(decisionRes.decision.reason.includes('文字を大きく'));
+    assert.equal(decisionRes.decision.reason, '');
 
     const noReasonRes = await recordHumanDecisionWithFunctionCalling({
       stage: 'select_cohort',
@@ -1456,6 +1487,7 @@ describe('core-loop', () => {
     // 2. 探索型（店長・客への質問）は往復数のペナルティ（初回成功率の分母）に入らない
     await recordPromptTelemetryEvent({
       cohortId: 'careful',
+      turnIndex: 0,
       promptText: '店長、定期便ってどうして付けてるの？',
       sessionMode: 'explore',
       recipient: 'owner',
@@ -1463,6 +1495,7 @@ describe('core-loop', () => {
     });
     await recordPromptTelemetryEvent({
       cohortId: 'careful',
+      turnIndex: 1,
       promptText: '客B、どこで困ったの？',
       sessionMode: 'explore',
       recipient: 'shigeru',
@@ -1485,6 +1518,7 @@ describe('core-loop', () => {
 
     await recordPromptTelemetryEvent({
       cohortId: 'careful',
+      turnIndex: 2,
       promptText: '定期便を消して',
       sessionMode: 'execute',
       recipient: 'assistant',
@@ -1524,6 +1558,7 @@ describe('core-loop', () => {
 
     const secondExecEvent = await recordPromptTelemetryEvent({
       cohortId: 'careful',
+      turnIndex: 3,
       promptText: '定期便の初期チェックを外して解約条件を明記して',
       sessionMode: 'execute',
       recipient: 'assistant',
@@ -1532,6 +1567,8 @@ describe('core-loop', () => {
       removedNeededFeature: restoredStats.removedNeededFeature,
     });
     assert.equal(secondExecEvent.isReworkOnSameComponent, true);
+    // 指示の本文は記録に残さない
+    assert.equal('promptText' in secondExecEvent, false);
 
     // 5. クリア時のサマリー生成とシステムメッセージ行（括弧なし・インラインコード付き）の確認
     const summary = finalizeTelemetryOnEvaluate('careful', 3, 3);
@@ -1540,20 +1577,24 @@ describe('core-loop', () => {
     assert.equal(summary.reworkTurns, 1);
     assert.equal(summary.firstShotSuccessRate, 50);
     assert.ok(summary.turningPoint);
-    assert.equal(summary.turningPoint?.beforePrompt, '定期便を消して');
-    assert.equal(
-      summary.turningPoint?.afterPrompt,
-      '定期便の初期チェックを外して解約条件を明記して',
-    );
+    assert.deepEqual(summary.turningPoint, { beforeTurn: 2, afterTurn: 3 });
     assert.equal(summary.systemLogLines.length, 2);
     assert.match(
       summary.systemLogLines[0],
       /質問した `2回` 直してと頼んだ `2回` 同じ所を直し直した `1回` 1回で思いどおりに直った割合 `50%`/,
     );
+    // サーバーの振り返り文には本文がなく、何番目の発言かの目印だけが入る
+    assert.match(summary.systemLogLines[1], /`\{\{turn:2\}\}` から条件を具体化した `\{\{turn:3\}\}`/);
+    // ブラウザが手元の本文に置き換える
+    const turnTexts = ['店長、定期便ってどうして付けてるの？', '客B、どこで困ったの？', '定期便を消して', '定期便の初期チェックを外して解約条件を明記して'];
     assert.match(
-      summary.systemLogLines[1],
+      fillTurnRefs(summary.systemLogLines[1], turnTexts),
       /`定期便を消して` から条件を具体化した `定期便の初期チェックを外して解約条件を明記して`/,
     );
+    // 本文が手元にないとき（画面を開き直したなど）は、その指示、と書く
+    assert.match(fillTurnRefs(summary.systemLogLines[1], []), /`その指示` から条件を具体化した `その指示`/);
+    // Natural Language API が取り出した語でも、題材の語彙にないもの（人名など）は残さない
+    assert.deepEqual(limitEntitiesToVocabulary(['山田太郎', '定期便のチェック', '090-1234-5678', '定期便']), ['定期便']);
     for (const line of summary.systemLogLines) {
       assert.doesNotMatch(line, /[()（）「」『』]/);
     }
@@ -1586,14 +1627,14 @@ describe('core-loop', () => {
     const goalSummary = summarizePromptTelemetry([
       {
         ...secondExecEvent,
-        promptText: '定期便を消して',
+        turnIndex: 0,
         embeddingSignal: classifyDeterministicArchetype('定期便を消して', 'execute'),
         isReworkOnSameComponent: false,
         removedNeededFeature: true,
       },
       {
         ...secondExecEvent,
-        promptText: goalPrompt,
+        turnIndex: 1,
         embeddingSignal: classifyDeterministicArchetype(goalPrompt, 'execute'),
         isReworkOnSameComponent: true,
         removedNeededFeature: false,
@@ -1602,7 +1643,7 @@ describe('core-loop', () => {
     assert.equal(goalSummary.goalDirectedTurns, 1);
     assert.match(goalSummary.systemLogLines[0], /うち目的を伝えた `1回`/);
     assert.match(
-      goalSummary.systemLogLines[1],
+      fillTurnRefs(goalSummary.systemLogLines[1], ['定期便を消して', goalPrompt]),
       /`定期便を消して` から目的を伝えた `定期便を望む人だけが自分で選べるようにして`/,
     );
     for (const line of goalSummary.systemLogLines) {
@@ -1613,7 +1654,7 @@ describe('core-loop', () => {
     const unrelatedSummary = summarizePromptTelemetry([
       {
         ...secondExecEvent,
-        promptText: 'あと最初に出てくる500円OFFの広告もじゃまだから出ないようにして',
+        turnIndex: 0,
         changedComponentIds: ['popup-coupon'],
         nlSignal: extractDeterministicNlSignal('あと最初に出てくる500円OFFの広告もじゃまだから出ないようにして'),
         embeddingSignal: classifyDeterministicArchetype('あと最初に出てくる500円OFFの広告もじゃまだから出ないようにして', 'execute'),
@@ -1622,7 +1663,7 @@ describe('core-loop', () => {
       },
       {
         ...secondExecEvent,
-        promptText: '勝手に定期便になるのひどい。チェックは最初外して、字ももっと大きくして',
+        turnIndex: 1,
         changedComponentIds: ['check-subscription'],
         nlSignal: extractDeterministicNlSignal('勝手に定期便になるのひどい。チェックは最初外して、字ももっと大きくして'),
         embeddingSignal: classifyDeterministicArchetype('勝手に定期便になるのひどい。チェックは最初外して、字ももっと大きくして', 'execute'),

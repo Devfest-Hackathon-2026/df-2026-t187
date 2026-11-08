@@ -23,8 +23,12 @@ import {
 } from './gemini.ts';
 import {
   synthesizeStudioSpeech,
+  recordRunEvent,
+  type RunEventInput,
 } from './store.ts';
 import { RateLimiter, clientKeyOf, rateLimitGroupOf } from './rateLimit.ts';
+import { describeErrorForLog } from './logSafe.ts';
+import { PromptRejectedError, assertPromptAllowed } from './modelArmor.ts';
 
 const apiRateLimiter = new RateLimiter();
 // 使われなくなった接続元の記録を捨てる。サーバーの終了を妨げないよう unref する
@@ -42,6 +46,13 @@ const VALID_OWNER_SITUATIONS = new Set<OwnerLineRequest['situation']>([
   'closing',
   'reply',
 ]);
+
+/** 発言の番号は 0 以上の整数だけを受け付ける。それ以外は番号なしとして扱う */
+function sanitizeTurnIndex(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value < 10_000
+    ? value
+    : undefined;
+}
 
 function isValidAppSpec(value: unknown): value is AppSpec {
   if (!value || typeof value !== 'object') return false;
@@ -166,8 +177,12 @@ export async function handleApiRequest(
         sendJson(res, 400, { error: 'currentSpec と userMessage が必要です' });
         return true;
       }
+      // Gemini に送る前に、個人情報やAIへの指示の乗っ取りが含まれていないかを調べる
+      await assertPromptAllowed(body.userMessage.slice(0, MAX_TEXT_INPUT_LENGTH));
       const result = await chatWithStudio({
         ...body,
+        turnIndex: sanitizeTurnIndex(body.turnIndex),
+        shareForAggregate: body.shareForAggregate === true,
         userMessage: body.userMessage.slice(0, MAX_TEXT_INPUT_LENGTH),
         targetComponentIds: Array.isArray(body.targetComponentIds)
           ? body.targetComponentIds.filter((id): id is string => typeof id === 'string').slice(0, 20)
@@ -187,14 +202,44 @@ export async function handleApiRequest(
         sendJson(res, 400, { error: 'currentSpec と手直し内容が必要です' });
         return true;
       }
+      await assertPromptAllowed(body.userInstruction.slice(0, MAX_TEXT_INPUT_LENGTH));
       const result = await applyOptionToSpec({
         ...body,
+        turnIndex: sanitizeTurnIndex(body.turnIndex),
+        shareForAggregate: body.shareForAggregate === true,
         userInstruction: body.userInstruction.slice(0, MAX_TEXT_INPUT_LENGTH),
         targetComponentIds: Array.isArray(body.targetComponentIds)
           ? body.targetComponentIds.filter((id): id is string => typeof id === 'string').slice(0, 20)
           : [],
       });
       sendJson(res, 200, result);
+      return true;
+    }
+
+    if (req.method === 'POST' && url === '/api/run-event') {
+      const body = await readJsonBody<Partial<RunEventInput>>(req);
+      const reasons = ['cleared', 'reset', 'closed', 'idle'] as const;
+      const isCount = (v: unknown) => typeof v === 'number' && Number.isInteger(v) && v >= 0 && v < 10_000;
+      if (
+        typeof body?.runId !== 'string' ||
+        !/^run-[0-9a-z-]{1,40}$/.test(body.runId) ||
+        (body.eventType !== 'start' && body.eventType !== 'end')
+      ) {
+        sendJson(res, 400, { error: 'runId と eventType が必要です' });
+        return true;
+      }
+      // 決まった値だけを取り出して送る。自由に書ける文字列は受け取らない
+      await recordRunEvent({
+        runId: body.runId,
+        eventType: body.eventType,
+        endReason: reasons.find((r) => r === body.endReason),
+        cohortId: typeof body.cohortId === 'string' && /^[a-z_]{1,20}$/.test(body.cohortId) ? body.cohortId : undefined,
+        scenario: typeof body.scenario === 'string' && /^[a-z_:]{1,30}$/.test(body.scenario) ? body.scenario : undefined,
+        turnCount: isCount(body.turnCount) ? body.turnCount : undefined,
+        achievedCount: isCount(body.achievedCount) ? body.achievedCount : undefined,
+        totalCustomers: isCount(body.totalCustomers) ? body.totalCustomers : undefined,
+      });
+      sendJson(res, 200, { ok: true });
       return true;
     }
 
@@ -253,6 +298,11 @@ export async function handleApiRequest(
     sendJson(res, 404, { error: `未対応のAPIエンドポイントです: ${req.method} ${url}` });
     return true;
   } catch (err) {
+    if (err instanceof PromptRejectedError) {
+      // 止めた理由の種類だけを返す。発言そのものは返さず、ログにも残さない
+      sendJson(res, err.statusCode, { error: err.message, code: err.code, reason: err.reason });
+      return true;
+    }
     if (
       err instanceof AiNotConfiguredError ||
       err instanceof AiTimeoutError ||
@@ -266,7 +316,7 @@ export async function handleApiRequest(
       return true;
     }
     // 原因は開発者向けにログへ残し、学習者には分かる言葉だけを返す
-    console.error('[api] リクエスト処理に失敗しました:', err);
+    console.error('[api] リクエスト処理に失敗しました:', describeErrorForLog(err));
     sendJson(res, 500, {
       error: 'お助けAIがうまく返事できませんでした。もう一度送ってください。',
     });

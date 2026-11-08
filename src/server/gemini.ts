@@ -23,6 +23,7 @@ import {
   simulatePersonaComputerUse,
   validateSandboxSpec,
 } from '../shared/sandboxValidator.ts';
+import { describeErrorForLog } from './logSafe.ts';
 import {
   classifyUserMessageIntent,
   detectExplicitRecipientMention,
@@ -323,7 +324,7 @@ export async function voiceOwnerLine(req: OwnerLineRequest): Promise<OwnerLineRe
       .slice(0, 2);
     return { text: lines.length > 0 ? lines.join('\n') : req.fallback };
   } catch (err) {
-    console.warn('[gemini:owner] 店長のせりふを作れなかったため決まったせりふを使います:', err);
+    console.warn('[gemini:owner] 店長のせりふを作れなかったため決まったせりふを使います:', describeErrorForLog(err));
     return { text: req.fallback };
   }
 }
@@ -482,7 +483,7 @@ async function voiceCohortCustomers(
       };
     });
   } catch (err) {
-    console.warn('[gemini:customer] お客さんの返事を作れなかったためシミュレーターの言葉を使います:', err);
+    console.warn('[gemini:customer] お客さんの返事を作れなかったためシミュレーターの言葉を使います:', describeErrorForLog(err));
     return fallbackReplies;
   }
 }
@@ -580,7 +581,6 @@ export async function recordHumanDecisionWithFunctionCalling(
   let recordedVia: 'gemini_function_call' | 'local_function_call' = 'local_function_call';
   // 理由は任意。空のまま記録し、AIが勝手に理由を補わないようにする
   const originalReason = (req.reason ?? '').trim();
-  let normalizedReason = originalReason;
 
   // 手直し（applyOptionToSpec）のたびに理由なしで並列呼び出しすると、利用枠（429）の消費が2倍になり、
   // しかも返り値の引数は使われないため、客層選択（/api/decision）や理由があるときだけ Gemini を呼ぶ
@@ -606,14 +606,10 @@ export async function recordHumanDecisionWithFunctionCalling(
       const fnCall = response.functionCalls?.[0];
       if (fnCall && fnCall.name === 'record_human_decision') {
         recordedVia = 'gemini_function_call';
-        const args = fnCall.args as Record<string, unknown> | undefined;
-        if (originalReason && args && typeof args.reason === 'string' && args.reason.trim()) {
-          normalizedReason = args.reason.trim();
-        }
       }
     } catch (err) {
       // 判断の記録はAIの成否に左右されないよう、AI呼び出しに失敗しても人間の入力どおりに保存する
-      console.error('[gemini:functionCall] AI経由の記録に失敗したため入力どおりに保存します:', err);
+      console.error('[gemini:functionCall] AI経由の記録に失敗したため入力どおりに保存します:', describeErrorForLog(err));
     }
   }
 
@@ -622,7 +618,8 @@ export async function recordHumanDecisionWithFunctionCalling(
     stage: req.stage,
     targetId: req.targetId,
     chosenLabel: req.chosenLabel,
-    reason: normalizedReason,
+    // 自由に書かれた理由は、学習者を特定できる言葉が混ざりうるので保存しない。保存するのは決まった値だけ
+    reason: '',
     recordedVia,
     createdAt: new Date().toISOString(),
   };
@@ -1010,7 +1007,7 @@ export function applyPatchesToSpecWithValidation(
   });
 
   if (!validation.valid) {
-    console.warn('[gemini:apply] 検証失敗のためロールバックします:', validation.errors);
+    console.warn('[gemini:apply] 検証失敗のためロールバックします:', `${validation.errors.length}件`);
     return {
       commitMessage: 'うまく動かなかったので元に戻しました',
       updatedSpec: structuredClone(currentSpec),
@@ -1150,6 +1147,8 @@ export async function applyOptionToSpec(req: ApplyRequest): Promise<ApplyRespons
     recordPromptTelemetryEvent({
       cohortId: req.cohortId,
       runId: req.runId,
+      turnIndex: req.turnIndex,
+      shareForAggregate: req.shareForAggregate,
       promptText: req.userInstruction,
       sessionMode: 'execute',
       recipient: 'assistant',
@@ -1288,7 +1287,7 @@ export async function evaluateAppWithPersonas(req: EvaluateRequest): Promise<Eva
     parsed = parseJsonResponse<typeof parsed>(response.text, 'evaluate');
   } catch (err) {
     if (err instanceof AiNotConfiguredError) throw err;
-    console.warn('[gemini:evaluate] 感想の生成に失敗したため、シミュレーターの言葉を使います:', err);
+    console.warn('[gemini:evaluate] 感想の生成に失敗したため、シミュレーターの言葉を使います:', describeErrorForLog(err));
   }
 
   const results: ReviewerEvaluation[] = reviewers.map((p) => {
@@ -1376,6 +1375,8 @@ async function applyFromChat(req: ChatRequest): Promise<ChatResponse> {
     userInstruction: req.userMessage,
     cohortId: req.cohortId,
     runId: req.runId,
+    turnIndex: req.turnIndex,
+    shareForAggregate: req.shareForAggregate,
     annotatedImageBase64: req.annotatedImageBase64,
     history: req.history,
   });
@@ -1543,6 +1544,8 @@ export async function chatWithStudio(req: ChatRequest): Promise<ChatResponse> {
       recordPromptTelemetryEvent({
         cohortId: effectiveReq.cohortId,
         runId: effectiveReq.runId,
+        turnIndex: effectiveReq.turnIndex,
+        shareForAggregate: effectiveReq.shareForAggregate,
         promptText: effectiveReq.userMessage,
         sessionMode: 'explore',
         recipient: 'owner',
@@ -1563,6 +1566,8 @@ export async function chatWithStudio(req: ChatRequest): Promise<ChatResponse> {
       recordPromptTelemetryEvent({
         cohortId: effectiveReq.cohortId,
         runId: effectiveReq.runId,
+        turnIndex: effectiveReq.turnIndex,
+        shareForAggregate: effectiveReq.shareForAggregate,
         promptText: effectiveReq.userMessage,
         sessionMode: 'explore',
         recipient: 'customer',
@@ -1691,7 +1696,7 @@ export async function chatWithStudio(req: ChatRequest): Promise<ChatResponse> {
     parsed = parseJsonResponse<typeof parsed>(response.text, 'triage');
   } catch (err) {
     if (err instanceof AiNotConfiguredError) throw err;
-    console.warn('[gemini:triage] 振り分け応答に失敗したためフォールバックします:', err);
+    console.warn('[gemini:triage] 振り分け応答に失敗したためフォールバックします:', describeErrorForLog(err));
     if (circledOnly && targets.length > 0) {
       const targetName =
         targets[0].label.replace(/\{[^}]+\}/g, '').trim() || targets[0].caption || 'この部品';
@@ -1741,6 +1746,8 @@ export async function chatWithStudio(req: ChatRequest): Promise<ChatResponse> {
       ? await recordPromptTelemetryEvent({
           cohortId: effectiveReq.cohortId,
           runId: effectiveReq.runId,
+          turnIndex: effectiveReq.turnIndex,
+          shareForAggregate: effectiveReq.shareForAggregate,
           promptText: effectiveReq.userMessage,
           sessionMode: 'explore',
           recipient: 'assistant',

@@ -5,7 +5,7 @@
 
 import type { IncomingMessage } from 'node:http';
 
-export type RateLimitGroup = 'gemini' | 'tts';
+export type RateLimitGroup = 'gemini' | 'tts' | 'record';
 
 export interface RateLimitRule {
   /** 1つの接続元が、時間の枠の中で呼べる回数 */
@@ -24,6 +24,11 @@ export const DEFAULT_RATE_LIMITS: Record<RateLimitGroup, RateLimitRule> = {
     perClient: readLimit('RATE_LIMIT_TTS_PER_CLIENT', 60),
     global: readLimit('RATE_LIMIT_TTS_GLOBAL', 300),
   },
+  /** 挑戦の始まりと終わりの記録。1回の挑戦で2回ほど */
+  record: {
+    perClient: readLimit('RATE_LIMIT_RECORD_PER_CLIENT', 20),
+    global: readLimit('RATE_LIMIT_RECORD_GLOBAL', 300),
+  },
 };
 
 const WINDOW_MS = 60_000;
@@ -37,6 +42,7 @@ const GROUP_BY_PATH: Record<string, RateLimitGroup> = {
   '/api/transcribe': 'gemini',
   '/api/decision': 'gemini',
   '/api/tts': 'tts',
+  '/api/run-event': 'record',
 };
 
 function readLimit(name: string, fallback: number): number {

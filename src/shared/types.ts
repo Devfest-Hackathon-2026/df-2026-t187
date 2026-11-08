@@ -373,6 +373,10 @@ export interface ApplyRequest {
   cohortId?: TargetCohortId;
   /** 1回の挑戦ごとの番号。振り返りの記録を、ほかの挑戦やほかの人の記録と混ぜないために使う */
   runId?: string;
+  /** その挑戦の中で何番目の発言か。指示の本文の代わりに、振り返りの引用の目印にする */
+  turnIndex?: number;
+  /** 学習者が、この挑戦の記録をみんなの集計に加えることに同意したか */
+  shareForAggregate?: boolean;
   annotatedImageBase64?: string;
   history?: ChatHistoryEntry[];
 }
@@ -455,6 +459,10 @@ export interface ChatRequest {
   cohortId?: TargetCohortId;
   /** 1回の挑戦ごとの番号。振り返りの記録を、ほかの挑戦やほかの人の記録と混ぜないために使う */
   runId?: string;
+  /** その挑戦の中で何番目の発言か。指示の本文の代わりに、振り返りの引用の目印にする */
+  turnIndex?: number;
+  /** 学習者が、この挑戦の記録をみんなの集計に加えることに同意したか */
+  shareForAggregate?: boolean;
   annotatedImageBase64?: string;
   history?: ChatHistoryEntry[];
   /** circled は、学習者が赤ペンで囲んだだけのとき。受け止めて尋ねるだけで、画面は変えない */
