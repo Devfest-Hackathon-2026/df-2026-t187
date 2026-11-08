@@ -180,7 +180,7 @@ function saveAggregateConsent(consent: boolean): void {
 // ============================================================================
 
 /** 注意の内容を変えたら版を上げ、もう一度読んでもらう */
-const TERMS_VERSION = '2026-11-08.10';
+const TERMS_VERSION = '2026-11-08.12';
 const TERMS_STORAGE_KEY = 'ponkotsu:termsAccepted';
 
 const TERMS_SUMMARY = '学習用の架空のお店の注文画面を、AIと一緒に直すツールです。';
@@ -200,15 +200,18 @@ const TERMS_ITEMS: TermsPart[][] = [
   ['指示と画面の画像は Google Cloud の Gemini に送られます。文章は保存しません'],
   ['名前や連絡先など、個人を特定できる情報は入力しないでください'],
   ['お客さんや店長の返事はAIが作ったもので、誤りを含むことがあります'],
+  // 1分あたり・同時・1日あたりの上限があることを先に知らせる。数値は環境変数で変わるので書かない
+  ['送れる回数と1日の利用量には上限があり、超えると一時的に使えなくなります'],
   ['不審なリクエストは、予告なく制限・拒否することがあります'],
   // 決勝に進んだ場合の Demo Day（11月27日）と GDG DevFest Tokyo（11月29日）まで動かせるよう、最初から長めにしておく
   ['公開は11月29日までの予定です。予告なく止めたり変えたりすることがあります'],
 ];
 
-/** 運営者と問い合わせ先。条文とは分けて、注意のすぐ下に番号なしの1行で置く */
-const OPERATOR_LINE: TermsPart[] = [
-  `運営: ${OPERATOR.team}, 代表者: ${OPERATOR.representative}, 問い合わせ: `,
-  { text: OPERATOR.email, href: `mailto:${OPERATOR.email}` },
+/** 運営者と問い合わせ先。条文とは分けて、注意のすぐ下に、見出しと値の組で並べる */
+const OPERATOR_ITEMS: Array<{ label: string; value: TermsPart[] }> = [
+  { label: '運営', value: [OPERATOR.team] },
+  { label: '代表者', value: [OPERATOR.representative] },
+  { label: '問い合わせ', value: [{ text: OPERATOR.email, href: `mailto:${OPERATOR.email}` }] },
 ];
 
 /** 文字とリンクを並べて、1つの要素に書き込む */
@@ -285,9 +288,18 @@ function openTermsDialog(mode: 'first' | 'review', onAccepted?: () => void): voi
     appendTermsParts(li, parts);
     noticeList.appendChild(li);
   }
-  const operatorLine = document.createElement('p');
+  const operatorLine = document.createElement('dl');
   operatorLine.className = 'terms-operator';
-  appendTermsParts(operatorLine, OPERATOR_LINE);
+  for (const item of OPERATOR_ITEMS) {
+    const pair = document.createElement('div');
+    pair.className = 'terms-operator-item';
+    const dt = document.createElement('dt');
+    dt.textContent = item.label;
+    const dd = document.createElement('dd');
+    appendTermsParts(dd, item.value);
+    pair.append(dt, dd);
+    operatorLine.appendChild(pair);
+  }
 
   // 自分で選ぶ所。枠で囲んで目立たせ、チェックは最初は外しておく
   const consentBox = document.createElement('div');

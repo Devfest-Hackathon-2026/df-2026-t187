@@ -2,14 +2,18 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import type {
   ApplyRequest,
   AppSpec,
+  ChatHistoryEntry,
   ChatRequest,
   DecisionStage,
   EvaluateRequest,
   OwnerLineRequest,
+  LatestReviewRecord,
   RecordDecisionRequest,
+  TargetCohortId,
   TranscribeRequest,
   TtsRequest,
 } from '../shared/types.ts';
+import { ACTIVE_THEME } from '../shared/initialTheme.ts';
 import {
   AiNotConfiguredError,
   AiTimeoutError,
@@ -26,15 +30,25 @@ import {
   recordRunEvent,
   type RunEventInput,
 } from './store.ts';
-import { RateLimiter, clientKeyOf, rateLimitGroupOf } from './rateLimit.ts';
+import {
+  ConcurrencyGate,
+  DailyLimitError,
+  MAX_CONCURRENT_PER_CLIENT,
+  RateLimiter,
+  clientKeyOf,
+  dailyGeminiCounter,
+  isAllowedOrigin,
+  maxBodyBytesFor,
+  rateLimitGroupOf,
+} from './rateLimit.ts';
 import { describeErrorForLog } from './logSafe.ts';
 import { PromptRejectedError, assertPromptAllowed } from './modelArmor.ts';
 
 const apiRateLimiter = new RateLimiter();
+const geminiConcurrency = new ConcurrencyGate(MAX_CONCURRENT_PER_CLIENT);
 // 使われなくなった接続元の記録を捨てる。サーバーの終了を妨げないよう unref する
 setInterval(() => apiRateLimiter.prune(), 5 * 60_000).unref();
 
-const MAX_BODY_BYTES = 8 * 1024 * 1024; // 8MB (ペン描きスクリーンショットBase64対応)
 const MAX_TEXT_INPUT_LENGTH = 2_000;
 const VALID_DECISION_STAGES = new Set<DecisionStage>([
   'select_cohort',
@@ -54,6 +68,68 @@ function sanitizeTurnIndex(value: unknown): number | undefined {
     : undefined;
 }
 
+const RUN_ID_RE = /^run-[0-9a-z-]{1,40}$/;
+const COHORT_IDS = new Set<string>(ACTIVE_THEME.cohorts.map((c) => c.id));
+const MAX_HISTORY_ENTRIES = 20;
+const MAX_HISTORY_TEXT_LENGTH = 1_000;
+
+/** 挑戦の番号は画面が作る形だけを受け付ける。記録に自由な文字列が入らないようにする */
+function sanitizeRunId(value: unknown): string | undefined {
+  return typeof value === 'string' && RUN_ID_RE.test(value) ? value : undefined;
+}
+
+/** 客層は題材に決まっているものだけを受け付ける */
+function sanitizeCohortId(value: unknown): TargetCohortId | undefined {
+  return typeof value === 'string' && COHORT_IDS.has(value) ? (value as TargetCohortId) : undefined;
+}
+
+function sanitizeComponentIds(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((id): id is string => typeof id === 'string' && id.length <= 80).slice(0, 20)
+    : [];
+}
+
+/** 会話の履歴は件数と長さを抑え、形の正しいものだけを Gemini に渡す */
+function sanitizeHistory(value: unknown): ChatHistoryEntry[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter(
+      (e): e is ChatHistoryEntry =>
+        Boolean(e) && typeof e.speaker === 'string' && typeof e.text === 'string',
+    )
+    .slice(-MAX_HISTORY_ENTRIES)
+    .map((e) => ({ speaker: e.speaker.slice(0, 20), text: e.text.slice(0, MAX_HISTORY_TEXT_LENGTH) }));
+}
+
+/** 直近のお客さんの反応の記録も、人数と行数と長さを抑える */
+function sanitizeLatestReviews(value: unknown): LatestReviewRecord | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const v = value as Partial<LatestReviewRecord>;
+  if (!Array.isArray(v.reviews)) return undefined;
+  const text = (s: unknown, max: number) => (typeof s === 'string' ? s.slice(0, max) : '');
+  return {
+    screenLabel: text(v.screenLabel, 40),
+    isCurrentScreen: v.isCurrentScreen === true,
+    reviews: v.reviews.slice(0, 9).map((r) => ({
+      name: text(r?.name, 40),
+      outcome: r?.outcome,
+      actionTrace: Array.isArray(r?.actionTrace) ? r.actionTrace.slice(0, 40).map((t) => text(t, 200)) : [],
+    })),
+    ownerMetrics: Array.isArray(v.ownerMetrics)
+      ? v.ownerMetrics.slice(0, 10).map((m) => ({
+          label: text(m?.label, 40),
+          count: typeof m?.count === 'number' ? m.count : 0,
+          missing: m?.missing === true,
+        }))
+      : undefined,
+  };
+}
+
+/** 学習者が自分で書いた発言を集める。今の発言に加え、会話の履歴にある学習者の発言も調べる */
+function learnerTextsForScreening(message: string, history: ChatHistoryEntry[]): string {
+  return [...history.filter((e) => e.speaker === 'ユーザー').map((e) => e.text), message].join('\n');
+}
+
 function isValidAppSpec(value: unknown): value is AppSpec {
   if (!value || typeof value !== 'object') return false;
   const candidate = value as Partial<AppSpec>;
@@ -68,16 +144,20 @@ class PayloadTooLargeError extends Error {
   }
 }
 
+/** 本文を読む。大きさの上限はAPIごとに決め、画像や音声を送らないAPIは小さく抑える */
 function readJsonBody<T>(req: IncomingMessage): Promise<T> {
+  const maxBytes = maxBodyBytesFor((req.url ?? '').split('?')[0]);
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let total = 0;
 
     req.on('data', (chunk: Buffer) => {
       total += chunk.length;
-      if (total > MAX_BODY_BYTES) {
+      if (total > maxBytes) {
+        // 読むのをやめ、413 を返してから接続を閉じる。先に接続を切ると、画面に理由が届かない
+        req.removeAllListeners('data');
+        req.pause();
         reject(new PayloadTooLargeError());
-        req.destroy();
         return;
       }
       chunks.push(chunk);
@@ -127,10 +207,22 @@ export async function handleApiRequest(
     return false;
   }
 
+  // ほかのサイトのページから、利用者のブラウザを通して呼ばせることは断る
+  if (req.method === 'POST' && !isAllowedOrigin(req)) {
+    sendJson(res, 403, { error: 'このサイトの画面からだけ使えます。' });
+    return true;
+  }
+
   // Gemini や読み上げを呼ぶAPIは、本文を読む前に回数の上限を確かめる
   const limitGroup = rateLimitGroupOf(req.method, url);
+  const clientKey = clientKeyOf(req);
   if (limitGroup) {
-    const taken = apiRateLimiter.take(limitGroup, clientKeyOf(req));
+    if (limitGroup === 'gemini' && dailyGeminiCounter.isExhausted()) {
+      const err = new DailyLimitError();
+      sendJson(res, err.statusCode, { error: err.message, code: err.code });
+      return true;
+    }
+    const taken = apiRateLimiter.take(limitGroup, clientKey);
     if (!taken.ok) {
       sendJson(
         res,
@@ -141,6 +233,28 @@ export async function handleApiRequest(
       return true;
     }
   }
+
+  // 1つの接続元から同時に処理する数を抑え、一度に大量に送られても利用枠を使い切らないようにする
+  if (limitGroup === 'gemini') {
+    if (!geminiConcurrency.tryEnter(clientKey)) {
+      sendJson(res, 429, { error: '前の返事を待ってから、もう一度送ってください。' });
+      return true;
+    }
+    try {
+      return await routeApiRequest(req, res, url);
+    } finally {
+      geminiConcurrency.leave(clientKey);
+    }
+  }
+  return routeApiRequest(req, res, url);
+}
+
+/** 確認を通ったリクエストを、それぞれのAPIに振り分ける */
+async function routeApiRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  url: string,
+): Promise<boolean> {
 
   try {
     if (req.method === 'GET' && url === '/api/status') {
@@ -161,11 +275,13 @@ export async function handleApiRequest(
         sendJson(res, 400, { error: '有効な stage, targetId, chosenLabel が必要です' });
         return true;
       }
+      // 判断の記録に残すのは決まった値だけ。自由に書かれた理由は受け取らない
       const result = await recordHumanDecisionWithFunctionCalling({
-        ...body,
-        targetId: body.targetId.slice(0, 200),
-        chosenLabel: body.chosenLabel.slice(0, 500),
-        reason: typeof body.reason === 'string' ? body.reason.slice(0, MAX_TEXT_INPUT_LENGTH) : '',
+        stage: body.stage,
+        targetId: body.targetId.slice(0, 80),
+        chosenLabel: body.chosenLabel.slice(0, 80),
+        reason: '',
+        cohortId: sanitizeCohortId(body.cohortId),
       });
       sendJson(res, 200, result);
       return true;
@@ -177,16 +293,22 @@ export async function handleApiRequest(
         sendJson(res, 400, { error: 'currentSpec と userMessage が必要です' });
         return true;
       }
-      // Gemini に送る前に、個人情報やAIへの指示の乗っ取りが含まれていないかを調べる
-      await assertPromptAllowed(body.userMessage.slice(0, MAX_TEXT_INPUT_LENGTH));
+      const userMessage = body.userMessage.slice(0, MAX_TEXT_INPUT_LENGTH);
+      const history = sanitizeHistory(body.history);
+      // Gemini に送る前に、個人情報やAIへの指示の乗っ取りが含まれていないかを調べる。
+      // 履歴の学習者の発言も調べ、画面を通さずに送られた履歴から乗っ取られないようにする
+      await assertPromptAllowed(learnerTextsForScreening(userMessage, history));
       const result = await chatWithStudio({
         ...body,
+        runId: sanitizeRunId(body.runId),
+        cohortId: sanitizeCohortId(body.cohortId),
         turnIndex: sanitizeTurnIndex(body.turnIndex),
         shareForAggregate: body.shareForAggregate === true,
-        userMessage: body.userMessage.slice(0, MAX_TEXT_INPUT_LENGTH),
-        targetComponentIds: Array.isArray(body.targetComponentIds)
-          ? body.targetComponentIds.filter((id): id is string => typeof id === 'string').slice(0, 20)
-          : [],
+        userMessage,
+        history,
+        latestReviews: sanitizeLatestReviews(body.latestReviews),
+        targetComponentIds: sanitizeComponentIds(body.targetComponentIds),
+        recipient: typeof body.recipient === 'string' ? body.recipient.slice(0, 40) : undefined,
       });
       sendJson(res, 200, result);
       return true;
@@ -202,15 +324,18 @@ export async function handleApiRequest(
         sendJson(res, 400, { error: 'currentSpec と手直し内容が必要です' });
         return true;
       }
-      await assertPromptAllowed(body.userInstruction.slice(0, MAX_TEXT_INPUT_LENGTH));
+      const userInstruction = body.userInstruction.slice(0, MAX_TEXT_INPUT_LENGTH);
+      const history = sanitizeHistory(body.history);
+      await assertPromptAllowed(learnerTextsForScreening(userInstruction, history));
       const result = await applyOptionToSpec({
         ...body,
+        runId: sanitizeRunId(body.runId),
+        cohortId: sanitizeCohortId(body.cohortId),
         turnIndex: sanitizeTurnIndex(body.turnIndex),
         shareForAggregate: body.shareForAggregate === true,
-        userInstruction: body.userInstruction.slice(0, MAX_TEXT_INPUT_LENGTH),
-        targetComponentIds: Array.isArray(body.targetComponentIds)
-          ? body.targetComponentIds.filter((id): id is string => typeof id === 'string').slice(0, 20)
-          : [],
+        userInstruction,
+        history,
+        targetComponentIds: sanitizeComponentIds(body.targetComponentIds),
       });
       sendJson(res, 200, result);
       return true;
@@ -220,20 +345,17 @@ export async function handleApiRequest(
       const body = await readJsonBody<Partial<RunEventInput>>(req);
       const reasons = ['cleared', 'reset', 'closed', 'idle'] as const;
       const isCount = (v: unknown) => typeof v === 'number' && Number.isInteger(v) && v >= 0 && v < 10_000;
-      if (
-        typeof body?.runId !== 'string' ||
-        !/^run-[0-9a-z-]{1,40}$/.test(body.runId) ||
-        (body.eventType !== 'start' && body.eventType !== 'end')
-      ) {
+      const runId = sanitizeRunId(body?.runId);
+      if (!runId || (body.eventType !== 'start' && body.eventType !== 'end')) {
         sendJson(res, 400, { error: 'runId と eventType が必要です' });
         return true;
       }
       // 決まった値だけを取り出して送る。自由に書ける文字列は受け取らない
       await recordRunEvent({
-        runId: body.runId,
+        runId,
         eventType: body.eventType,
         endReason: reasons.find((r) => r === body.endReason),
-        cohortId: typeof body.cohortId === 'string' && /^[a-z_]{1,20}$/.test(body.cohortId) ? body.cohortId : undefined,
+        cohortId: sanitizeCohortId(body.cohortId),
         scenario: typeof body.scenario === 'string' && /^[a-z_:]{1,30}$/.test(body.scenario) ? body.scenario : undefined,
         turnCount: isCount(body.turnCount) ? body.turnCount : undefined,
         achievedCount: isCount(body.achievedCount) ? body.achievedCount : undefined,
@@ -264,7 +386,12 @@ export async function handleApiRequest(
         sendJson(res, 400, { error: 'currentSpec が必要です' });
         return true;
       }
-      const result = await evaluateAppWithPersonas(body);
+      const result = await evaluateAppWithPersonas({
+        ...body,
+        runId: sanitizeRunId(body.runId),
+        cohortId: sanitizeCohortId(body.cohortId),
+        history: sanitizeHistory(body.history),
+      });
       sendJson(res, 200, result);
       return true;
     }
@@ -298,16 +425,21 @@ export async function handleApiRequest(
     sendJson(res, 404, { error: `未対応のAPIエンドポイントです: ${req.method} ${url}` });
     return true;
   } catch (err) {
+    if (err instanceof DailyLimitError) {
+      sendJson(res, err.statusCode, { error: err.message, code: err.code });
+      return true;
+    }
     if (err instanceof PromptRejectedError) {
       // 止めた理由の種類だけを返す。発言そのものは返さず、ログにも残さない
       sendJson(res, err.statusCode, { error: err.message, code: err.code, reason: err.reason });
       return true;
     }
-    if (
-      err instanceof AiNotConfiguredError ||
-      err instanceof AiTimeoutError ||
-      err instanceof PayloadTooLargeError
-    ) {
+    if (err instanceof PayloadTooLargeError) {
+      // 残りの本文は読まずに、返事を送ったら接続を閉じる
+      sendJson(res, err.statusCode, { error: err.message }, { Connection: 'close' });
+      return true;
+    }
+    if (err instanceof AiNotConfiguredError || err instanceof AiTimeoutError) {
       sendJson(res, err.statusCode, { error: err.message });
       return true;
     }

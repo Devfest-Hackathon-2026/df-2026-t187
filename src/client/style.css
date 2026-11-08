@@ -1960,13 +1960,38 @@ body {
   color: var(--accent-blue);
 }
 
-/* 運営者と問い合わせ先。条文とは分け、番号なしの1行で注意のすぐ下に置く */
+/* 運営者と問い合わせ先。条文とは分け、見出しと値の組を横に並べる。狭い画面では折り返す */
 .terms-operator {
-  margin: 8px 0 0;
-  padding-top: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 20px;
+  margin: 10px 0 0;
+  padding-top: 10px;
   border-top: 1px solid var(--ink-15);
-  color: var(--ink-60);
   font-size: 0.8rem;
+}
+
+.terms-operator-item {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+
+.terms-operator dt {
+  padding: 0 6px;
+  border-radius: 4px;
+  background: var(--ink-05, rgba(0, 0, 0, 0.05));
+  color: var(--ink-60);
+  font-size: 0.72rem;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.terms-operator dd {
+  margin: 0;
+  color: var(--ink);
+  font-weight: 700;
   overflow-wrap: anywhere;
 }
 

@@ -342,14 +342,6 @@ export interface SandboxValidationResult {
 }
 
 // 差分パッチ操作（案B: 変更箇所だけを適用し、触っていない部品を保護する）
-export type SpecPatchOp =
-  | 'remove_component'
-  | 'replace_component'
-  | 'insert_component'
-  | 'move_component'
-  | 'upsert_state'
-  | 'upsert_derived';
-
 export type SpecPatch =
   | { op: 'remove_component'; id: string }
   | { op: 'replace_component'; component: AppComponent }

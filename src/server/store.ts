@@ -20,8 +20,6 @@ import type {
   TtsResponse,
 } from '../shared/types.ts';
 
-const MAX_IN_MEMORY_DECISIONS = 200;
-const inMemoryDecisions: HumanDecisionRecord[] = [];
 const MAX_IN_MEMORY_TELEMETRY = 300;
 const inMemoryTelemetryEvents: PromptTelemetryEvent[] = [];
 const ttsAudioCache = new Map<string, string>();
@@ -62,16 +60,12 @@ export async function getGcpAccessToken(): Promise<string | null> {
 
 /**
  * 人間の判断記録 (Own the Why) を保存する。
- * Cloud Firestore 環境が構成されている場合は ADC トークン付き REST 経由で送信し、インメモリにも保持する。
+ * Cloud Firestore 環境が構成されている場合は ADC トークン付き REST 経由で送信する。
+ * 保存するのは決まった値だけで、サーバーのメモリには残さない。
  */
 export async function saveHumanDecision(
   decision: HumanDecisionRecord,
 ): Promise<{ persistedToFirestore: boolean }> {
-  inMemoryDecisions.push(decision);
-  if (inMemoryDecisions.length > MAX_IN_MEMORY_DECISIONS) {
-    inMemoryDecisions.splice(0, inMemoryDecisions.length - MAX_IN_MEMORY_DECISIONS);
-  }
-
   const project = process.env.GOOGLE_CLOUD_PROJECT;
   const firestoreEnabled =
     process.env.FIRESTORE_ENABLED !== '0' &&
@@ -277,6 +271,28 @@ export async function classifyPromptWithAgentPlatformEmbeddings(
   }
 }
 
+/** BigQuery のテーブルに行を送る。失敗しても体験は止めない。待たずに返すときは呼び出し側で void する */
+async function insertBigQueryRows(
+  project: string,
+  token: string,
+  table: string,
+  rows: Array<{ insertId: string; json: Record<string, unknown> }>,
+): Promise<void> {
+  const dataset = process.env.BIGQUERY_DATASET || 'studio_telemetry';
+  const url = `https://bigquery.googleapis.com/bigquery/v2/projects/${encodeURIComponent(project)}/datasets/${encodeURIComponent(dataset)}/tables/${encodeURIComponent(table)}/insertAll`;
+  await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+    body: JSON.stringify({
+      kind: 'bigquery#tableDataInsertAllRequest',
+      skipInvalidRows: true,
+      ignoreUnknownValues: true,
+      rows,
+    }),
+    signal: AbortSignal.timeout(1500),
+  }).catch(() => {});
+}
+
 /** Firestore の記録を自動で消すまでの時間。消す処理は Firestore の TTL ポリシーで expireAt を見て行う */
 const TELEMETRY_TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -329,44 +345,31 @@ async function persistTelemetryToCloud(event: PromptTelemetryEvent, shareForAggr
 
     // 2. BigQuery Streaming Insert への保存。集計に加えることに同意した挑戦だけ
     if (!shareForAggregate) return;
-    const dataset = process.env.BIGQUERY_DATASET || 'studio_telemetry';
-    const table = process.env.BIGQUERY_TABLE || 'prompt_events';
-    const bqUrl = `https://bigquery.googleapis.com/bigquery/v2/projects/${encodeURIComponent(project)}/datasets/${encodeURIComponent(dataset)}/tables/${encodeURIComponent(table)}/insertAll`;
-    void fetch(bqUrl, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
-        kind: 'bigquery#tableDataInsertAllRequest',
-        skipInvalidRows: true,
-        ignoreUnknownValues: true,
-        rows: [
-          {
-            insertId: event.id,
-            json: {
-              id: event.id,
-              cohort_id: event.cohortId ?? null,
-              run_id: event.runId ?? null,
-              turn_index: event.turnIndex,
-              session_mode: event.sessionMode,
-              recipient: event.recipient,
-              has_pen_annotation: event.hasPenAnnotation,
-              changed_component_ids: event.changedComponentIds.join(','),
-              is_rework_on_same_component: event.isReworkOnSameComponent,
-              removed_needed_feature: event.removedNeededFeature,
-              closest_archetype: event.embeddingSignal.closestArchetype,
-              similarity_score: event.embeddingSignal.similarityScore,
-              embedding_via: event.embeddingSignal.analyzedVia,
-              entities: event.nlSignal.entities.join(','),
-              has_condition_constraint: event.nlSignal.hasConditionConstraint,
-              sentiment_score: event.nlSignal.sentimentScore,
-              nl_via: event.nlSignal.analyzedVia,
-              created_at: event.createdAt,
-            },
-          },
-        ],
-      }),
-      signal: AbortSignal.timeout(1500),
-    }).catch(() => {});
+    void insertBigQueryRows(project, token, process.env.BIGQUERY_TABLE || 'prompt_events', [
+      {
+        insertId: event.id,
+        json: {
+          id: event.id,
+          cohort_id: event.cohortId ?? null,
+          run_id: event.runId ?? null,
+          turn_index: event.turnIndex,
+          session_mode: event.sessionMode,
+          recipient: event.recipient,
+          has_pen_annotation: event.hasPenAnnotation,
+          changed_component_ids: event.changedComponentIds.join(','),
+          is_rework_on_same_component: event.isReworkOnSameComponent,
+          removed_needed_feature: event.removedNeededFeature,
+          closest_archetype: event.embeddingSignal.closestArchetype,
+          similarity_score: event.embeddingSignal.similarityScore,
+          embedding_via: event.embeddingSignal.analyzedVia,
+          entities: event.nlSignal.entities.join(','),
+          has_condition_constraint: event.nlSignal.hasConditionConstraint,
+          sentiment_score: event.nlSignal.sentimentScore,
+          nl_via: event.nlSignal.analyzedVia,
+          created_at: event.createdAt,
+        },
+      },
+    ]);
   } catch {
     // クラウド送信エラー時はインメモリ記録を維持する
   }
@@ -394,38 +397,22 @@ export async function recordRunEvent(input: RunEventInput): Promise<void> {
   try {
     const token = await getGcpAccessToken();
     if (!token) return;
-    const dataset = process.env.BIGQUERY_DATASET || 'studio_telemetry';
-    const table = process.env.BIGQUERY_RUN_TABLE || 'run_events';
-    const createdAt = new Date().toISOString();
-    await fetch(
-      `https://bigquery.googleapis.com/bigquery/v2/projects/${encodeURIComponent(project)}/datasets/${encodeURIComponent(dataset)}/tables/${encodeURIComponent(table)}/insertAll`,
+    await insertBigQueryRows(project, token, process.env.BIGQUERY_RUN_TABLE || 'run_events', [
       {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({
-          kind: 'bigquery#tableDataInsertAllRequest',
-          skipInvalidRows: true,
-          ignoreUnknownValues: true,
-          rows: [
-            {
-              insertId: `${input.runId}:${input.eventType}`,
-              json: {
-                run_id: input.runId,
-                event_type: input.eventType,
-                end_reason: input.endReason ?? null,
-                cohort_id: input.cohortId ?? null,
-                scenario: input.scenario ?? null,
-                turn_count: input.turnCount ?? null,
-                achieved_count: input.achievedCount ?? null,
-                total_customers: input.totalCustomers ?? null,
-                created_at: createdAt,
-              },
-            },
-          ],
-        }),
-        signal: AbortSignal.timeout(1500),
+        insertId: `${input.runId}:${input.eventType}`,
+        json: {
+          run_id: input.runId,
+          event_type: input.eventType,
+          end_reason: input.endReason ?? null,
+          cohort_id: input.cohortId ?? null,
+          scenario: input.scenario ?? null,
+          turn_count: input.turnCount ?? null,
+          achieved_count: input.achievedCount ?? null,
+          total_customers: input.totalCustomers ?? null,
+          created_at: new Date().toISOString(),
+        },
       },
-    );
+    ]);
   } catch {
     // 記録に失敗しても体験は止めない
   }

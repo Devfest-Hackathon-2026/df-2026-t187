@@ -313,7 +313,7 @@ export function inspectAppliedChangeForTelemetry(
 }
 
 /** 振り返り文の中で、何番目の発言を引用するかの目印 */
-export function turnRef(turnIndex: number): string {
+function turnRef(turnIndex: number): string {
   return `{{turn:${turnIndex}}}`;
 }
 
@@ -338,7 +338,7 @@ export function limitEntitiesToVocabulary(entities: string[]): string[] {
   return kept;
 }
 
-export function cleanPromptForBadge(text: string): string {
+function cleanPromptForBadge(text: string): string {
   const cleaned = text.replace(/`/g, '').replace(/\s+/g, ' ').trim();
   return cleaned.length > 60 ? `${cleaned.slice(0, 59)}…` : cleaned;
 }

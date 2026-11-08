@@ -23,6 +23,7 @@ import {
   simulatePersonaComputerUse,
   validateSandboxSpec,
 } from '../shared/sandboxValidator.ts';
+import { dailyGeminiCounter } from './rateLimit.ts';
 import { describeErrorForLog } from './logSafe.ts';
 import {
   classifyUserMessageIntent,
@@ -199,6 +200,8 @@ async function generateContentWithTimeout(
 ): Promise<GenerateContentResponse> {
   let rateLimitRetried = false;
   for (let attempt = 0; attempt <= retries; attempt++) {
+    // 1日あたりの上限を数える。やり直しも1回として数え、上限に達したらそれ以上呼ばない
+    dailyGeminiCounter.consume();
     try {
       return await aiInfo.client.models.generateContent({
         ...params,

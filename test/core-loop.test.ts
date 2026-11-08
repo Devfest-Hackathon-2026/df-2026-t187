@@ -23,7 +23,18 @@ import {
   withDerivedValues,
 } from '../src/shared/appRuntime.ts';
 import { clipToVisibleRects, detectHitComponents, type Rect2D } from '../src/shared/hitTest.ts';
-import { RateLimiter, clientKeyOf, rateLimitGroupOf } from '../src/server/rateLimit.ts';
+import {
+  ConcurrencyGate,
+  DailyCounter,
+  DailyLimitError,
+  LARGE_BODY_BYTES,
+  RateLimiter,
+  SMALL_BODY_BYTES,
+  clientKeyOf,
+  isAllowedOrigin,
+  maxBodyBytesFor,
+  rateLimitGroupOf,
+} from '../src/server/rateLimit.ts';
 import { PromptRejectedError, assertPromptAllowed, findPersonalInfoByRules, reasonFromModelArmorResult } from '../src/server/modelArmor.ts';
 import {
   ACTIVE_THEME,
@@ -123,6 +134,46 @@ describe('core-loop', () => {
       { x: 30, y: 50 },
     ];
     assert.deepEqual(detectHitComponents(partial, rects), ['product-hero']);
+  });
+
+  it('1日の上限・同時に処理する数・本文の大きさ・呼び出し元で、予期しないトラフィックを止める', () => {
+    // 1日の上限：日本時間で日付が変わったら数え直す
+    let t = Date.parse('2026-11-10T14:00:00Z'); // 日本時間 23:00
+    const daily = new DailyCounter(2, () => t);
+    daily.consume();
+    daily.consume();
+    assert.equal(daily.isExhausted(), true);
+    assert.throws(() => daily.consume(), DailyLimitError);
+    t = Date.parse('2026-11-10T15:00:00Z'); // 日本時間 0:00、翌日
+    assert.equal(daily.isExhausted(), false);
+    daily.consume();
+
+    // 同時に処理する数：接続元ごとに数え、終わったら空く
+    const gate = new ConcurrencyGate(2);
+    assert.equal(gate.tryEnter('a'), true);
+    assert.equal(gate.tryEnter('a'), true);
+    assert.equal(gate.tryEnter('a'), false);
+    assert.equal(gate.tryEnter('b'), true);
+    gate.leave('a');
+    assert.equal(gate.tryEnter('a'), true);
+
+    // 本文の大きさ：画像や音声を送るAPIだけ大きめ
+    assert.equal(maxBodyBytesFor('/api/chat'), LARGE_BODY_BYTES);
+    assert.equal(maxBodyBytesFor('/api/evaluate'), LARGE_BODY_BYTES);
+    assert.equal(maxBodyBytesFor('/api/tts'), SMALL_BODY_BYTES);
+    assert.equal(maxBodyBytesFor('/api/run-event'), SMALL_BODY_BYTES);
+
+    // 呼び出し元：このサイト自身か、前に立つ配信が付けた名前と一致するときだけ通す
+    const req = (headers: Record<string, string>) => ({ headers }) as never;
+    assert.equal(isAllowedOrigin(req({ host: 'app.example.run.app' })), true);
+    assert.equal(isAllowedOrigin(req({ host: 'app.example.run.app', origin: 'https://app.example.run.app' })), true);
+    assert.equal(isAllowedOrigin(req({ host: 'app.example.run.app', origin: 'https://evil.example.com' })), false);
+    assert.equal(
+      isAllowedOrigin(req({ host: 'app.example.run.app', 'x-forwarded-host': 'yukid.web.app', origin: 'https://yukid.web.app' })),
+      true,
+    );
+    assert.equal(isAllowedOrigin(req({ host: 'localhost:5173', origin: 'http://localhost:5173' })), true);
+    assert.equal(isAllowedOrigin(req({ host: 'localhost:5173', origin: 'null' })), false);
   });
 
   it('Gemini に送る前に、個人情報らしき内容やAIへの指示の乗っ取りを止める', async () => {

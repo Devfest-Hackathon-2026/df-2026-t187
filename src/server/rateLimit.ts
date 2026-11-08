@@ -123,3 +123,127 @@ export class RateLimiter {
     }
   }
 }
+
+// ============================================================================
+// 1日あたりの上限（費用の非常停止）と、同時に処理する数の上限
+// ============================================================================
+
+/** Gemini を呼べる1日あたりの回数。日付は日本時間で区切る。サーバー（インスタンス）ごとに数える */
+export const DAILY_GEMINI_LIMIT = readLimit('RATE_LIMIT_GEMINI_DAILY', 2000);
+/** 1つの接続元から同時に処理する、Gemini を呼ぶリクエストの数 */
+export const MAX_CONCURRENT_PER_CLIENT = readLimit('RATE_LIMIT_CONCURRENT_PER_CLIENT', 2);
+
+export class DailyLimitError extends Error {
+  readonly statusCode = 429;
+  readonly code = 'daily_limit';
+  constructor() {
+    super('本日の利用上限に達しました。明日になってから、もう一度お試しください。');
+    this.name = 'DailyLimitError';
+  }
+}
+
+function tokyoDateKey(now: number): string {
+  return new Date(now).toLocaleDateString('sv-SE', { timeZone: 'Asia/Tokyo' });
+}
+
+/** 1日あたりの回数を数える。日本時間で日付が変わったら数え直す */
+export class DailyCounter {
+  private day = '';
+  private count = 0;
+  private readonly limit: number;
+  private readonly now: () => number;
+
+  constructor(limit: number, now: () => number = () => Date.now()) {
+    this.limit = limit;
+    this.now = now;
+  }
+
+  private roll(): void {
+    const today = tokyoDateKey(this.now());
+    if (today !== this.day) {
+      this.day = today;
+      this.count = 0;
+    }
+  }
+
+  isExhausted(): boolean {
+    this.roll();
+    return this.count >= this.limit;
+  }
+
+  /** 1回分を数える。上限に達していれば DailyLimitError を投げる */
+  consume(): void {
+    this.roll();
+    if (this.count >= this.limit) throw new DailyLimitError();
+    this.count++;
+  }
+}
+
+/** Gemini の呼び出しを数える、サーバー全体で1つの数え口 */
+export const dailyGeminiCounter = new DailyCounter(DAILY_GEMINI_LIMIT);
+
+/** 同時に処理している数を接続元ごとに数え、上限を超える分は断る */
+export class ConcurrencyGate {
+  private readonly inFlight = new Map<string, number>();
+  private readonly max: number;
+
+  constructor(max: number) {
+    this.max = max;
+  }
+
+  tryEnter(key: string): boolean {
+    const n = this.inFlight.get(key) ?? 0;
+    if (n >= this.max) return false;
+    this.inFlight.set(key, n + 1);
+    return true;
+  }
+
+  leave(key: string): void {
+    const n = (this.inFlight.get(key) ?? 1) - 1;
+    if (n <= 0) this.inFlight.delete(key);
+    else this.inFlight.set(key, n);
+  }
+}
+
+// ============================================================================
+// 本文の大きさと、呼び出し元の確認
+// ============================================================================
+
+/** 画像や音声を送るAPIだけ大きめにし、そのほかは小さく抑える */
+const LARGE_BODY_PATHS = new Set(['/api/chat', '/api/apply', '/api/evaluate', '/api/transcribe']);
+export const LARGE_BODY_BYTES = 2 * 1024 * 1024;
+export const SMALL_BODY_BYTES = 16 * 1024;
+
+export function maxBodyBytesFor(path: string): number {
+  return LARGE_BODY_PATHS.has(path) ? LARGE_BODY_BYTES : SMALL_BODY_BYTES;
+}
+
+/**
+ * ブラウザから来たリクエストが、このサイト自身から送られたかを確かめる。
+ * Origin がない（curl などの直接の呼び出し、同じページからの一部のリクエスト）ときは通す。
+ * このサイトの名前は Host と、前に立つ配信（Firebase Hosting など）が付ける X-Forwarded-Host から読む。
+ * ほかに許す呼び出し元があれば ALLOWED_ORIGINS にカンマ区切りで書く
+ */
+export function isAllowedOrigin(req: IncomingMessage): boolean {
+  const origin = req.headers.origin;
+  if (!origin) return true;
+  let originHost: string;
+  try {
+    originHost = new URL(origin).host;
+  } catch {
+    return false;
+  }
+  const forwarded = req.headers['x-forwarded-host'];
+  const hosts = [
+    req.headers.host,
+    ...(Array.isArray(forwarded) ? forwarded : (forwarded ?? '').split(',')),
+  ]
+    .map((h) => (h ?? '').trim())
+    .filter(Boolean);
+  if (hosts.includes(originHost)) return true;
+  const allowed = (process.env.ALLOWED_ORIGINS ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return allowed.includes(origin);
+}
