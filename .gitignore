@@ -11,12 +11,6 @@ service-account*.json
 *credentials*.json
 .gcp/
 
-# Firebase
-.firebase/
-firebase-debug.log*
-firestore-debug.log*
-ui-debug.log*
-
 # ログ
 logs/
 *.log

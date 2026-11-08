@@ -19,7 +19,7 @@
 - **ダークパターンによる被害は減っていない**
   - 通販の定期購入の相談は、2023年度80,315件、2024年度89,401件、2025年度93,065件と毎年増えています[^kokusen-sub]。2025年度は65歳以上が46,958件、65歳未満が47,387件で、年齢を問わず起きています[^kokusen-65]。
   - 令和3年の特定商取引法改正で最終確認画面の表示が義務になった後も、定期購入の相談は高い水準のままです。消費者庁の検討会は、ダークパターンをより広く規制する方向で検討しています[^caa-interim]。
-  - ダークパターンを見たことがある人は76.2%、過去12か月に経験した人は37.5%です[^caa-survey]。
+  - 28種類のダークパターンについて、見たことがある人の割合は平均で76.2%、過去12か月に経験した人は37.5%です[^caa-survey]。
 - **悪意がなくても生まれる**
   - 同じ検討会は、問題のある表示には「事業者が意図的に用いるものだけでなく、過失等で結果的に消費者の意思決定を歪めるものも含まれ得る」としています。一方で、分かりやすい案内そのものは利便性にも役立つとしています[^caa-interim]。問題は定期便やクーポンという施策ではなく、見せ方です。
 - **生成AIで増えうる**
@@ -28,7 +28,7 @@
 [^kokusen-sub]: 国民生活センター、定期購入の相談件数。2026年5月31日時点のPIO-NET登録分。 https://www.kokusen.go.jp/soudan_topics/data/subscription_traps.html
 [^kokusen-65]: 国民生活センター、2025年度 65歳以上の消費生活相談の状況、2026年9月16日。 https://www.kokusen.go.jp/pdf/n-20260916_1.pdf
 [^caa-interim]: 消費者庁 デジタル取引・特定商取引法等検討会、中間取りまとめ、2026年9月10日。利便性は p.9、令和3年改正後の相談状況は p.11、過失によるものと生成AIは p.24。 https://www.caa.go.jp/notice/entry/047488
-[^caa-survey]: 消費者庁 新未来創造戦略本部、Webページ等におけるいわゆるダークパターンに対する消費者意識調査について 概要版、令和8年6月。
+[^caa-survey]: 消費者庁 新未来創造戦略本部、Webページ等におけるいわゆるダークパターンに対する消費者意識調査について 概要版、令和8年6月。 https://www.caa.go.jp/policies/future/icprc/research_002/assets/caa_futurer_cms201_260618_02.pdf
 [^chen]: Chen et al. "Deception at Scale: Deceptive Designs in 1K LLM-Generated Ecommerce Components" arXiv:2502.13499 v2, 2026. https://arxiv.org/abs/2502.13499 2025年2月の初版では、指示による差は有意ではありませんでした。
 
 このリポジトリは、チーム内ハッカソンなどで、ほかの開発者がフォークして拡張することを前提にしています。改修対象のアプリの初期仕様、顧客層、ペルソナの行動の制約、妨害要素は、題材ファイル1つにまとまっています。操作シミュレーターは部品の役割だけを見て判定するので、題材を差し替えれば新しい課題アプリと評価環境を作れます。
@@ -158,7 +158,7 @@ AIに任せないことも、はっきり分けています。お客さんが買
 - 妨害要素を入れる前の画面。部品、状態、合計金額などの計算式
 - 妨害要素の候補と、毎回入れるもの・現実の使いにくさ・冗談の区別、難しさごとに選ぶ数
 - 固定の問題として妨害要素を名前で並べたものと、既定で使う問題
-- 店長のせりふと、お客さんの反応を見るたびに数える定期便の件数などの数字
+- 店長のセリフと、お客さんの反応を見るたびに数える定期便の件数などの数字
 - 顧客層とペルソナ、一人ひとりの制約
 - 冒頭で進行役が話す行と、実装AIへの題材特有の補足
 
@@ -187,7 +187,7 @@ AIに任せないことも、はっきり分けています。お客さんが買
 ## 技術構成
 
 - **フロントエンド**：TypeScript / Vite / HTML5 Canvas / Sandbox `iframe`
-- **生成AI・音声**：`@google/genai` で Gemini Enterprise Agent Platform の Gemini を呼ぶ。赤ペンで囲んだ画像と画面のスクリーンショットのマルチモーダル入力、Structured Outputs、Function Calling の `record_human_decision` / Google Cloud Text-to-Speech API で11人分の声を合成し、決まったせりふの音声は同梱
+- **生成AI・音声**：`@google/genai` で Gemini Enterprise Agent Platform の Gemini を呼ぶ。赤ペンで囲んだ画像と画面のスクリーンショットのマルチモーダル入力、Structured Outputs、Function Calling の `record_human_decision` / Google Cloud Text-to-Speech API で11人分の声を合成し、決まったセリフの音声は同梱
 - **LLMを使わない分析と記録**：規則による分類と、それを補う Agent Platform の Text embeddings API / 規則によるキーワード抽出と、それを補う Google Cloud Natural Language API / 指示の文章を含まない記録を、Cloud Firestore に期限つきで置き、同意した挑戦だけ BigQuery に送る
 - **実行環境と安全性**：Google Cloud Run 向けのコンテナ構成 / CSP ヘッダー、Sandbox `iframe` による分離、対象外の部品が変わらないことの検証と自動で戻す仕組み / Gemini と読み上げと記録のAPIの呼び出し回数の上限。接続元ごととサーバー全体の1分あたりで数え、`.env.example` の `RATE_LIMIT_*` で変えられる / Gemini を呼ぶ1日あたりの上限による費用の非常停止、接続元ごとの同時に処理する数の上限、APIごとの本文の大きさの上限、ほかのサイトの画面からの呼び出しを断る確認 / Model Armor と規則による、送る前の個人情報とプロンプトインジェクションの検査 / 受け付ける値の形と長さの確認
 - **品質と衛生管理**：Node.js Test Runner / `scripts/check-hygiene.mjs` によるコミット、機密情報、ローカルパスの混入の検査
