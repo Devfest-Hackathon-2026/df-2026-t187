@@ -39,6 +39,7 @@ import {
   clientKeyOf,
   dailyGeminiCounter,
   isAllowedOrigin,
+  isBotUserAgent,
   maxBodyBytesFor,
   rateLimitGroupOf,
 } from './rateLimit.ts';
@@ -190,6 +191,7 @@ function sendJson(
     'Cache-Control': 'no-store',
     'X-Content-Type-Options': 'nosniff',
     'X-Frame-Options': 'DENY',
+    'X-Robots-Tag': 'noindex, nofollow, noarchive',
     'Referrer-Policy': 'strict-origin-when-cross-origin',
   });
   res.end(body);
@@ -208,7 +210,13 @@ export async function handleApiRequest(
     return false;
   }
 
-  // ほかのサイトのページから、利用者のブラウザを通して呼ばせることは断る
+  // 自動スクリプトやクローラによる直接の API 呼び出しは断る
+  if (isBotUserAgent(req)) {
+    sendJson(res, 403, { error: '自動プログラムからの呼び出しはできません。' });
+    return true;
+  }
+
+  // ほかのサイトのページや、Origin のないスクリプトからの POST は断る
   if (req.method === 'POST' && !isAllowedOrigin(req)) {
     sendJson(res, 403, { error: 'このサイトの画面からだけ使えます。' });
     return true;

@@ -22,10 +22,13 @@ const MIME_TYPES: Record<string, string> = {
 const SECURITY_HEADERS: Record<string, string> = {
   'X-Content-Type-Options': 'nosniff',
   'X-Frame-Options': 'SAMEORIGIN',
+  'X-Robots-Tag': 'noindex, nofollow, noarchive',
   'Referrer-Policy': 'strict-origin-when-cross-origin',
   'Content-Security-Policy':
     "default-src 'self'; img-src 'self' data: blob:; media-src 'self' data: blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; connect-src 'self'; frame-ancestors 'self'; object-src 'none'; base-uri 'self'; form-action 'self'",
 };
+
+const ROBOTS_TXT = 'User-agent: *\nDisallow: /\n';
 
 const server = createServer(async (req, res) => {
   const handled = await handleApiRequest(req, res);
@@ -38,6 +41,11 @@ const server = createServer(async (req, res) => {
     return;
   }
   const rawUrlPath = (req.url ?? '/').split('?')[0];
+  if (rawUrlPath === '/robots.txt') {
+    res.writeHead(200, { ...SECURITY_HEADERS, 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end(ROBOTS_TXT);
+    return;
+  }
   let urlPath = '/';
   try {
     urlPath = decodeURIComponent(rawUrlPath);

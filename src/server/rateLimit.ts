@@ -219,15 +219,31 @@ export function maxBodyBytesFor(path: string): number {
   return LARGE_BODY_PATHS.has(path) ? LARGE_BODY_BYTES : SMALL_BODY_BYTES;
 }
 
+const BOT_UA_PATTERN =
+  /([a-z0-9_-]*bot\b|crawler|[a-z0-9_-]*spider\b|scrapy|\bcurl\b|\bwget\b|python-requests|python-urllib|\bhttpx\b|\baiohttp\b|go-http-client|\bjava\/|libwww-perl|\baxios\/|postmanruntime|\binsomnia\b)/i;
+
+/**
+ * クローラやスクリプトなどの自動プログラムによる呼び出しかどうかを判定する。
+ * User-Agent が空、または既知のボット・HTTPクライアント文字列を含む場合は true を返す
+ */
+export function isBotUserAgent(req: IncomingMessage): boolean {
+  const raw = req.headers['user-agent'];
+  const ua = (Array.isArray(raw) ? raw.join(' ') : (raw ?? '')).trim();
+  if (!ua) return true;
+  return BOT_UA_PATTERN.test(ua);
+}
+
 /**
  * ブラウザから来たリクエストが、このサイト自身から送られたかを確かめる。
- * Origin がない（curl などの直接の呼び出し、同じページからの一部のリクエスト）ときは通す。
+ * Origin がない直接の呼び出し（curl やスクリプト等）は Sec-Fetch-Site: same-origin がない限り断る。
  * このサイトの名前は Host と、前に立つ配信（Firebase Hosting など）が付ける X-Forwarded-Host から読む。
  * ほかに許す呼び出し元があれば ALLOWED_ORIGINS にカンマ区切りで書く
  */
 export function isAllowedOrigin(req: IncomingMessage): boolean {
   const origin = req.headers.origin;
-  if (!origin) return true;
+  if (!origin) {
+    return req.headers['sec-fetch-site'] === 'same-origin';
+  }
   let originHost: string;
   try {
     originHost = new URL(origin).host;

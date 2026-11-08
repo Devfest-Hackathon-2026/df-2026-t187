@@ -32,6 +32,7 @@ import {
   SMALL_BODY_BYTES,
   clientKeyOf,
   isAllowedOrigin,
+  isBotUserAgent,
   maxBodyBytesFor,
   rateLimitGroupOf,
 } from '../src/server/rateLimit.ts';
@@ -168,9 +169,13 @@ describe('core-loop', () => {
     assert.equal(maxBodyBytesFor('/api/tts'), SMALL_BODY_BYTES);
     assert.equal(maxBodyBytesFor('/api/run-event'), SMALL_BODY_BYTES);
 
-    // 呼び出し元：このサイト自身か、前に立つ配信が付けた名前と一致するときだけ通す
+    // 呼び出し元：このサイト自身か、前に立つ配信が付けた名前と一致するときだけ通す。Origin がない直接通信は Sec-Fetch-Site: same-origin がなければ断る
     const req = (headers: Record<string, string>) => ({ headers }) as never;
-    assert.equal(isAllowedOrigin(req({ host: 'app.example.run.app' })), true);
+    assert.equal(isAllowedOrigin(req({ host: 'app.example.run.app' })), false);
+    assert.equal(
+      isAllowedOrigin(req({ host: 'app.example.run.app', 'sec-fetch-site': 'same-origin' })),
+      true,
+    );
     assert.equal(isAllowedOrigin(req({ host: 'app.example.run.app', origin: 'https://app.example.run.app' })), true);
     assert.equal(isAllowedOrigin(req({ host: 'app.example.run.app', origin: 'https://evil.example.com' })), false);
     assert.equal(
@@ -179,6 +184,21 @@ describe('core-loop', () => {
     );
     assert.equal(isAllowedOrigin(req({ host: 'localhost:5173', origin: 'http://localhost:5173' })), true);
     assert.equal(isAllowedOrigin(req({ host: 'localhost:5173', origin: 'null' })), false);
+
+    // ボットやスクリプトの User-Agent、または空の User-Agent は断る
+    assert.equal(isBotUserAgent(req({})), true);
+    assert.equal(isBotUserAgent(req({ 'user-agent': 'curl/8.7.1' })), true);
+    assert.equal(isBotUserAgent(req({ 'user-agent': 'python-requests/2.31.0' })), true);
+    assert.equal(isBotUserAgent(req({ 'user-agent': 'Mozilla/5.0 (compatible; Googlebot/2.1)' })), true);
+    assert.equal(
+      isBotUserAgent(
+        req({
+          'user-agent':
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        }),
+      ),
+      false,
+    );
   });
 
   it('Gemini に送る前に、個人情報らしき内容やAIへの指示の乗っ取りを止める', async () => {
