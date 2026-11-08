@@ -130,11 +130,12 @@ function createGenAIClient(): GenAIClientInfo | null {
     return cachedClientInfo;
   }
   if (project && project !== 'your-gcp-project-id') {
-    const cacheKey = `vertex:${project}:${location}:${model}`;
+    const cacheKey = `agent-platform:${project}:${location}:${model}`;
     if (cachedClientInfo?.cacheKey !== cacheKey) {
       cachedClientInfo = {
         cacheKey,
         client: new GoogleGenAI({
+          // Gemini Enterprise Agent Platform（旧称 Vertex AI）を使う指定。引数名は SDK が決めた旧称のまま
           vertexai: true,
           project,
           location,

@@ -39,11 +39,11 @@ export interface NaturalLanguageSignal {
   analyzedVia: 'cloud_natural_language_api' | 'local_deterministic';
 }
 
-/** Vertex AI Embeddings（またはローカル決定論類似度）による構造化クラスタ分類 */
+/** Gemini Enterprise Agent Platform の埋め込み（またはローカル決定論類似度）による構造化クラスタ分類 */
 export interface EmbeddingSignal {
   closestArchetype: PromptArchetype;
   similarityScore: number;
-  analyzedVia: 'vertex_ai_embedding' | 'local_deterministic';
+  analyzedVia: 'agent_platform_embedding' | 'local_deterministic';
 }
 
 /** 1回の発言・指示に対するテレメトリ記録 */
@@ -233,7 +233,7 @@ export function classifyDeterministicArchetype(
 }
 
 /**
- * 2つの数値ベクトル間のコサイン類似度を計算する（Vertex AI Embeddings 用）。
+ * 2つの数値ベクトル間のコサイン類似度を計算する（Agent Platform の埋め込み用）。
  */
 export function cosineSimilarity(a: number[], b: number[]): number {
   if (a.length === 0 || a.length !== b.length) return 0;
@@ -460,8 +460,10 @@ export function summarizePromptTelemetry(
 
   const systemLogLines: string[] = [];
   if (executeTurns > 0) {
+    // 学び始めたばかりの人が読むので、専門用語を使わずに言う（質問＝探索型、直してと頼んだ＝実行型、
+    // 同じ所を直し直した＝手戻り、1回で思いどおりに直った割合＝初回成功率）
     systemLogLines.push(
-      `今回の到達記録 情報聞き出し \`${exploreTurns}回\` 手直し指示 \`${executeTurns}回\`${goalDirectedTurns > 0 ? ` うち目的を伝えた指示 \`${goalDirectedTurns}回\`` : ''} 手戻り \`${reworkTurns}回\` 初回成功率 \`${firstShotSuccessRate}%\``,
+      `今回の記録 質問した \`${exploreTurns}回\` 直してと頼んだ \`${executeTurns}回\`${goalDirectedTurns > 0 ? ` うち目的を伝えた \`${goalDirectedTurns}回\`` : ''} 同じ所を直し直した \`${reworkTurns}回\` 1回で思いどおりに直った割合 \`${firstShotSuccessRate}%\``,
     );
     if (turningPoint) {
       systemLogLines.push(
@@ -475,7 +477,7 @@ export function summarizePromptTelemetry(
       const entityCount = bestExecute?.nlSignal.entities.length ?? 0;
       if (entityCount > 0 && bestExecute?.nlSignal.hasConditionConstraint) {
         systemLogLines.push(
-          `決め手になった指示 \`${effectivePrompt}\` は対象部品と変更条件が具体的だったため手戻りなく反映されました`,
+          `決め手になった指示 \`${effectivePrompt}\` は対象の部品と変える条件が具体的だったため、直し直さずに反映されました`,
         );
       } else {
         systemLogLines.push(

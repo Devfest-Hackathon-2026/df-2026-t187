@@ -21,12 +21,14 @@ import {
   transcribeAndRefineUserAudio,
   voiceOwnerLine,
 } from './gemini.ts';
-import { summarizePromptTelemetry } from '../shared/promptTelemetry.ts';
 import {
-  listHumanDecisions,
-  listPromptTelemetryEvents,
   synthesizeStudioSpeech,
 } from './store.ts';
+import { RateLimiter, clientKeyOf, rateLimitGroupOf } from './rateLimit.ts';
+
+const apiRateLimiter = new RateLimiter();
+// 使われなくなった接続元の記録を捨てる。サーバーの終了を妨げないよう unref する
+setInterval(() => apiRateLimiter.prune(), 5 * 60_000).unref();
 
 const MAX_BODY_BYTES = 8 * 1024 * 1024; // 8MB (ペン描きスクリーンショットBase64対応)
 const MAX_TEXT_INPUT_LENGTH = 2_000;
@@ -83,9 +85,15 @@ function readJsonBody<T>(req: IncomingMessage): Promise<T> {
   });
 }
 
-function sendJson(res: ServerResponse, statusCode: number, payload: unknown): void {
+function sendJson(
+  res: ServerResponse,
+  statusCode: number,
+  payload: unknown,
+  extraHeaders: Record<string, string> = {},
+): void {
   const body = JSON.stringify(payload);
   res.writeHead(statusCode, {
+    ...extraHeaders,
     'Content-Type': 'application/json; charset=utf-8',
     'Cache-Control': 'no-store',
     'X-Content-Type-Options': 'nosniff',
@@ -108,23 +116,24 @@ export async function handleApiRequest(
     return false;
   }
 
+  // Gemini や読み上げを呼ぶAPIは、本文を読む前に回数の上限を確かめる
+  const limitGroup = rateLimitGroupOf(req.method, url);
+  if (limitGroup) {
+    const taken = apiRateLimiter.take(limitGroup, clientKeyOf(req));
+    if (!taken.ok) {
+      sendJson(
+        res,
+        429,
+        { error: `混み合っています。${taken.retryAfterSec}秒ほど待ってから、もう一度送ってください。` },
+        { 'Retry-After': String(taken.retryAfterSec) },
+      );
+      return true;
+    }
+  }
+
   try {
     if (req.method === 'GET' && url === '/api/status') {
       sendJson(res, 200, getAiConnectionStatus());
-      return true;
-    }
-
-    if (req.method === 'GET' && url === '/api/decisions') {
-      sendJson(res, 200, { decisions: listHumanDecisions() });
-      return true;
-    }
-
-    if (req.method === 'GET' && url === '/api/telemetry') {
-      const events = listPromptTelemetryEvents();
-      sendJson(res, 200, {
-        events,
-        summary: summarizePromptTelemetry(events),
-      });
       return true;
     }
 

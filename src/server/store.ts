@@ -108,10 +108,6 @@ export async function saveHumanDecision(
   }
 }
 
-export function listHumanDecisions(): HumanDecisionRecord[] {
-  return [...inMemoryDecisions];
-}
-
 const ARCHETYPE_ANCHOR_TEXTS: Record<PromptArchetype, string> = {
   simple_delete: '定期便やクーポンや広告の欄をそのまま消して削除してなくして',
   condition_design:
@@ -197,10 +193,10 @@ export async function analyzePromptWithCloudNaturalLanguage(
 /**
  * 指示の型（目的つき / 単純削除 / 条件設計 / 具体修正 / 丸投げ / 探索）を分類する。
  * 型の定義はコードの規則で決める。規則に当てはまらず既定の具体修正に落ちた実行指示だけ、
- * Vertex AI Text Embeddings (`text-multilingual-embedding-002`) で典型的な指示とのコサイン類似度を見て、近い型で補う。
+ * Gemini Enterprise Agent Platform の Text embeddings API (`text-multilingual-embedding-002`) で典型的な指示とのコサイン類似度を見て、近い型で補う。
  * 埋め込みで常に上書きすると、近さが低い発言で規則どおりの型が覆ることがあったため（例：目的つきの指示が丸投げになる）。
  */
-export async function classifyPromptWithVertexEmbeddings(
+export async function classifyPromptWithAgentPlatformEmbeddings(
   promptText: string,
   sessionMode: PromptSessionMode,
 ): Promise<EmbeddingSignal> {
@@ -276,7 +272,7 @@ export async function classifyPromptWithVertexEmbeddings(
     return {
       closestArchetype: bestArchetype,
       similarityScore: bestScore > 0 ? bestScore : base.similarityScore,
-      analyzedVia: 'vertex_ai_embedding',
+      analyzedVia: 'agent_platform_embedding',
     };
   } catch {
     return base;
@@ -367,7 +363,7 @@ async function persistTelemetryToCloud(event: PromptTelemetryEvent): Promise<voi
 }
 
 /**
- * 学習者の1回の発言・指示を Cloud Natural Language API + Vertex AI Embeddings で分析し、
+ * 学習者の1回の発言・指示を Cloud Natural Language API + Agent Platform の埋め込みで分析し、
  * 行動テレメトリとして記録する。
  */
 export async function recordPromptTelemetryEvent(input: {
@@ -395,7 +391,7 @@ export async function recordPromptTelemetryEvent(input: {
 
   const [nlSignal, embeddingSignal] = await Promise.all([
     analyzePromptWithCloudNaturalLanguage(input.promptText),
-    classifyPromptWithVertexEmbeddings(input.promptText, input.sessionMode),
+    classifyPromptWithAgentPlatformEmbeddings(input.promptText, input.sessionMode),
   ]);
 
   const event: PromptTelemetryEvent = {
@@ -448,11 +444,6 @@ export function finalizeTelemetryOnEvaluate(
     };
   }
   return summarizePromptTelemetry(events, cohortId);
-}
-
-export function listPromptTelemetryEvents(cohortId?: TargetCohortId): PromptTelemetryEvent[] {
-  if (!cohortId) return [...inMemoryTelemetryEvents];
-  return inMemoryTelemetryEvents.filter((e) => !e.cohortId || e.cohortId === cohortId);
 }
 
 export function clearPromptTelemetryEvents(): void {

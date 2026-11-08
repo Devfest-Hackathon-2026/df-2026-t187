@@ -23,6 +23,7 @@ import {
   withDerivedValues,
 } from '../src/shared/appRuntime.ts';
 import { clipToVisibleRects, detectHitComponents, type Rect2D } from '../src/shared/hitTest.ts';
+import { RateLimiter, clientKeyOf, rateLimitGroupOf } from '../src/server/rateLimit.ts';
 import {
   ACTIVE_THEME,
   ALL_REVIEWER_PERSONAS,
@@ -53,7 +54,7 @@ import {
   summarizePromptTelemetry,
 } from '../src/shared/promptTelemetry.ts';
 import {
-  classifyPromptWithVertexEmbeddings,
+  classifyPromptWithAgentPlatformEmbeddings,
   clearPromptTelemetryEvents,
   finalizeTelemetryOnEvaluate,
   recordPromptTelemetryEvent,
@@ -119,6 +120,40 @@ describe('core-loop', () => {
       { x: 30, y: 50 },
     ];
     assert.deepEqual(detectHitComponents(partial, rects), ['product-hero']);
+  });
+
+  it('Gemini や読み上げを呼ぶAPIは、接続元ごととサーバー全体の両方で1分あたりの回数を超えたら断る', () => {
+    let t = 0;
+    const limiter = new RateLimiter(
+      { gemini: { perClient: 3, global: 5 }, tts: { perClient: 2, global: 10 } },
+      60_000,
+      () => t,
+    );
+    // 接続元ごとの上限
+    for (let i = 0; i < 3; i++) assert.equal(limiter.take('gemini', 'a').ok, true);
+    const denied = limiter.take('gemini', 'a');
+    assert.equal(denied.ok, false);
+    assert.equal(!denied.ok && denied.retryAfterSec, 60);
+    // 別の接続元は通るが、サーバー全体の上限に達したら断る
+    assert.equal(limiter.take('gemini', 'b').ok, true);
+    assert.equal(limiter.take('gemini', 'c').ok, true);
+    assert.equal(limiter.take('gemini', 'd').ok, false);
+    // 読み上げは別に数える
+    assert.equal(limiter.take('tts', 'a').ok, true);
+    // 1分たてば、また呼べる
+    t = 60_000;
+    assert.equal(limiter.take('gemini', 'a').ok, true);
+    limiter.prune();
+
+    // 数えるのはPOSTの決まったAPIだけ
+    assert.equal(rateLimitGroupOf('POST', '/api/chat'), 'gemini');
+    assert.equal(rateLimitGroupOf('POST', '/api/tts'), 'tts');
+    assert.equal(rateLimitGroupOf('GET', '/api/status'), null);
+    // 接続元は、X-Forwarded-For の最後（受付が付けた値）を使い、送る側が書ける先頭は使わない
+    const req = (xff?: string) =>
+      ({ headers: xff ? { 'x-forwarded-for': xff } : {}, socket: { remoteAddress: '10.0.0.9' } }) as never;
+    assert.equal(clientKeyOf(req('1.1.1.1, 203.0.113.5')), '203.0.113.5');
+    assert.equal(clientKeyOf(req()), '10.0.0.9');
   });
 
   it('画面下に固定した帯の裏に隠れた部品は、帯の注文ボタンを囲んでもいっしょに選ばない', () => {
@@ -528,11 +563,11 @@ describe('core-loop', () => {
         ['定期便の初期チェックを外して解約条件を明記して', 'condition_design'],
         ['いい感じにして', 'vague_delegate'],
       ] as const) {
-        const signal = await classifyPromptWithVertexEmbeddings(text, 'execute');
+        const signal = await classifyPromptWithAgentPlatformEmbeddings(text, 'execute');
         assert.equal(signal.closestArchetype, expected, text);
         assert.equal(signal.analyzedVia, 'local_deterministic', text);
       }
-      assert.equal((await classifyPromptWithVertexEmbeddings('店長、なぜ定期便を付けたの？', 'explore')).closestArchetype, 'inquiry');
+      assert.equal((await classifyPromptWithAgentPlatformEmbeddings('店長、なぜ定期便を付けたの？', 'explore')).closestArchetype, 'inquiry');
       assert.equal(fetchCalls, 0);
     } finally {
       globalThis.fetch = originalFetch;
@@ -1513,7 +1548,7 @@ describe('core-loop', () => {
     assert.equal(summary.systemLogLines.length, 2);
     assert.match(
       summary.systemLogLines[0],
-      /情報聞き出し `2回` 手直し指示 `2回` 手戻り `1回` 初回成功率 `50%`/,
+      /質問した `2回` 直してと頼んだ `2回` 同じ所を直し直した `1回` 1回で思いどおりに直った割合 `50%`/,
     );
     assert.match(
       summary.systemLogLines[1],
@@ -1532,9 +1567,9 @@ describe('core-loop', () => {
       },
     ]);
     assert.equal(oneShotSummary.firstShotSuccessRate, 100);
-    assert.match(oneShotSummary.systemLogLines[0], /初回成功率 `100%`/);
-    // 目的を伝えた指示がないときは、その回数を到達記録に出さない
-    assert.doesNotMatch(oneShotSummary.systemLogLines[0], /目的を伝えた指示/);
+    assert.match(oneShotSummary.systemLogLines[0], /1回で思いどおりに直った割合 `100%`/);
+    // 目的を伝えた指示がないときは、その回数を今回の記録に出さない
+    assert.doesNotMatch(oneShotSummary.systemLogLines[0], /うち目的を伝えた/);
 
     // 目的だけを伝えると、AIが部品を書き換えるときに label や style を省くことがある。元の部品から補い、描画が落ちない
     const couponComp = findComponent(initial, 'popup-coupon');
@@ -1565,7 +1600,7 @@ describe('core-loop', () => {
       },
     ]);
     assert.equal(goalSummary.goalDirectedTurns, 1);
-    assert.match(goalSummary.systemLogLines[0], /うち目的を伝えた指示 `1回`/);
+    assert.match(goalSummary.systemLogLines[0], /うち目的を伝えた `1回`/);
     assert.match(
       goalSummary.systemLogLines[1],
       /`定期便を消して` から目的を伝えた `定期便を望む人だけが自分で選べるようにして`/,
