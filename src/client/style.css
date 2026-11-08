@@ -1591,6 +1591,58 @@ body {
   opacity: 1;
 }
 
+/* お客さんの反応を見る前の1人ずつの予想ステップ */
+.cohort-pill-btn.is-prediction-opt.is-achieved:hover:not(:disabled) {
+  border-color: var(--accent-green);
+  background: #f0fdf4;
+  color: var(--accent-green);
+}
+
+.cohort-pill-btn.is-prediction-opt.is-bothered:hover:not(:disabled) {
+  border-color: var(--accent-amber);
+  background: #fefce8;
+  color: #b45309;
+}
+
+.cohort-pill-btn.is-prediction-opt.is-abandoned:hover:not(:disabled) {
+  border-color: var(--accent-red);
+  background: #fef2f2;
+  color: var(--accent-red);
+}
+
+.cohort-pill-btn.is-prediction-opt.is-regretted:hover:not(:disabled) {
+  border-color: #ea580c;
+  background: #fff7ed;
+  color: #c2410c;
+}
+
+.cohort-pill-btn.is-prediction-skip {
+  color: var(--ink-60);
+}
+
+/* お客さんの吹き出しの下に添える予想の答え合わせバッジ */
+.prediction-result-badge {
+  display: inline-flex;
+  align-items: center;
+  font-size: 0.72rem;
+  font-weight: 800;
+  border-radius: 8px;
+  padding: 3px 9px;
+  margin-top: 2px;
+}
+
+.prediction-result-badge.is-matched {
+  background: #f0fdf4;
+  border: 1px solid #bbf7d0;
+  color: var(--accent-green);
+}
+
+.prediction-result-badge.is-missed {
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  color: var(--accent-red);
+}
+
 .speaker-avatar.is-selectable,
 .speaker-name.is-selectable {
   cursor: pointer;

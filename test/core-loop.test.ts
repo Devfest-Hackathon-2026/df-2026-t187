@@ -53,6 +53,12 @@ import {
   validateSandboxSpec,
 } from '../src/shared/sandboxValidator.ts';
 import { detectCheckpointRevertCommand } from '../src/shared/intent.ts';
+import {
+  formatPredictionBadgeText,
+  formatPredictionReportLine,
+  scorePredictionRound,
+  summarizePredictions,
+} from '../src/shared/prediction.ts';
 import { describeOtherCohortImpact, describeOtherCohortReport } from '../src/shared/otherCohorts.ts';
 import { splitIntoChatChunks } from '../src/shared/chatText.ts';
 import {
@@ -529,6 +535,10 @@ describe('core-loop', () => {
       '定期便は、毎月届けてほしい人だけが自分で選べるようにしたい',
       'クーポン広告は、使いたい人には役立って、いらない人の邪魔にならないようにしたい',
       '注文する前に、スマホに不慣れな人でも内容を確かめられるようにしたい',
+      // 「〜とはっきり」「〜とは別に」「〜とは違う」に含まれる「とは」を質問と誤認しない
+      '背景とはっきり見分けられる濃い色にして',
+      '注文ボタンとは別に、定期便の説明を書いて',
+      '周りとは違う見やすい色にして',
     ]) {
       assert.equal(classifyUserMessageIntent(msg), 'apply', msg);
     }
@@ -537,6 +547,8 @@ describe('core-loop', () => {
       'なんでこのボタン押しても動かないの？',
       'これ何が困る？',
       'このボタンの仕組みを教えて',
+      'ダークパターンとは',
+      '定期便とは何？',
       'なんで小さいの？大きくしてほしい',
       '赤いボタンが邪魔',
       '健太が困ってるのはどこ',
@@ -1952,5 +1964,60 @@ describe('core-loop', () => {
     }
     const ownerFactsWithTarget = describeOwnerContext(initial, undefined, ['check-subscription']);
     assert.ok(ownerFactsWithTarget.some((f) => f.includes('赤ペンで指して聞いている部品')));
+  });
+
+  it('お客さんの反応を見る前の予想と結果を突き合わせ、困りごとを見抜けたかも含めて振り返り文を作れる', () => {
+    const sampleResults = [
+      { reviewerId: 'p1', outcome: 'achieved' as const },
+      { reviewerId: 'p2', outcome: 'bothered' as const },
+      { reviewerId: 'p3', outcome: 'regretted' as const },
+    ];
+
+    // 予想せずすぐ見た回
+    const skipped = scorePredictionRound(sampleResults, undefined);
+    assert.deepEqual(skipped, { predicted: false, total: 0, hits: 0, caughtIssueCount: 0 });
+    assert.equal(formatPredictionReportLine([skipped]), null);
+
+    // 1回目：不満や後悔も含めて予想し、3人中2人的中（うち困りごと1人的中）
+    const round1 = scorePredictionRound(sampleResults, {
+      p1: 'achieved',
+      p2: 'bothered',
+      p3: 'achieved',
+    });
+    assert.deepEqual(round1, { predicted: true, total: 3, hits: 2, caughtIssueCount: 1 });
+
+    // 2回目：全員達成した回で3人とも的中
+    const round2 = scorePredictionRound(
+      [
+        { reviewerId: 'p1', outcome: 'achieved' },
+        { reviewerId: 'p2', outcome: 'achieved' },
+        { reviewerId: 'p3', outcome: 'achieved' },
+      ],
+      { p1: 'achieved', p2: 'achieved', p3: 'achieved' },
+    );
+    assert.deepEqual(round2, { predicted: true, total: 3, hits: 3, caughtIssueCount: 0 });
+
+    const summary = summarizePredictions([skipped, round1, round2]);
+    assert.equal(summary.totalRounds, 3);
+    assert.equal(summary.predictedRounds, 2);
+    assert.equal(summary.total, 6);
+    assert.equal(summary.hits, 5);
+    assert.equal(summary.caughtIssue, true);
+
+    const reportWithIssue = formatPredictionReportLine([skipped, round1, round2]);
+    assert.equal(
+      reportWithIssue,
+      'お客さんの反応の予想は `6人中5人` 当たり、どこで困るかも見抜けました',
+    );
+    const reportAchievedOnly = formatPredictionReportLine([round2]);
+    assert.equal(reportAchievedOnly, 'お客さんの反応の予想は `3人中3人` 当たりました');
+
+    const matchedBadge = formatPredictionBadgeText('bothered', 'bothered');
+    assert.equal(matchedBadge.matched, true);
+    assert.equal(matchedBadge.text, '○ 買えたけど不満');
+
+    const missedBadge = formatPredictionBadgeText('achieved', 'bothered');
+    assert.equal(missedBadge.matched, false);
+    assert.equal(missedBadge.text, '× 買えたけど不満');
   });
 });

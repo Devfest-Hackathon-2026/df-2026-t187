@@ -21,6 +21,14 @@ import { buildOwnerClosingLines } from '../shared/owner.ts';
 import { simulatePersonaComputerUse } from '../shared/sandboxValidator.ts';
 import { describeOtherCohortImpact, describeOtherCohortReport } from '../shared/otherCohorts.ts';
 import { splitIntoChatChunks } from '../shared/chatText.ts';
+import {
+  formatPredictionBadgeText,
+  formatPredictionReportLine,
+  outcomePredictionLabel,
+  PREDICTION_OPTIONS,
+  scorePredictionRound,
+  type PredictionRound,
+} from '../shared/prediction.ts';
 import { fillTurnRefs } from '../shared/promptTelemetry.ts';
 import { buildInitialSpec, buildScenarioSpec, type DifficultyLevel } from '../shared/theme.ts';
 import type {
@@ -75,6 +83,15 @@ interface TimelineMessage {
   chosenOption?: string;
   /** 改造完了後にチャット内からも「お客さんの反応を見る」を押せるようにする */
   showEvaluateAction?: boolean;
+  /** お客さんの反応を見る前に、3人がそれぞれどう思うかを1人ずつ予想する選択肢 */
+  predictionPrompt?: {
+    draft: Record<string, ReviewOutcome>;
+  };
+  /** 1人ずつ予想していく途中で確定した予想の1行（反応結果が出るまで表示し、押せば選び直せる） */
+  predictionStepDone?: {
+    personaIndex: number;
+    draftBefore: Record<string, ReviewOutcome>;
+  };
   /** この発言が対象にしている、赤ペンで囲んだ部品 */
   targetComponentIds?: string[];
   /** 改造の作業の過程。システムのメッセージとして1行ずつ進み、完了後もそのまま残す */
@@ -91,6 +108,7 @@ interface TimelineMessage {
   /** お客さんの反応 */
   review?: {
     outcome: ReviewOutcome;
+    predictedOutcome?: ReviewOutcome;
   };
 }
 
@@ -102,6 +120,8 @@ interface StudioState {
   liveAppState: Record<string, StateValue>;
   selectedCohortId?: TargetCohortId;
   decisions: HumanDecisionRecord[];
+  /** 今の挑戦で、お客さんの反応を見る前に立てた予想の記録 */
+  predictionRounds: PredictionRound[];
   interactionMode: 'play' | 'pen';
   penPoints: Point2D[];
   circledComponentIds: string[];
@@ -814,6 +834,7 @@ const state: StudioState = {
   selectedCohortId: undefined,
   clearedCohortIds: [],
   decisions: [],
+  predictionRounds: [],
   interactionMode: 'play',
   penPoints: [],
   circledComponentIds: [],
@@ -1169,7 +1190,7 @@ async function runQueueLoop(runId: number): Promise<void> {
     activeQueuedItem = next;
     const spoken = isSpokenMessage(next.message);
 
-    if (next.typingMs > 0) {
+    if (next.typingMs > 0 && next.message.role !== 'system') {
       state.typingMessage = { role: next.message.role, personaId: next.message.personaId };
       renderStudio();
       scrollToLatestMessage();
@@ -1187,7 +1208,7 @@ async function runQueueLoop(runId: number): Promise<void> {
     } else {
       state.typingMessage = undefined;
       renderStudio();
-      await sleepWithQueueTimer(260);
+      await sleepWithQueueTimer(next.typingMs > 0 ? next.typingMs : 260);
     }
 
     if (runId !== queueRunId) return;
@@ -1274,15 +1295,25 @@ function flushMessageQueue(): void {
   }
 }
 
-/** 一時的な返信候補・反応確認ボタンのシステムメッセージを履歴から整理する */
-function clearTransientChoiceMessages(): void {
-  state.messages = state.messages.filter(
-    (m) =>
-      !(
-        m.role === 'system' &&
-        ((m.followUps && m.followUps.length > 0) || m.showEvaluateAction)
-      ),
+function isTransientChoiceMessage(m: TimelineMessage): boolean {
+  return (
+    m.role === 'system' &&
+    Boolean(
+      (m.followUps && m.followUps.length > 0) || m.showEvaluateAction || m.predictionPrompt,
+    )
   );
+}
+
+/** 一時的な返信候補・反応確認ボタン・未実行の予想パネルのシステムメッセージを履歴から整理する */
+function clearTransientChoiceMessages(): void {
+  const hadOpenPrediction = state.messages.some((m) => Boolean(m.predictionPrompt));
+  state.messages = state.messages.filter(
+    (m) => !isTransientChoiceMessage(m) && !(hadOpenPrediction && m.predictionStepDone),
+  );
+}
+
+function clearPredictionStepMessages(): void {
+  state.messages = state.messages.filter((m) => !m.predictionStepDone);
 }
 
 /** 冒頭の会話。店長とお助けエージェントの行は書き込み中の表示を挟んで話す */
@@ -1548,6 +1579,7 @@ function handleRestartFromScratch(sameCohortId?: TargetCohortId): void {
   clearTransientChoiceMessages();
   state.runFinished = false;
   state.selectedCohortId = undefined;
+  state.predictionRounds = [];
   state.recipient = 'assistant';
   recipientFirstSeenAt.clear();
   state.checkpoints = [
@@ -1584,6 +1616,7 @@ function startCohort(cohortId: TargetCohortId): void {
   state.selectedCohortId = cohort.id;
   state.runId = `run-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   state.runTurnTexts = [];
+  state.predictionRounds = [];
   // 同意の切り替えは、次の挑戦から効く
   state.runShareForAggregate = state.aggregateConsent === true;
   state.runEnded = false;
@@ -1664,14 +1697,7 @@ function buildOwnerHistory(): ChatHistoryEntry[] {
 
 function buildChatHistory(): ChatHistoryEntry[] {
   return state.messages
-    .filter(
-      (m) =>
-        m.text.trim().length > 0 &&
-        !(
-          m.role === 'system' &&
-          ((m.followUps && m.followUps.length > 0) || m.showEvaluateAction)
-        ),
-    )
+    .filter((m) => m.text.trim().length > 0 && !isTransientChoiceMessage(m))
     .slice(-12)
     .map((m) => ({
       speaker:
@@ -2376,10 +2402,39 @@ async function speakOwner(
   enqueueMessages(queued);
 }
 
-async function handleEvaluate(): Promise<void> {
+/** 「お客さんの反応を見る」を押したとき、まず1人目のお客さんがどう思うかを予想する選択肢をチャットに出す */
+function handleRequestEvaluate(): void {
+  if (state.evaluateLoading || !state.selectedCohortId || state.runFinished) return;
+  flushMessageQueue();
+  const existing = [...state.messages].reverse().find((m) => m.predictionPrompt);
+  if (existing && state.messages[state.messages.length - 1] === existing) {
+    scrollToLatestMessage();
+    return;
+  }
+  clearTransientChoiceMessages();
+  clearPredictionStepMessages();
+  const personas = getReviewersByCohort(state.selectedCohortId);
+  const firstPersona = personas[0];
+  if (!firstPersona) {
+    void handleEvaluate();
+    return;
+  }
+  pushMessage({
+    role: 'system',
+    text: `\`${firstPersona.name}\` はどう思うか予想しよう`,
+    predictionPrompt: { draft: {} },
+  });
+  renderStudio();
+  scrollToLatestMessage();
+}
+
+async function handleEvaluate(predictions?: Record<string, ReviewOutcome>): Promise<void> {
   if (state.evaluateLoading || !state.selectedCohortId) return;
   flushMessageQueue();
   clearTransientChoiceMessages();
+  if (!predictions) {
+    clearPredictionStepMessages();
+  }
   state.evaluateLoading = true;
   renderStudio();
   scrollToLatestMessage();
@@ -2401,6 +2456,9 @@ async function handleEvaluate(): Promise<void> {
       history: buildOwnerHistory(),
     });
     getCurrentCheckpoint().evaluation = evaluation;
+    state.predictionRounds.push(scorePredictionRound(evaluation.results, predictions));
+    // 各お客さんの吹き出しの下に予想の答え合わせバッジが出るため、途中の予想確認行はここで片付ける
+    clearPredictionStepMessages();
 
     // お客さん3人の反応を書き込み中の表示を挟んで1人ずつ出す（店長は変更直後に反応済みのためここでは話さない）
     const queued: QueuedMessage[] = [];
@@ -2414,7 +2472,10 @@ async function handleEvaluate(): Promise<void> {
           role: 'customer',
           personaId: persona.id,
           text: result.comment,
-          review: { outcome: result.outcome },
+          review: {
+            outcome: result.outcome,
+            predictedOutcome: predictions?.[persona.id],
+          },
         },
         typingMs: typingDurationFor(result.comment),
       });
@@ -2485,6 +2546,13 @@ async function handleEvaluate(): Promise<void> {
           typingMs: 0,
         });
       }
+      const predictionLine = formatPredictionReportLine(state.predictionRounds);
+      if (predictionLine) {
+        queued.push({
+          message: { role: 'system', text: predictionLine },
+          typingMs: 0,
+        });
+      }
       const report = describeOtherCohortReport(
         currentSpec,
         otherPersonas,
@@ -2533,6 +2601,7 @@ async function handleEvaluate(): Promise<void> {
     state.evaluateLoading = false;
     enqueueMessages(queued);
   } catch (err) {
+    clearPredictionStepMessages();
     pushMessage({ role: 'system', tone: 'warning', text: describeError(err) });
   } finally {
     state.evaluateLoading = false;
@@ -2616,8 +2685,80 @@ function renderNextChallengeSelector(msg: TimelineMessage, isLatestChallenge: bo
   return pillRow;
 }
 
-/** お助けAIが出す選択肢（返信候補・お客さんの反応確認）をシステムメッセージのピルボタンとして描画する */
+const PREDICTION_NEXT_DELAY_MS = 480;
+
+/** お客さんの反応を見る前に、いま順番が来ている1人の予想選択肢ピルを描画する */
+function renderPredictionPrompt(msg: TimelineMessage): HTMLElement | null {
+  const draft = msg.predictionPrompt!.draft;
+  const personas = getReviewersByCohort(state.selectedCohortId);
+  const personaIndex = personas.findIndex((p) => !draft[p.id]);
+  if (personaIndex < 0) return null;
+  const currentPersona = personas[personaIndex];
+
+  const pillRow = document.createElement('div');
+  pillRow.className = 'cohort-pill-row';
+  for (const opt of PREDICTION_OPTIONS) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.disabled = state.evaluateLoading;
+    btn.className = `cohort-pill-btn is-prediction-opt is-${opt.outcome}`;
+    btn.textContent = opt.label;
+    btn.addEventListener('click', () => {
+      const nextDraft: Record<string, ReviewOutcome> = {
+        ...draft,
+        [currentPersona.id]: opt.outcome,
+      };
+      // 選んだ瞬間に今の選択肢ボタンを消し、選んだ予想の1行だけを残す
+      state.messages = state.messages.filter((m) => !m.predictionPrompt);
+      pushMessage({
+        role: 'system',
+        text: `\`${currentPersona.name}\` の予想：\`${outcomePredictionLabel(opt.outcome)}\``,
+        predictionStepDone: {
+          personaIndex,
+          draftBefore: { ...draft },
+        },
+      });
+      renderStudio();
+      scrollToLatestMessage();
+
+      const nextPersona = personas.find((p) => !nextDraft[p.id]);
+      if (nextPersona) {
+        // 少し間隔を空けてから、次のお客さんの予想と選択肢を出す
+        enqueueMessages([
+          {
+            message: {
+              role: 'system',
+              text: `\`${nextPersona.name}\` はどう思うか予想しよう`,
+              predictionPrompt: { draft: nextDraft },
+            },
+            typingMs: PREDICTION_NEXT_DELAY_MS,
+          },
+        ]);
+      } else {
+        void handleEvaluate(nextDraft);
+      }
+    });
+    pillRow.appendChild(btn);
+  }
+
+  const skipBtn = document.createElement('button');
+  skipBtn.type = 'button';
+  skipBtn.className = 'cohort-pill-btn is-prediction-skip';
+  skipBtn.disabled = state.evaluateLoading;
+  skipBtn.textContent = '予想せずすぐ見る';
+  skipBtn.addEventListener('click', () => {
+    void handleEvaluate();
+  });
+  pillRow.appendChild(skipBtn);
+
+  return pillRow;
+}
+
+/** お助けAIが出す選択肢（返信候補・お客さんの反応確認・予想パネル）をシステムメッセージのピルボタンとして描画する */
 function renderActionChoiceRow(msg: TimelineMessage): HTMLElement | null {
+  if (msg.predictionPrompt && state.selectedCohortId) {
+    return renderPredictionPrompt(msg);
+  }
   const pillRow = document.createElement('div');
   pillRow.className = 'cohort-pill-row';
   if (msg.showEvaluateAction && !evaluationFor(getCurrentCheckpoint()) && state.selectedCohortId) {
@@ -2626,7 +2767,7 @@ function renderActionChoiceRow(msg: TimelineMessage): HTMLElement | null {
     evalBtn.className = 'cohort-pill-btn';
     evalBtn.textContent = 'お客さんの反応を見る';
     evalBtn.addEventListener('click', () => {
-      void handleEvaluate();
+      handleRequestEvaluate();
     });
     pillRow.appendChild(evalBtn);
 
@@ -2842,15 +2983,13 @@ function renderChatPanel(): HTMLElement {
   const latestChallengeMessageId = [...state.messages].reverse().find((m) => m.showNextChallenge)?.id;
   const latestActionChoiceId = [...state.messages]
     .reverse()
-    .find((m) => (m.followUps && m.followUps.length > 0) || m.showEvaluateAction)?.id;
+    .find((m) => isTransientChoiceMessage(m))?.id;
   let prevSpeakerKey = '';
 
   for (const msg of state.messages) {
     // 進行役のアナウンス・AIの作業プログレス・選択肢：吹き出しなしで中央に小さく出す
     if (msg.role === 'system') {
-      const isActionChoiceMsg = Boolean(
-        (msg.followUps && msg.followUps.length > 0) || msg.showEvaluateAction,
-      );
+      const isActionChoiceMsg = isTransientChoiceMessage(msg);
       if (isActionChoiceMsg) {
         if (msg.id !== latestActionChoiceId || isBusy || isPlayingQueue) continue;
         const actionRow = renderActionChoiceRow(msg);
@@ -2859,7 +2998,7 @@ function renderChatPanel(): HTMLElement {
         if (msg.text) {
           const line = document.createElement('div');
           line.className = 'chat-system-line';
-          line.textContent = msg.text;
+          appendFormattedSystemText(line, msg.text);
           row.appendChild(line);
         }
         row.appendChild(actionRow);
@@ -2876,8 +3015,37 @@ function renderChatPanel(): HTMLElement {
         appendWorkLogLines(row, msg);
       } else if (msg.text) {
         const line = document.createElement('div');
-        line.className = `chat-system-line ${msg.tone === 'warning' ? 'is-warning' : ''}`;
+        const canRewindPrediction =
+          Boolean(msg.predictionStepDone) &&
+          !isBusy &&
+          (state.messages.some((m) => Boolean(m.predictionPrompt)) ||
+            messageQueue.some((q) => Boolean(q.message.predictionPrompt)) ||
+            Boolean(activeQueuedItem?.message.predictionPrompt));
+        line.className = `chat-system-line ${msg.tone === 'warning' ? 'is-warning' : ''}${canRewindPrediction ? ' is-interactive is-selectable' : ''}`;
         appendFormattedSystemText(line, msg.text);
+        if (canRewindPrediction && msg.predictionStepDone) {
+          const stepInfo = msg.predictionStepDone;
+          line.title = 'クリックするとこのお客さんの予想から選び直せます';
+          line.addEventListener('click', () => {
+            flushMessageQueue();
+            state.messages = state.messages.filter(
+              (m) =>
+                !m.predictionPrompt &&
+                !(m.predictionStepDone && m.predictionStepDone.personaIndex >= stepInfo.personaIndex),
+            );
+            const personas = getReviewersByCohort(state.selectedCohortId);
+            const targetPersona = personas[stepInfo.personaIndex];
+            if (targetPersona) {
+              pushMessage({
+                role: 'system',
+                text: `\`${targetPersona.name}\` はどう思うか予想しよう`,
+                predictionPrompt: { draft: { ...stepInfo.draftBefore } },
+              });
+            }
+            renderStudio();
+            scrollToLatestMessage();
+          });
+        }
         row.appendChild(line);
       }
       if (msg.showCohortSelector) {
@@ -2908,13 +3076,21 @@ function renderChatPanel(): HTMLElement {
       const persona = findPersona(msg.personaId);
       const outcomeClass = msg.review ? ` is-${msg.review.outcome}` : '';
       const bubble = createBubble(`chat-bubble is-customer${outcomeClass}${enteringClass}`, msg.text);
+      const extras: HTMLElement[] = [];
+      if (msg.review?.predictedOutcome) {
+        const badgeInfo = formatPredictionBadgeText(msg.review.predictedOutcome, msg.review.outcome);
+        const badge = document.createElement('div');
+        badge.className = `prediction-result-badge ${badgeInfo.matched ? 'is-matched' : 'is-missed'}`;
+        badge.textContent = badgeInfo.text;
+        extras.push(badge);
+      }
       stream.appendChild(
         createSpeakerRow(
           'customer',
           persona?.icon ?? '客',
           persona?.name ?? 'お客さん',
           bubble,
-          [],
+          extras,
           isContinuation,
           'customer',
         ),
@@ -3422,7 +3598,7 @@ function renderStudio(): void {
       state.evaluateLoading ? '反応を確認中...' : 'お客さんの反応を見る'
     }</span>`;
     evalBtn.addEventListener('click', () => {
-      void handleEvaluate();
+      handleRequestEvaluate();
     });
 
     bottomBarEl.append(modeSwitch, evalBtn);

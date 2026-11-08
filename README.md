@@ -74,6 +74,7 @@
    - 書き換えた画面は、描画できるか、注文を完了するボタンと合計金額が残っているか、対象外の部品が書き換わっていないかを検証します。問題があれば、直前の画面に自動で戻します。チャットの履歴から、好きな時点の画面に戻すこともできます。
    - 手直しの直後に、店長が売上の立場から一言反応します。
 4. **お客さんの反応を見る**
+   - 反応を見る前に、3人がそれぞれどうなるかを予想してから確かめることもできます。予想せずすぐ見ることもでき、予想したときは結果と突き合わせて、クリア時のレポートにも当たった数が出ます。
    - レビューAIは、これまでの会話や手直しの意図を知らされないまま、画面を実際に操作します。
    - ペルソナごとに、視界のぼかし、コントラストの低下、タップ位置のずれ、手数の上限、待てる時間、細かい字を読むか、定期便やクーポンを望んでいるか、といった制約があります。その制約のもとで操作をシミュレーションし、結果はコードが判定します。
    - 結果は4種類です。
@@ -176,6 +177,7 @@ AIに任せないことも、はっきり分けています。お客さんが買
 - [`src/shared/appRuntime.ts`](src/shared/appRuntime.ts)：計算式、表示条件、アクションの実行規則。画面の描画と操作シミュレーターで共有する
 - [`src/client/sandboxRenderer.ts`](src/client/sandboxRenderer.ts)：スマートフォンの画面の中での部品の描画と、操作したときの処理
 - [`src/shared/sandboxValidator.ts`](src/shared/sandboxValidator.ts)：画面の整合性の検査と、部品の役割にもとづく操作シミュレーション
+- [`src/shared/prediction.ts`](src/shared/prediction.ts)：お客さんの反応を見る前の予想と、結果との突き合わせ
 - [`src/shared/promptTelemetry.ts`](src/shared/promptTelemetry.ts)：質問と手直しの指示の区別、指示の型の分類、直し直しの判定、クリア時の記録の集計
 - [`src/server/gemini.ts`](src/server/gemini.ts)：3つのAIのプロンプト、Structured Outputs のスキーマ、発言の意図の判定、Function Calling による判断の記録
 - [`src/server/store.ts`](src/server/store.ts)：規則による分類と抽出、それを補う Agent Platform の Text embeddings API と Cloud Natural Language API、Cloud Text-to-Speech、BigQuery、Cloud Firestore との連携
