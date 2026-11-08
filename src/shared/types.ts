@@ -9,6 +9,8 @@ import type {
   PromptSessionMode,
   PromptSessionSummary,
   PromptTelemetryEvent,
+  PublicAggregateCohortStat,
+  PublicAggregateStats,
 } from './promptTelemetry.ts';
 
 export type {
@@ -18,6 +20,8 @@ export type {
   PromptSessionMode,
   PromptSessionSummary,
   PromptTelemetryEvent,
+  PublicAggregateCohortStat,
+  PublicAggregateStats,
 };
 
 export type StateValue = string | number | boolean;

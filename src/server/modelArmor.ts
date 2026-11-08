@@ -32,10 +32,37 @@ const EMAIL_RE = /[\w.+-]+@[\w-]+(?:\.[\w-]+)+/;
 /** 0 から始まり、区切りを除いて10〜11けたの数字。値段や時刻は 0 から始まらないので当たらない */
 const PHONE_CANDIDATE_RE = /(?<![\d０-９])[0０][\d０-９]{1,4}[-‐ー－\s]?[\d０-９]{1,4}[-‐ー－\s]?[\d０-９]{3,4}(?![\d０-９])/g;
 
+/** 題材の画面に最初から載っている架空のお届け先。画面の文字をそのまま引用した指示が誤って止められないように取り除く */
+const THEME_SAMPLE_PHRASES = [
+  '〒150-0001',
+  '150-0001',
+  '東京都渋谷区神宮前1-2-3',
+  '東京都渋谷区神宮前',
+  '渋谷区神宮前1-2-3',
+  '渋谷区神宮前',
+  '山田 花子',
+  '山田花子',
+  '〒100-0005',
+  '100-0005',
+  '東京都千代田区丸の内4-5-6',
+  '東京都千代田区丸の内',
+  '千代田区丸の内4-5-6',
+  '千代田区丸の内',
+];
+
+export function stripThemeSamplePhrases(text: string): string {
+  let cleaned = text;
+  for (const phrase of THEME_SAMPLE_PHRASES) {
+    cleaned = cleaned.replaceAll(phrase, '');
+  }
+  return cleaned;
+}
+
 /** コードの規則で、メールアドレスと電話番号らしいものがあるかを見る */
 export function findPersonalInfoByRules(text: string): boolean {
-  if (EMAIL_RE.test(text)) return true;
-  for (const m of text.matchAll(PHONE_CANDIDATE_RE)) {
+  const target = stripThemeSamplePhrases(text);
+  if (EMAIL_RE.test(target)) return true;
+  for (const m of target.matchAll(PHONE_CANDIDATE_RE)) {
     const digits = m[0].replace(/[^\d０-９]/g, '');
     if (digits.length === 10 || digits.length === 11) return true;
   }
@@ -98,9 +125,9 @@ async function screenWithModelArmor(text: string): Promise<PromptRejectReason | 
 
 /** 発言を Gemini に送ってよいかを確かめ、止めるときは PromptRejectedError を投げる */
 export async function assertPromptAllowed(text: string): Promise<void> {
-  const trimmed = text.trim();
-  if (!trimmed) return;
-  if (findPersonalInfoByRules(trimmed)) throw new PromptRejectedError('personal_info');
-  const reason = await screenWithModelArmor(trimmed);
+  const cleaned = stripThemeSamplePhrases(text).trim();
+  if (!cleaned) return;
+  if (findPersonalInfoByRules(cleaned)) throw new PromptRejectedError('personal_info');
+  const reason = await screenWithModelArmor(cleaned);
   if (reason) throw new PromptRejectedError(reason);
 }

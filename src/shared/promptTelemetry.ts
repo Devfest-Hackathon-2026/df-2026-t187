@@ -530,3 +530,249 @@ export function summarizePromptTelemetry(
     systemLogLines,
   };
 }
+
+/** 個人の挑戦が推測されないよう、公開の集計で数値を出すために必要な最小の挑戦数 */
+export const MIN_PUBLIC_RUN_COUNT = 3;
+
+export const ARCHETYPE_PUBLIC_LABELS: ReadonlyArray<{
+  archetype: PromptArchetype;
+  label: string;
+}> = [
+  { archetype: 'goal_directed', label: '目的を伝えた指示' },
+  { archetype: 'condition_design', label: '条件を具体化した指示' },
+  { archetype: 'direct_fix', label: '具体的に直した指示' },
+  { archetype: 'inquiry', label: '店長やお客さんへの質問' },
+  { archetype: 'simple_delete', label: '単純に消す指示' },
+  { archetype: 'vague_delegate', label: '丸投げした指示' },
+];
+
+export interface PublicAggregateCohortStat {
+  cohortId: TargetCohortId;
+  label: string;
+  /** この客層の挑戦が minRunsForDisplay 未満なら true（内訳の数字は伏せる） */
+  suppressed: boolean;
+  runCount?: number;
+  clearedCount?: number;
+  clearRatePercent?: number;
+  avgExecuteTurnsOnClear?: number | null;
+}
+
+export interface PublicAggregateStats {
+  /** BigQuery との連携が有効で取得できたか */
+  available: boolean;
+  /** 集計した時刻（ISO 8601） */
+  generatedAt: string;
+  /** 個人が特定されないために必要な最小の挑戦数（既定は3件） */
+  minRunsForDisplay: number;
+  /** 全体の挑戦が minRunsForDisplay 未満なら true（全体の内訳も伏せる） */
+  suppressed: boolean;
+  totalRuns?: number;
+  clearedRuns?: number;
+  resetRuns?: number;
+  abandonedRuns?: number;
+  clearRatePercent?: number;
+  avgExecuteTurnsOnClear?: number | null;
+  totalPrompts?: number;
+  reworkRatePercent?: number;
+  removedNeededFeatureRatePercent?: number;
+  archetypeBreakdown?: Array<{
+    archetype: PromptArchetype;
+    label: string;
+    count: number;
+    percent: number;
+  }>;
+  topEntities?: Array<{ term: string; count: number }>;
+  cohorts: PublicAggregateCohortStat[];
+}
+
+export interface RawBigQueryAggregatePayload {
+  runTotals?: {
+    total_runs?: number | string | null;
+    cleared_runs?: number | string | null;
+    reset_runs?: number | string | null;
+    abandoned_runs?: number | string | null;
+    avg_execute_turns_on_clear?: number | string | null;
+  } | null;
+  cohortStats?: Array<{
+    cohort_id?: string | null;
+    run_count?: number | string | null;
+    cleared_count?: number | string | null;
+    avg_execute_turns_on_clear?: number | string | null;
+  }> | null;
+  promptTotals?: {
+    total_prompts?: number | string | null;
+    execute_prompts?: number | string | null;
+    rework_prompts?: number | string | null;
+    removed_needed_prompts?: number | string | null;
+  } | null;
+  archetypeStats?: Array<{
+    archetype?: string | null;
+    cnt?: number | string | null;
+  }> | null;
+  entityStats?: Array<{
+    term?: string | null;
+    cnt?: number | string | null;
+  }> | null;
+}
+
+function toSafeInt(v: unknown): number {
+  const n = typeof v === 'number' ? v : typeof v === 'string' ? Number(v) : 0;
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+}
+
+function toSafeAvg(v: unknown): number | null {
+  if (v === null || v === undefined || v === '') return null;
+  const n = typeof v === 'number' ? v : typeof v === 'string' ? Number(v) : NaN;
+  return Number.isFinite(n) && n >= 0 ? Number(n.toFixed(1)) : null;
+}
+
+/**
+ * BigQuery の集計結果から、公開用の集計データを組み立てる。
+ * 挑戦数が minRunsForDisplay（既定3件）に満たない全体または客層区分は suppressed: true にし、数値を出さない
+ */
+export function formatPublicAggregateStats(
+  raw: RawBigQueryAggregatePayload | null | undefined,
+  cohorts: ReadonlyArray<{ id: TargetCohortId; label: string }>,
+  options: {
+    available?: boolean;
+    minRunsForDisplay?: number;
+    generatedAt?: string;
+  } = {},
+): PublicAggregateStats {
+  const available = options.available ?? Boolean(raw);
+  const minRunsForDisplay = options.minRunsForDisplay ?? MIN_PUBLIC_RUN_COUNT;
+  const generatedAt = options.generatedAt ?? new Date().toISOString();
+
+  if (!available || !raw) {
+    return {
+      available: false,
+      generatedAt,
+      minRunsForDisplay,
+      suppressed: true,
+      cohorts: cohorts.map((c) => ({
+        cohortId: c.id,
+        label: c.label,
+        suppressed: true,
+      })),
+    };
+  }
+
+  const totalRuns = toSafeInt(raw.runTotals?.total_runs);
+  if (totalRuns < minRunsForDisplay) {
+    return {
+      available: true,
+      generatedAt,
+      minRunsForDisplay,
+      suppressed: true,
+      cohorts: cohorts.map((c) => ({
+        cohortId: c.id,
+        label: c.label,
+        suppressed: true,
+      })),
+    };
+  }
+
+  const clearedRuns = toSafeInt(raw.runTotals?.cleared_runs);
+  const resetRuns = toSafeInt(raw.runTotals?.reset_runs);
+  const abandonedRuns = toSafeInt(raw.runTotals?.abandoned_runs);
+  const clearRatePercent = Math.round((clearedRuns / totalRuns) * 100);
+  const avgExecuteTurnsOnClear =
+    clearedRuns >= minRunsForDisplay
+      ? toSafeAvg(raw.runTotals?.avg_execute_turns_on_clear)
+      : null;
+
+  const totalPrompts = toSafeInt(raw.promptTotals?.total_prompts);
+  const executePrompts = toSafeInt(raw.promptTotals?.execute_prompts);
+  const reworkPrompts = toSafeInt(raw.promptTotals?.rework_prompts);
+  const removedNeededPrompts = toSafeInt(raw.promptTotals?.removed_needed_prompts);
+
+  const reworkRatePercent =
+    executePrompts >= minRunsForDisplay
+      ? Math.round((reworkPrompts / executePrompts) * 100)
+      : undefined;
+  const removedNeededFeatureRatePercent =
+    executePrompts >= minRunsForDisplay
+      ? Math.round((removedNeededPrompts / executePrompts) * 100)
+      : undefined;
+
+  const archetypeCountMap = new Map<PromptArchetype, number>();
+  for (const row of raw.archetypeStats ?? []) {
+    const key = row?.archetype as PromptArchetype | undefined;
+    if (key && ARCHETYPE_PUBLIC_LABELS.some((item) => item.archetype === key)) {
+      archetypeCountMap.set(key, toSafeInt(row?.cnt));
+    }
+  }
+  const archetypeBreakdown =
+    totalPrompts >= minRunsForDisplay
+      ? ARCHETYPE_PUBLIC_LABELS.map(({ archetype, label }) => {
+          const count = archetypeCountMap.get(archetype) ?? 0;
+          return {
+            archetype,
+            label,
+            count,
+            percent: Math.round((count / totalPrompts) * 100),
+          };
+        })
+      : undefined;
+
+  const topEntities: Array<{ term: string; count: number }> = [];
+  for (const row of raw.entityStats ?? []) {
+    const allowed = limitEntitiesToVocabulary([row?.term ?? '']);
+    const count = toSafeInt(row?.cnt);
+    if (allowed.length === 1 && count >= minRunsForDisplay) {
+      const term = allowed[0];
+      if (!topEntities.some((e) => e.term === term)) {
+        topEntities.push({ term, count });
+      }
+    }
+  }
+
+  const cohortMap = new Map<string, NonNullable<RawBigQueryAggregatePayload['cohortStats']>[number]>();
+  for (const row of raw.cohortStats ?? []) {
+    if (row?.cohort_id) {
+      cohortMap.set(row.cohort_id, row);
+    }
+  }
+
+  const cohortResults: PublicAggregateCohortStat[] = cohorts.map((c) => {
+    const row = cohortMap.get(c.id);
+    const runCount = toSafeInt(row?.run_count);
+    if (runCount < minRunsForDisplay) {
+      return {
+        cohortId: c.id,
+        label: c.label,
+        suppressed: true,
+      };
+    }
+    const clearedCount = toSafeInt(row?.cleared_count);
+    return {
+      cohortId: c.id,
+      label: c.label,
+      suppressed: false,
+      runCount,
+      clearedCount,
+      clearRatePercent: Math.round((clearedCount / runCount) * 100),
+      avgExecuteTurnsOnClear:
+        clearedCount >= minRunsForDisplay ? toSafeAvg(row?.avg_execute_turns_on_clear) : null,
+    };
+  });
+
+  return {
+    available: true,
+    generatedAt,
+    minRunsForDisplay,
+    suppressed: false,
+    totalRuns,
+    clearedRuns,
+    resetRuns,
+    abandonedRuns,
+    clearRatePercent,
+    avgExecuteTurnsOnClear,
+    totalPrompts: totalPrompts >= minRunsForDisplay ? totalPrompts : undefined,
+    reworkRatePercent,
+    removedNeededFeatureRatePercent,
+    archetypeBreakdown,
+    topEntities,
+    cohorts: cohortResults,
+  };
+}

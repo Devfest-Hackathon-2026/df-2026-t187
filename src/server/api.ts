@@ -26,6 +26,7 @@ import {
   voiceOwnerLine,
 } from './gemini.ts';
 import {
+  getPublicAggregateStats,
   synthesizeStudioSpeech,
   recordRunEvent,
   type RunEventInput,
@@ -259,6 +260,11 @@ async function routeApiRequest(
   try {
     if (req.method === 'GET' && url === '/api/status') {
       sendJson(res, 200, getAiConnectionStatus());
+      return true;
+    }
+
+    if (req.method === 'GET' && url === '/api/aggregate-stats') {
+      sendJson(res, 200, await getPublicAggregateStats());
       return true;
     }
 

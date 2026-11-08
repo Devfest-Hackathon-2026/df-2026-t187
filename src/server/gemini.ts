@@ -1321,16 +1321,12 @@ export async function evaluateAppWithPersonas(req: EvaluateRequest): Promise<Eva
     };
   });
 
-  const closing = await closingPromise;
-  if (closing) owner.closingLines = closing.text.split('\n').filter(Boolean);
-
   const achievedCount = results.filter((r) => r.outcome === 'achieved').length;
-  const telemetrySummary = finalizeTelemetryOnEvaluate(
-    req.cohortId,
-    achievedCount,
-    results.length,
-    req.runId,
-  );
+  const [closing, telemetrySummary] = await Promise.all([
+    closingPromise,
+    finalizeTelemetryOnEvaluate(req.cohortId, achievedCount, results.length, req.runId),
+  ]);
+  if (closing) owner.closingLines = closing.text.split('\n').filter(Boolean);
 
   return {
     evaluatedAt: new Date().toISOString(),

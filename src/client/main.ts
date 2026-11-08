@@ -33,6 +33,7 @@ import type {
   LatestReviewRecord,
   OwnerLineRequest,
   OwnerLineResponse,
+  PublicAggregateStats,
   RecordDecisionRequest,
   RecordDecisionResponse,
   ReviewerPersona,
@@ -188,7 +189,8 @@ const TERMS_SUMMARY = '学習用の架空のお店の注文画面を、AIと一�
 /** 運営者と問い合わせ先 */
 const OPERATOR = {
   team: 'YukiD',
-  representative: 'Hinata Wakabayashi',
+  representative: 'xxxxholica',
+  representativeUrl: 'https://github.com/xxxxholica',
   email: 'yukid-df-hack@hinata.works',
 };
 
@@ -210,7 +212,10 @@ const TERMS_ITEMS: TermsPart[][] = [
 /** 運営者と問い合わせ先。条文とは分けて、注意のすぐ下に、見出しと値の組で並べる */
 const OPERATOR_ITEMS: Array<{ label: string; value: TermsPart[] }> = [
   { label: '運営', value: [OPERATOR.team] },
-  { label: '代表者', value: [OPERATOR.representative] },
+  {
+    label: '代表者',
+    value: [{ text: OPERATOR.representative, href: OPERATOR.representativeUrl, external: true }],
+  },
   { label: '問い合わせ', value: [{ text: OPERATOR.email, href: `mailto:${OPERATOR.email}` }] },
 ];
 
@@ -235,7 +240,7 @@ function appendTermsParts(target: HTMLElement, parts: TermsPart[]): void {
 const AGGREGATE_NOTES = [
   '送るのは指示の型・回数・結果・途中でやめたかだけ。',
   '文章や個人を特定できる情報は送りません。',
-  '画面の下でいつでも変えられ、次の挑戦から反映されます。',
+  '画面下の「このツールについて」からいつでも変えられ、次の挑戦から反映されます。',
 ];
 
 function hasAcceptedTerms(): boolean {
@@ -356,10 +361,11 @@ function openTermsDialog(mode: 'first' | 'review', onAccepted?: () => void): voi
   dialog.append(title, summary, noticeHeading, noticeList, operatorLine, consentBox, actionBtn);
   overlay.appendChild(dialog);
   document.body.appendChild(overlay);
-  actionBtn.focus();
+  dialog.scrollTop = 0;
+  actionBtn.focus({ preventScroll: true });
 }
 
-/** 画面の下の切り替え。押すたびに、加える・加えないが入れ替わる。今の挑戦ではなく次の挑戦から効く */
+/** 「このツールについて」で集計への協力を切り替えたときに反映する。今の挑戦ではなく次の挑戦から効く */
 function toggleAggregateConsent(): void {
   const next = state.aggregateConsent !== true;
   saveAggregateConsent(next);
@@ -371,6 +377,332 @@ function toggleAggregateConsent(): void {
   });
   renderStudio();
   scrollToLatestMessage();
+}
+
+/** 指示や質問の型の全6分類（集計画面の枠組み表示にも使う） */
+const ALL_ARCHETYPE_LABELS: ReadonlyArray<{ label: string }> = [
+  { label: '目的を伝えた指示' },
+  { label: '条件を具体化した指示' },
+  { label: '具体的に直した指示' },
+  { label: '店長やお客さんへの質問' },
+  { label: '単純に消す指示' },
+  { label: '丸投げした指示' },
+];
+
+const STATS_STAGGER_MS = 45;
+
+function applyStaggerEnter(el: HTMLElement, step: number): void {
+  el.classList.add('stats-value-enter');
+  el.style.animationDelay = `${step * STATS_STAGGER_MS}ms`;
+}
+
+function appendAggregateStatsBody(
+  container: HTMLElement,
+  stats: PublicAggregateStats,
+  options: { loading?: boolean } = {},
+): void {
+  container.innerHTML = '';
+  const isLoading = options.loading === true;
+  container.classList.toggle('is-loading', isLoading);
+
+  const isInsufficient =
+    isLoading ||
+    !stats.available ||
+    stats.suppressed ||
+    (stats.totalRuns ?? 0) < stats.minRunsForDisplay;
+
+  let staggerStep = 0;
+
+  // 1. 全体の数値カード
+  const kpiGrid = document.createElement('div');
+  kpiGrid.className = 'stats-kpi-grid';
+  const kpiItems: Array<{ label: string; value: string }> = isLoading
+    ? [
+        { label: '協力された挑戦', value: '…' },
+        { label: 'クリア率', value: '…' },
+        { label: '平均手直し', value: '…' },
+        { label: '記録された発言', value: '…' },
+      ]
+    : isInsufficient
+      ? [
+          { label: '協力された挑戦', value: '— 件' },
+          { label: 'クリア率', value: '— %' },
+          { label: '平均手直し', value: '— 回' },
+          { label: '記録された発言', value: '— 件' },
+        ]
+      : [
+          { label: '協力された挑戦', value: `${stats.totalRuns ?? 0}件` },
+          { label: 'クリア率', value: `${stats.clearRatePercent ?? 0}%` },
+          {
+            label: '平均手直し',
+            value:
+              stats.avgExecuteTurnsOnClear !== null && stats.avgExecuteTurnsOnClear !== undefined
+                ? `${stats.avgExecuteTurnsOnClear}回`
+                : '— 回',
+          },
+          {
+            label: '記録された発言',
+            value: stats.totalPrompts !== undefined ? `${stats.totalPrompts}件` : '— 件',
+          },
+        ];
+  for (const item of kpiItems) {
+    const card = document.createElement('div');
+    card.className = `stats-kpi-card${isInsufficient ? ' is-placeholder' : ''}`;
+    const lbl = document.createElement('div');
+    lbl.className = 'stats-kpi-label';
+    lbl.textContent = item.label;
+    const val = document.createElement('div');
+    val.className = 'stats-kpi-value';
+    val.textContent = item.value;
+    if (!isLoading) applyStaggerEnter(val, staggerStep++);
+    card.append(lbl, val);
+    kpiGrid.appendChild(card);
+  }
+  container.appendChild(kpiGrid);
+
+  // 2. 指示の型の割合
+  const archSection = document.createElement('div');
+  archSection.className = 'stats-section';
+  const h = document.createElement('h3');
+  h.className = 'terms-heading';
+  h.textContent = '指示や質問の型の内訳';
+  archSection.appendChild(h);
+
+  const barList = document.createElement('div');
+  barList.className = 'stats-bar-list';
+  const archRows =
+    !isInsufficient && stats.archetypeBreakdown && stats.archetypeBreakdown.length > 0
+      ? stats.archetypeBreakdown
+      : ALL_ARCHETYPE_LABELS.map((item) => ({
+          label: item.label,
+          count: null as number | null,
+          percent: null as number | null,
+        }));
+  for (const row of archRows) {
+    const step = staggerStep++;
+    const r = document.createElement('div');
+    r.className = 'stats-bar-row';
+    const labelEl = document.createElement('span');
+    labelEl.className = 'stats-bar-label';
+    labelEl.textContent = row.label;
+    const track = document.createElement('div');
+    track.className = 'stats-bar-track';
+    const fill = document.createElement('div');
+    fill.className = 'stats-bar-fill';
+    fill.style.width = '0%';
+    if (!isLoading && row.percent !== null) {
+      fill.style.transitionDelay = `${step * STATS_STAGGER_MS}ms`;
+      const targetWidth = `${Math.max(0, Math.min(100, row.percent))}%`;
+      window.requestAnimationFrame(() => {
+        fill.style.width = targetWidth;
+      });
+    }
+    track.appendChild(fill);
+    const numEl = document.createElement('span');
+    numEl.className = 'stats-bar-num';
+    numEl.textContent = isLoading
+      ? '…'
+      : row.percent !== null && row.count !== null
+        ? `${row.percent}% · ${row.count}件`
+        : '— % · — 件';
+    if (!isLoading) applyStaggerEnter(numEl, step);
+    r.append(labelEl, track, numEl);
+    barList.appendChild(r);
+  }
+  archSection.appendChild(barList);
+
+  const subGrid = document.createElement('div');
+  subGrid.className = 'stats-sub-grid';
+  const reworkText = isLoading
+    ? '…'
+    : !isInsufficient && stats.reworkRatePercent !== undefined
+      ? `${stats.reworkRatePercent}%`
+      : '— %';
+  const removedText = isLoading
+    ? '…'
+    : !isInsufficient && stats.removedNeededFeatureRatePercent !== undefined
+      ? `${stats.removedNeededFeatureRatePercent}%`
+      : '— %';
+  for (const [label, value] of [
+    ['同じ部品を直し直した割合', reworkText],
+    ['必要な機能を単純に消した割合', removedText],
+  ] as const) {
+    const item = document.createElement('div');
+    item.className = 'stats-sub-item';
+    const k = document.createElement('span');
+    k.textContent = label;
+    const v = document.createElement('strong');
+    v.textContent = value;
+    if (!isLoading) applyStaggerEnter(v, staggerStep++);
+    item.append(k, v);
+    subGrid.appendChild(item);
+  }
+  archSection.appendChild(subGrid);
+  container.appendChild(archSection);
+
+  // 3. 客層ごとの集計（3件未満の客層は非表示）
+  const cohortSection = document.createElement('div');
+  cohortSection.className = 'stats-section';
+  const cohortHeading = document.createElement('h3');
+  cohortHeading.className = 'terms-heading';
+  cohortHeading.textContent = '客層ごとの結果';
+  cohortSection.appendChild(cohortHeading);
+
+  const cohortList = document.createElement('div');
+  cohortList.className = 'stats-cohort-list';
+  for (const c of stats.cohorts) {
+    const step = staggerStep++;
+    const card = document.createElement('div');
+    card.className = 'stats-cohort-card';
+    const title = document.createElement('div');
+    title.className = 'stats-cohort-title';
+    title.textContent = c.label;
+
+    const rowsEl = document.createElement('dl');
+    rowsEl.className = 'stats-cohort-rows';
+    const hideCohort = isInsufficient || c.suppressed;
+    const cohortMetrics: Array<[string, string]> = isLoading
+      ? [
+          ['挑戦', '…'],
+          ['クリア率', '…'],
+          ['平均手直し', '…'],
+        ]
+      : [
+          ['挑戦', hideCohort ? '— 件' : `${c.runCount}件`],
+          ['クリア率', hideCohort ? '— %' : `${c.clearRatePercent}%`],
+          [
+            '平均手直し',
+            hideCohort || c.avgExecuteTurnsOnClear === null || c.avgExecuteTurnsOnClear === undefined
+              ? '— 回'
+              : `${c.avgExecuteTurnsOnClear}回`,
+          ],
+        ];
+    for (const [kText, vText] of cohortMetrics) {
+      const row = document.createElement('div');
+      row.className = 'stats-cohort-row';
+      const dt = document.createElement('dt');
+      dt.textContent = kText;
+      const dd = document.createElement('dd');
+      dd.textContent = vText;
+      if (!isLoading) applyStaggerEnter(dd, step);
+      row.append(dt, dd);
+      rowsEl.appendChild(row);
+    }
+    card.append(title, rowsEl);
+    cohortList.appendChild(card);
+  }
+  cohortSection.appendChild(cohortList);
+  container.appendChild(cohortSection);
+
+  // 4. よく話題になった語彙（3回以上出た題材語彙のみ）
+  const entSection = document.createElement('div');
+  entSection.className = 'stats-section';
+  const entHeading = document.createElement('h3');
+  entHeading.className = 'terms-heading';
+  entHeading.textContent = 'よく話題になった部品・言葉';
+  entSection.appendChild(entHeading);
+
+  const tagList = document.createElement('div');
+  tagList.className = 'stats-tag-list';
+  if (!isInsufficient && stats.topEntities && stats.topEntities.length > 0) {
+    for (const ent of stats.topEntities) {
+      const tag = document.createElement('span');
+      tag.className = 'stats-tag';
+      tag.textContent = `${ent.term} ${ent.count}回`;
+      if (!isLoading) applyStaggerEnter(tag, staggerStep++);
+      tagList.appendChild(tag);
+    }
+  } else {
+    for (const label of [
+      isLoading ? '定期便 …' : '定期便 — 回',
+      isLoading ? 'クーポン …' : 'クーポン — 回',
+      isLoading ? '注文を確定する …' : '注文を確定する — 回',
+    ]) {
+      const tag = document.createElement('span');
+      tag.className = 'stats-tag is-placeholder';
+      tag.textContent = label;
+      if (!isLoading) applyStaggerEnter(tag, staggerStep++);
+      tagList.appendChild(tag);
+    }
+  }
+  entSection.appendChild(tagList);
+  container.appendChild(entSection);
+}
+
+/**
+ * みんなの集計のウィンドウを出す。
+ * BigQuery の run_events・prompt_events から集計された統計値だけを表示する
+ */
+function openAggregateStatsDialog(): void {
+  if (document.querySelector('.stats-overlay')) return;
+  const overlay = document.createElement('div');
+  overlay.className = 'terms-overlay stats-overlay';
+
+  const dialog = document.createElement('div');
+  dialog.className = 'terms-dialog stats-dialog';
+  dialog.setAttribute('role', 'dialog');
+  dialog.setAttribute('aria-modal', 'true');
+  dialog.setAttribute('aria-labelledby', 'stats-title');
+
+  const title = document.createElement('h2');
+  title.id = 'stats-title';
+  title.className = 'terms-title';
+  title.textContent = 'みんなの集計';
+
+  const summary = document.createElement('p');
+  summary.className = 'terms-summary';
+  summary.textContent =
+    '集計への協力にチェックを入れた挑戦だけを、BigQuery で集計した全体の傾向です。指示の文章や個人を特定できる情報は含まれず、個人の挑戦が推測されないよう3件未満の区分は数値を表示しません。';
+
+  const bodyBox = document.createElement('div');
+  bodyBox.className = 'stats-data-box';
+  const placeholderStats: PublicAggregateStats = {
+    available: false,
+    generatedAt: '',
+    minRunsForDisplay: 3,
+    suppressed: true,
+    cohorts: TARGET_COHORTS.map((c) => ({ cohortId: c.id, label: c.label, suppressed: true })),
+  };
+  appendAggregateStatsBody(bodyBox, placeholderStats, { loading: true });
+
+  const closeBtn = document.createElement('button');
+  closeBtn.type = 'button';
+  closeBtn.className = 'terms-action';
+  closeBtn.textContent = '閉じる';
+
+  const close = () => {
+    document.removeEventListener('keydown', onKeydown);
+    overlay.remove();
+  };
+  const onKeydown = (e: KeyboardEvent) => {
+    if (e.key === 'Escape') close();
+  };
+  closeBtn.addEventListener('click', close);
+  document.addEventListener('keydown', onKeydown);
+  overlay.addEventListener('click', (e) => {
+    if (e.target === overlay) close();
+  });
+
+  dialog.append(title, summary, bodyBox, closeBtn);
+  overlay.appendChild(dialog);
+  document.body.appendChild(overlay);
+  dialog.scrollTop = 0;
+  closeBtn.focus({ preventScroll: true });
+
+  const minWait = sleep(160);
+  void Promise.all([
+    fetch('/api/aggregate-stats').then(async (res) => {
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return (await res.json()) as PublicAggregateStats;
+    }),
+    minWait,
+  ])
+    .then(([stats]) => {
+      appendAggregateStatsBody(bodyBox, stats);
+    })
+    .catch(() => {
+      appendAggregateStatsBody(bodyBox, placeholderStats);
+    });
 }
 
 /** 集計で、どの問題の画面で遊んだかを分けるための名前 */
@@ -770,8 +1102,6 @@ let penCanvasEl: HTMLCanvasElement | null = null;
 let bottomBarEl: HTMLElement | null = null;
 let chatSlotEl: HTMLElement | null = null;
 let chatScrollEl: HTMLElement | null = null;
-/** 画面の下部にある、集計への協力の切り替え。表示は renderStudio で今の設定に合わせる */
-let footerConsentEl: HTMLButtonElement | null = null;
 let lastSandboxRenderKey = '';
 const seenMessageIds = new Set<string>();
 const recipientFirstSeenAt = new Map<string, number>();
@@ -2886,19 +3216,16 @@ function ensureStudioShellInitialized(): void {
   stage.append(deviceColumn, chatSlotEl);
   shellEl.appendChild(stage);
 
-  // 画面の下部：タイトルと、集計への協力の切り替え、利用上の注意の読み直し
+  // 画面の下部：みんなの集計と、利用上の注意・集計への協力の読み直し
   const footer = document.createElement('footer');
   footer.className = 'studio-footer';
-  const watermark = document.createElement('span');
-  watermark.className = 'studio-watermark';
-  watermark.textContent = 'ポンコツ工房';
 
-  // 記録をみんなの集計に加えるかの切り替え。次の挑戦から効く
-  footerConsentEl = document.createElement('button');
-  footerConsentEl.type = 'button';
-  footerConsentEl.className = 'footer-link consent-toggle';
-  footerConsentEl.title = '押すと切り替わります。次の挑戦から反映されます。指示の文章や、あなたを特定できる情報は送りません';
-  footerConsentEl.addEventListener('click', toggleAggregateConsent);
+  // 同意された挑戦の集計を見る
+  const statsBtn = document.createElement('button');
+  statsBtn.type = 'button';
+  statsBtn.className = 'footer-link stats-btn';
+  statsBtn.textContent = 'みんなの集計';
+  statsBtn.addEventListener('click', openAggregateStatsDialog);
 
   // 利用上の注意と集計への協力を、いつでも読み直せる
   const aboutBtn = document.createElement('button');
@@ -2907,7 +3234,7 @@ function ensureStudioShellInitialized(): void {
   aboutBtn.textContent = 'このツールについて';
   aboutBtn.addEventListener('click', () => openTermsDialog('review'));
 
-  footer.append(watermark, footerConsentEl, aboutBtn);
+  footer.append(statsBtn, aboutBtn);
   shellEl.appendChild(footer);
 
   appRoot.innerHTML = '';
@@ -2917,10 +3244,6 @@ function ensureStudioShellInitialized(): void {
 function renderStudio(): void {
   if (!appRoot) return;
   ensureStudioShellInitialized();
-  if (footerConsentEl) {
-    footerConsentEl.textContent = `集計への協力 ${state.aggregateConsent ? '加える' : '加えない'}`;
-    footerConsentEl.classList.toggle('is-on', state.aggregateConsent === true);
-  }
   const spec = getCurrentSpec();
 
   const activeEl = document.activeElement;

@@ -51,6 +51,7 @@ function readLimit(name: string, fallback: number): number {
 }
 
 export function rateLimitGroupOf(method: string | undefined, path: string): RateLimitGroup | null {
+  if (method === 'GET' && path === '/api/aggregate-stats') return 'record';
   if (method !== 'POST') return null;
   return GROUP_BY_PATH[path] ?? null;
 }

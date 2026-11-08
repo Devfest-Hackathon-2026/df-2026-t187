@@ -1,10 +1,13 @@
 import { GoogleAuth } from 'google-auth-library';
 import { existsSync, readFileSync } from 'node:fs';
+import { TARGET_COHORTS } from '../shared/initialTheme.ts';
 import {
   classifyDeterministicArchetype,
   cosineSimilarity,
   extractDeterministicNlSignal,
+  formatPublicAggregateStats,
   limitEntitiesToVocabulary,
+  type RawBigQueryAggregatePayload,
   summarizePromptTelemetry,
 } from '../shared/promptTelemetry.ts';
 import type {
@@ -15,6 +18,7 @@ import type {
   PromptSessionMode,
   PromptSessionSummary,
   PromptTelemetryEvent,
+  PublicAggregateStats,
   TargetCohortId,
   TtsRequest,
   TtsResponse,
@@ -151,7 +155,7 @@ export async function analyzePromptWithCloudNaturalLanguage(
         },
         encodingType: 'UTF8',
       }),
-      signal: AbortSignal.timeout(1200),
+      signal: AbortSignal.timeout(2500),
     });
     if (!res.ok) return base;
 
@@ -225,7 +229,7 @@ export async function classifyPromptWithAgentPlatformEmbeddings(
         Authorization: `Bearer ${token}`,
       },
       body: JSON.stringify({ instances }),
-      signal: AbortSignal.timeout(1500),
+      signal: AbortSignal.timeout(2500),
     });
     if (!res.ok) return base;
 
@@ -289,12 +293,226 @@ async function insertBigQueryRows(
       ignoreUnknownValues: true,
       rows,
     }),
-    signal: AbortSignal.timeout(1500),
+    signal: AbortSignal.timeout(5000),
   }).catch(() => {});
 }
 
 /** Firestore の記録を自動で消すまでの時間。消す処理は Firestore の TTL ポリシーで expireAt を見て行う */
 const TELEMETRY_TTL_MS = 24 * 60 * 60 * 1000;
+
+const VALID_PROMPT_ARCHETYPES = new Set<PromptArchetype>([
+  'goal_directed',
+  'simple_delete',
+  'condition_design',
+  'direct_fix',
+  'vague_delegate',
+  'inquiry',
+]);
+
+export interface FirestoreFieldValue {
+  stringValue?: string;
+  integerValue?: string;
+  doubleValue?: number;
+  booleanValue?: boolean;
+  timestampValue?: string;
+}
+
+export interface FirestoreDocumentLike {
+  name?: string;
+  fields?: Record<string, FirestoreFieldValue>;
+}
+
+/** PromptTelemetryEvent を Firestore の fields 形式に変える。指示の本文は含めない */
+export function toFirestoreTelemetryFields(
+  event: PromptTelemetryEvent,
+): Record<string, FirestoreFieldValue> {
+  return {
+    cohortId: { stringValue: event.cohortId ?? '' },
+    runId: { stringValue: event.runId ?? '' },
+    turnIndex: { integerValue: String(event.turnIndex) },
+    sessionMode: { stringValue: event.sessionMode },
+    recipient: { stringValue: event.recipient },
+    hasPenAnnotation: { booleanValue: event.hasPenAnnotation },
+    changedComponentIds: { stringValue: event.changedComponentIds.join(',') },
+    isReworkOnSameComponent: { booleanValue: event.isReworkOnSameComponent },
+    removedNeededFeature: { booleanValue: event.removedNeededFeature },
+    closestArchetype: { stringValue: event.embeddingSignal.closestArchetype },
+    similarityScore: { doubleValue: event.embeddingSignal.similarityScore },
+    embeddingVia: { stringValue: event.embeddingSignal.analyzedVia },
+    hasConditionConstraint: { booleanValue: event.nlSignal.hasConditionConstraint },
+    entities: { stringValue: event.nlSignal.entities.join(',') },
+    sentimentScore: { doubleValue: event.nlSignal.sentimentScore },
+    nlVia: { stringValue: event.nlSignal.analyzedVia },
+    createdAt: { stringValue: event.createdAt },
+    expireAt: {
+      timestampValue: new Date(Date.parse(event.createdAt) + TELEMETRY_TTL_MS).toISOString(),
+    },
+  };
+}
+
+function readFirestoreNumber(field: FirestoreFieldValue | undefined, fallback: number): number {
+  if (typeof field?.doubleValue === 'number' && Number.isFinite(field.doubleValue)) {
+    return field.doubleValue;
+  }
+  if (typeof field?.integerValue === 'string' && field.integerValue.trim()) {
+    const parsed = Number(field.integerValue);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return fallback;
+}
+
+/**
+ * Firestore から読んだドキュメントを PromptTelemetryEvent に戻す。
+ * TTL の削除処理が走る前でも、expireAt を過ぎた古い記録はここで除外する
+ */
+export function parseFirestoreTelemetryDoc(
+  doc: FirestoreDocumentLike,
+  nowMs: number = Date.now(),
+): PromptTelemetryEvent | null {
+  const id = doc.name?.split('/').pop()?.trim();
+  const fields = doc.fields;
+  if (!id || !fields) return null;
+
+  const expireAtRaw = fields.expireAt?.timestampValue;
+  if (expireAtRaw) {
+    const expireAtMs = Date.parse(expireAtRaw);
+    if (Number.isFinite(expireAtMs) && expireAtMs <= nowMs) {
+      return null;
+    }
+  }
+
+  const rawArchetype = fields.closestArchetype?.stringValue as PromptArchetype | undefined;
+  const closestArchetype: PromptArchetype =
+    rawArchetype && VALID_PROMPT_ARCHETYPES.has(rawArchetype) ? rawArchetype : 'direct_fix';
+
+  const turnIndexRaw = Number(fields.turnIndex?.integerValue ?? -1);
+  const turnIndex = Number.isInteger(turnIndexRaw) ? turnIndexRaw : -1;
+
+  const changedComponentIds = (fields.changedComponentIds?.stringValue ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  const entities = limitEntitiesToVocabulary(
+    (fields.entities?.stringValue ?? '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean),
+  );
+
+  return {
+    id,
+    cohortId: fields.cohortId?.stringValue || undefined,
+    runId: fields.runId?.stringValue || undefined,
+    turnIndex,
+    sessionMode: fields.sessionMode?.stringValue === 'explore' ? 'explore' : 'execute',
+    recipient: fields.recipient?.stringValue || 'assistant',
+    hasPenAnnotation: Boolean(fields.hasPenAnnotation?.booleanValue),
+    changedComponentIds,
+    isReworkOnSameComponent: Boolean(fields.isReworkOnSameComponent?.booleanValue),
+    removedNeededFeature: Boolean(fields.removedNeededFeature?.booleanValue),
+    nlSignal: {
+      entities,
+      hasConditionConstraint: Boolean(fields.hasConditionConstraint?.booleanValue),
+      sentimentScore: readFirestoreNumber(fields.sentimentScore, 0),
+      analyzedVia:
+        fields.nlVia?.stringValue === 'cloud_natural_language_api'
+          ? 'cloud_natural_language_api'
+          : 'local_deterministic',
+    },
+    embeddingSignal: {
+      closestArchetype,
+      similarityScore: readFirestoreNumber(fields.similarityScore, 0.84),
+      analyzedVia:
+        fields.embeddingVia?.stringValue === 'agent_platform_embedding'
+          ? 'agent_platform_embedding'
+          : 'local_deterministic',
+    },
+    createdAt: fields.createdAt?.stringValue || new Date(0).toISOString(),
+  };
+}
+
+/**
+ * サーバーのメモリにある記録と Firestore から読んだ記録を id で突合し、発言順に並べる。
+ * 同じインスタンスで直前に記録されたものも、別のインスタンスで記録されたものも欠けないようにする
+ */
+export function mergeTelemetryEvents(
+  localEvents: PromptTelemetryEvent[],
+  cloudEvents: PromptTelemetryEvent[],
+): PromptTelemetryEvent[] {
+  const byId = new Map<string, PromptTelemetryEvent>();
+  for (const ev of cloudEvents) {
+    byId.set(ev.id, ev);
+  }
+  for (const ev of localEvents) {
+    byId.set(ev.id, ev);
+  }
+  return [...byId.values()].sort((a, b) => {
+    if (a.turnIndex >= 0 && b.turnIndex >= 0 && a.turnIndex !== b.turnIndex) {
+      return a.turnIndex - b.turnIndex;
+    }
+    const timeCmp = a.createdAt.localeCompare(b.createdAt);
+    return timeCmp !== 0 ? timeCmp : a.id.localeCompare(b.id);
+  });
+}
+
+/**
+ * 1回の挑戦の記録を Firestore の prompt_telemetry から読む。
+ * 複合インデックスを作らずに済むよう runId の一致だけで引き、並び替えはメモリで行う
+ */
+async function fetchRunTelemetryFromFirestore(runId?: string): Promise<PromptTelemetryEvent[]> {
+  if (!runId) return [];
+  const project = process.env.GOOGLE_CLOUD_PROJECT;
+  const firestoreEnabled =
+    process.env.FIRESTORE_ENABLED !== '0' &&
+    Boolean(project) &&
+    project !== 'your-gcp-project-id';
+  if (!firestoreEnabled || !project) return [];
+
+  try {
+    const token = await getGcpAccessToken();
+    if (!token) return [];
+
+    const url = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(project)}/databases/(default)/documents:runQuery`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        structuredQuery: {
+          from: [{ collectionId: 'prompt_telemetry' }],
+          where: {
+            fieldFilter: {
+              field: { fieldPath: 'runId' },
+              op: 'EQUAL',
+              value: { stringValue: runId },
+            },
+          },
+          limit: 100,
+        },
+      }),
+      signal: AbortSignal.timeout(2500),
+    });
+    if (!res.ok) return [];
+
+    const rows = (await res.json()) as Array<{ document?: FirestoreDocumentLike }>;
+    if (!Array.isArray(rows)) return [];
+    const nowMs = Date.now();
+    const events: PromptTelemetryEvent[] = [];
+    for (const row of rows) {
+      if (!row?.document) continue;
+      const parsed = parseFirestoreTelemetryDoc(row.document, nowMs);
+      if (parsed && parsed.runId === runId) {
+        events.push(parsed);
+      }
+    }
+    return events;
+  } catch {
+    return [];
+  }
+}
 
 /**
  * 記録をクラウドに送る。指示の本文は送らない。
@@ -321,25 +539,9 @@ async function persistTelemetryToCloud(event: PromptTelemetryEvent, shareForAggr
         method: 'POST',
         headers,
         body: JSON.stringify({
-          fields: {
-            cohortId: { stringValue: event.cohortId ?? '' },
-            runId: { stringValue: event.runId ?? '' },
-            turnIndex: { integerValue: String(event.turnIndex) },
-            sessionMode: { stringValue: event.sessionMode },
-            recipient: { stringValue: event.recipient },
-            hasPenAnnotation: { booleanValue: event.hasPenAnnotation },
-            changedComponentIds: { stringValue: event.changedComponentIds.join(',') },
-            isReworkOnSameComponent: { booleanValue: event.isReworkOnSameComponent },
-            removedNeededFeature: { booleanValue: event.removedNeededFeature },
-            closestArchetype: { stringValue: event.embeddingSignal.closestArchetype },
-            hasConditionConstraint: { booleanValue: event.nlSignal.hasConditionConstraint },
-            entities: { stringValue: event.nlSignal.entities.join(',') },
-            sentimentScore: { doubleValue: event.nlSignal.sentimentScore },
-            createdAt: { stringValue: event.createdAt },
-            expireAt: { timestampValue: new Date(Date.parse(event.createdAt) + TELEMETRY_TTL_MS).toISOString() },
-          },
+          fields: toFirestoreTelemetryFields(event),
         }),
-        signal: AbortSignal.timeout(1500),
+        signal: AbortSignal.timeout(2500),
       }).catch(() => {});
     }
 
@@ -438,22 +640,32 @@ export async function recordPromptTelemetryEvent(input: {
   shareForAggregate?: boolean;
 }): Promise<PromptTelemetryEvent> {
   const changedComponentIds = input.changedComponentIds ?? [];
-  const priorExecuteEvents = inMemoryTelemetryEvents.filter(
+  const localPriorEvents = inMemoryTelemetryEvents.filter((e) =>
+    input.runId
+      ? e.runId === input.runId
+      : !input.cohortId || !e.cohortId || e.cohortId === input.cohortId,
+  );
+
+  const [nlSignal, embeddingSignal, cloudPriorEvents] = await Promise.all([
+    analyzePromptWithCloudNaturalLanguage(input.promptText),
+    classifyPromptWithAgentPlatformEmbeddings(input.promptText, input.sessionMode),
+    input.sessionMode === 'execute' && input.runId
+      ? fetchRunTelemetryFromFirestore(input.runId)
+      : Promise.resolve([]),
+  ]);
+
+  const priorEvents = input.runId
+    ? mergeTelemetryEvents(localPriorEvents, cloudPriorEvents)
+    : localPriorEvents;
+  const priorExecuteEvents = priorEvents.filter(
     (e) =>
       e.sessionMode === 'execute' &&
-      (input.runId
-        ? e.runId === input.runId
-        : !input.cohortId || !e.cohortId || e.cohortId === input.cohortId),
+      (input.turnIndex === undefined || input.turnIndex < 0 || e.turnIndex < input.turnIndex),
   );
   const previouslyTouchedIds = new Set(priorExecuteEvents.flatMap((e) => e.changedComponentIds));
   const isReworkOnSameComponent =
     input.sessionMode === 'execute' &&
     changedComponentIds.some((id) => previouslyTouchedIds.has(id));
-
-  const [nlSignal, embeddingSignal] = await Promise.all([
-    analyzePromptWithCloudNaturalLanguage(input.promptText),
-    classifyPromptWithAgentPlatformEmbeddings(input.promptText, input.sessionMode),
-  ]);
 
   const event: PromptTelemetryEvent = {
     id: `pt-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
@@ -483,17 +695,20 @@ export async function recordPromptTelemetryEvent(input: {
 /**
  * 顧客シミュレーション実行後、直近のテレメトリイベントに結果（何人満足したか・クリアしたか）を紐づけ、
  * 現在のコホートの集計サマリーを返す。
+ * Cloud Run で別のインスタンスが途中の発言を処理していても欠けないよう、Firestore の記録も合わせて集計する
  */
-export function finalizeTelemetryOnEvaluate(
+export async function finalizeTelemetryOnEvaluate(
   cohortId: TargetCohortId | undefined,
   achievedCount: number,
   totalCustomers: number,
   runId?: string,
-): PromptSessionSummary {
+): Promise<PromptSessionSummary> {
   // 挑戦の番号があれば、その挑戦の記録だけで振り返る（やり直す前の挑戦や、ほかの人の記録を混ぜない）
-  const events = runId
+  const localEvents = runId
     ? inMemoryTelemetryEvents.filter((e) => e.runId === runId)
     : inMemoryTelemetryEvents;
+  const cloudEvents = runId ? await fetchRunTelemetryFromFirestore(runId) : [];
+  const events = runId ? mergeTelemetryEvents(localEvents, cloudEvents) : localEvents;
   const latest = [...events]
     .reverse()
     .find((e) => !cohortId || !e.cohortId || e.cohortId === cohortId);
@@ -509,6 +724,189 @@ export function finalizeTelemetryOnEvaluate(
 
 export function clearPromptTelemetryEvents(): void {
   inMemoryTelemetryEvents.length = 0;
+}
+
+/** 公開する集計のキャッシュ時間（5分）。連続で開かれても BigQuery を毎回は呼ばない */
+const AGGREGATE_CACHE_TTL_MS = 5 * 60 * 1000;
+let cachedAggregateStats: { expiresAt: number; value: PublicAggregateStats } | null = null;
+
+function isSafeBqIdentifier(name: string): boolean {
+  return /^[A-Za-z0-9_]{1,64}$/.test(name);
+}
+
+function isSafeGcpProjectId(project: string): boolean {
+  return /^[A-Za-z0-9:.-]{1,100}$/.test(project);
+}
+
+/**
+ * BigQuery の run_events と prompt_events から、同意した挑戦の集計値だけを取得する。
+ * 個別の行や発言は返さず、挑戦数が少ない区分は formatPublicAggregateStats で非表示にする
+ */
+export async function getPublicAggregateStats(): Promise<PublicAggregateStats> {
+  const now = Date.now();
+  if (cachedAggregateStats && cachedAggregateStats.expiresAt > now) {
+    return cachedAggregateStats.value;
+  }
+
+  const project = process.env.GOOGLE_CLOUD_PROJECT;
+  const dataset = process.env.BIGQUERY_DATASET || 'studio_telemetry';
+  const promptTable = process.env.BIGQUERY_TABLE || 'prompt_events';
+  const runTable = process.env.BIGQUERY_RUN_TABLE || 'run_events';
+
+  if (
+    !project ||
+    project === 'your-gcp-project-id' ||
+    !isSafeGcpProjectId(project) ||
+    !isSafeBqIdentifier(dataset) ||
+    !isSafeBqIdentifier(promptTable) ||
+    !isSafeBqIdentifier(runTable)
+  ) {
+    return formatPublicAggregateStats(null, TARGET_COHORTS, { available: false });
+  }
+
+  try {
+    const token = await getGcpAccessToken();
+    if (!token) {
+      return formatPublicAggregateStats(null, TARGET_COHORTS, { available: false });
+    }
+
+    const runTableRef = `\`${project}.${dataset}.${runTable}\``;
+    const promptTableRef = `\`${project}.${dataset}.${promptTable}\``;
+    const query = [
+      'WITH runs_by_id AS (',
+      '  SELECT',
+      '    run_id,',
+      "    ARRAY_AGG(NULLIF(cohort_id, '') IGNORE NULLS ORDER BY created_at DESC LIMIT 1)[SAFE_OFFSET(0)] AS cohort_id,",
+      "    ARRAY_AGG(NULLIF(end_reason, '') IGNORE NULLS ORDER BY created_at DESC LIMIT 1)[SAFE_OFFSET(0)] AS end_reason",
+      `  FROM ${runTableRef}`,
+      "  WHERE run_id IS NOT NULL AND run_id != ''",
+      '  GROUP BY run_id',
+      '),',
+      'prompts_by_id AS (',
+      '  SELECT',
+      '    id,',
+      "    ANY_VALUE(NULLIF(run_id, '')) AS run_id,",
+      "    ANY_VALUE(NULLIF(cohort_id, '')) AS cohort_id,",
+      '    ANY_VALUE(session_mode) AS session_mode,',
+      '    ANY_VALUE(is_rework_on_same_component) AS is_rework,',
+      '    ANY_VALUE(removed_needed_feature) AS removed_needed,',
+      '    ANY_VALUE(closest_archetype) AS closest_archetype,',
+      '    ANY_VALUE(entities) AS entities',
+      `  FROM ${promptTableRef}`,
+      "  WHERE id IS NOT NULL AND id != ''",
+      '  GROUP BY id',
+      '),',
+      'merged_runs AS (',
+      '  SELECT',
+      '    COALESCE(r.run_id, p.run_id) AS run_id,',
+      '    COALESCE(r.cohort_id, p.cohort_id) AS cohort_id,',
+      "    COALESCE(r.end_reason, 'unfinished') AS end_reason,",
+      '    COALESCE(p.execute_turns, 0) AS execute_turns',
+      '  FROM runs_by_id r',
+      '  FULL OUTER JOIN (',
+      '    SELECT',
+      '      run_id,',
+      '      ARRAY_AGG(cohort_id IGNORE NULLS LIMIT 1)[SAFE_OFFSET(0)] AS cohort_id,',
+      "      COUNTIF(session_mode = 'execute') AS execute_turns",
+      '    FROM prompts_by_id',
+      '    WHERE run_id IS NOT NULL',
+      '    GROUP BY run_id',
+      '  ) p',
+      '  ON r.run_id = p.run_id',
+      '),',
+      'run_totals AS (',
+      '  SELECT',
+      '    COUNT(*) AS total_runs,',
+      "    COUNTIF(end_reason = 'cleared') AS cleared_runs,",
+      "    COUNTIF(end_reason = 'reset') AS reset_runs,",
+      "    COUNTIF(end_reason IN ('closed', 'idle', 'unfinished')) AS abandoned_runs,",
+      "    AVG(IF(end_reason = 'cleared', execute_turns, NULL)) AS avg_execute_turns_on_clear",
+      '  FROM merged_runs',
+      '),',
+      'cohort_stats AS (',
+      '  SELECT',
+      '    cohort_id,',
+      '    COUNT(*) AS run_count,',
+      "    COUNTIF(end_reason = 'cleared') AS cleared_count,",
+      "    AVG(IF(end_reason = 'cleared', execute_turns, NULL)) AS avg_execute_turns_on_clear",
+      '  FROM merged_runs',
+      '  WHERE cohort_id IS NOT NULL',
+      '  GROUP BY cohort_id',
+      '),',
+      'prompt_totals AS (',
+      '  SELECT',
+      '    COUNT(*) AS total_prompts,',
+      "    COUNTIF(session_mode = 'execute') AS execute_prompts,",
+      "    COUNTIF(session_mode = 'execute' AND is_rework IS TRUE) AS rework_prompts,",
+      "    COUNTIF(session_mode = 'execute' AND removed_needed IS TRUE) AS removed_needed_prompts",
+      '  FROM prompts_by_id',
+      '),',
+      'archetype_stats AS (',
+      '  SELECT',
+      '    closest_archetype AS archetype,',
+      '    COUNT(*) AS cnt',
+      '  FROM prompts_by_id',
+      "  WHERE closest_archetype IS NOT NULL AND closest_archetype != ''",
+      '  GROUP BY closest_archetype',
+      '),',
+      'entity_stats AS (',
+      '  SELECT',
+      '    TRIM(ent) AS term,',
+      '    COUNT(*) AS cnt',
+      '  FROM prompts_by_id,',
+      "  UNNEST(SPLIT(IFNULL(entities, ''), ',')) AS ent",
+      "  WHERE TRIM(ent) != ''",
+      '  GROUP BY term',
+      '  HAVING COUNT(*) >= 3',
+      '  ORDER BY cnt DESC, term ASC',
+      '  LIMIT 5',
+      ')',
+      'SELECT TO_JSON_STRING(STRUCT(',
+      '  (SELECT AS STRUCT * FROM run_totals) AS runTotals,',
+      '  ARRAY(SELECT AS STRUCT * FROM cohort_stats) AS cohortStats,',
+      '  (SELECT AS STRUCT * FROM prompt_totals) AS promptTotals,',
+      '  ARRAY(SELECT AS STRUCT * FROM archetype_stats) AS archetypeStats,',
+      '  ARRAY(SELECT AS STRUCT * FROM entity_stats) AS entityStats',
+      ')) AS payload',
+    ].join('\n');
+
+    const url = `https://bigquery.googleapis.com/bigquery/v2/projects/${encodeURIComponent(project)}/queries`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        query,
+        useLegacySql: false,
+        timeoutMs: 5000,
+      }),
+      signal: AbortSignal.timeout(5500),
+    });
+    if (!res.ok) {
+      return formatPublicAggregateStats(null, TARGET_COHORTS, { available: false });
+    }
+
+    const data = (await res.json()) as {
+      jobComplete?: boolean;
+      rows?: Array<{ f?: Array<{ v?: string | null }> }>;
+    };
+    const jsonRaw = data.rows?.[0]?.f?.[0]?.v;
+    if (!data.jobComplete || typeof jsonRaw !== 'string' || !jsonRaw.trim()) {
+      return formatPublicAggregateStats(null, TARGET_COHORTS, { available: false });
+    }
+
+    const rawPayload = JSON.parse(jsonRaw) as RawBigQueryAggregatePayload;
+    const formatted = formatPublicAggregateStats(rawPayload, TARGET_COHORTS, { available: true });
+    cachedAggregateStats = {
+      expiresAt: Date.now() + AGGREGATE_CACHE_TTL_MS,
+      value: formatted,
+    };
+    return formatted;
+  } catch {
+    return formatPublicAggregateStats(null, TARGET_COHORTS, { available: false });
+  }
 }
 
 const SPEAKER_VOICE_MAP: Record<

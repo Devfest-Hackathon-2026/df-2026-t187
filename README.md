@@ -87,7 +87,7 @@
 5. **トレードオフを判断して次の手直しへ**
    - まだ満足していないお客さんに理由を聞いたり、売上が減って困っている店長の意見を聞いたりしながら、ただ消すのではなく、誰のためにどう整えて残すかを判断して、次の手直しへ進みます。
    - 発言は、店長やお客さんへの質問と、画面の手直しの指示に分けて記録します。手直しの指示は、単純に消す、条件を決めて残す、具体的に直す、丸投げする、目的を伝える、といった型に分けます。型はコードの規則で決めるのが基本で、規則で決まらない指示だけを、Gemini Enterprise Agent Platform、旧称 Vertex AI の Text embeddings API で `text-multilingual-embedding-002` を使い、典型的な指示との近さを見て補います。
-   - 指示に出てくる部品の名前や条件は、コードの規則で取り出します。Cloud Natural Language API が有効なプロジェクトでは、その結果でも補います。取り出した語は題材の語彙に限り、人名などは残しません。無効なときや失敗したときは、規則の結果だけを使います。
+   - 指示に出てくる部品の名前や条件は、コードの規則で取り出し、Cloud Natural Language API の結果でも補います。取り出した語は題材の語彙に限り、人名などは残しません。通信に失敗したときや設定がない環境では、規則の結果だけを使います。
    - 記録には指示の文章を含めません。何を記録し、どこに送るかは、次の学習者の情報の扱いにまとめています。
    - 選んだ客層の3人全員が満足してクリアすると、レポートが出ます。LLMによる主観的な採点ではなく、質問した回数、直してと頼んだ回数、同じ所を直し直した回数、1回で思いどおりに直った割合と、指示の出し方が変わった転換点を、実際の指示を引用して示します。選ばなかった客層の6人それぞれが、その画面をどう思いそうかも1行ずつ出ます。
    - 1回の挑戦は1つの客層で終わります。クリア後は、同じ客層でやり直すか、別の客層でやり直すかを選び、画面を最初の状態に戻してもう一度挑戦します。客層ごとのトレードオフや、指示の出し方の違いを比べられます。
@@ -97,13 +97,13 @@
 学習者を特定できる情報は、見えるかどうかに関係なく保持しない、を前提にしています。
 
 - **指示の文章を残さない**：サーバー、Cloud Firestore、BigQuery のどこにも指示の文章を残しません。サーバーが持つのは、その挑戦の中で何番目の発言かだけです。クリア後のレポートで指示を引用するときは、サーバーが返す目印を、学習者のブラウザが手元の文章に置き換えて表示します。
-- **集計は同意した挑戦だけ**：集計への協力にチェックを入れた挑戦だけ、指示の型、回数、結果を BigQuery に送ります。挑戦の始まりと終わり方も送り、クリアした、やり直した、タブを閉じた、30分操作しなかった、を区別して途中でやめた挑戦も数えます。うまくいった挑戦だけに集計が偏らないよう、同意は最初に1回尋ねます。
+- **集計は同意した挑戦だけ**：集計への協力にチェックを入れた挑戦だけ、指示の型、回数、結果を BigQuery に送ります。挑戦の始まりと終わり方も送り、クリアした、やり直した、タブを閉じた、30分操作しなかった、を区別して途中でやめた挑戦も数えます。うまくいった挑戦だけに集計が偏らないよう、同意は最初に1回尋ねます。集計した全体の傾向は、画面下部の みんなの集計 から誰でも見られます。個人の挑戦が推測されないよう、挑戦が3件未満の区分は数値を表示しません。
 - **一時的な記録は期限で消す**：1回の挑戦の振り返りに使う値は、挑戦ごとの乱数の番号で Cloud Firestore に置き、24時間で自動的に消えるようにします。
 - **送る前に止める**：メールアドレスと電話番号はコードの規則で止め、さらに Model Armor で個人情報、プロンプトインジェクション、有害な内容を調べます。止めた発言は会話の履歴から外し、以後 Gemini に渡しません。会話の履歴にある学習者の発言も合わせて調べるので、画面を通さずに送られた履歴から乗っ取られることも防ぎます。
 - **ログと保存を絞る**：サーバーのログにはエラーの種類と状態コードだけを出し、発言や Gemini の返事は出しません。判断の記録に自由に書かれた理由は保存せず、合成した音声も覚えておきません。接続元のIPアドレスは、呼び出し回数の上限を数えるためにメモリで扱うだけで、保存しません。
 - **受け付ける値を絞る**：挑戦の番号、客層、会話の履歴、お客さんの反応の記録は、決まった形と長さのものだけを受け付けます。
 
-Cloud Firestore、BigQuery、Cloud Natural Language API、Model Armor との連携はコードに組み込み済みで、公開の前にこのプロジェクトで有効にします。有効にするまでは、メールアドレスと電話番号の規則による確認だけが働き、記録はクラウドに送られません。
+Cloud Firestore、BigQuery、Cloud Natural Language API、Sensitive Data Protection と連携した Model Armor はこのプロジェクトで有効にしてあり、設定がないローカル環境でもメールアドレスと電話番号の規則による確認や手元での振り返りがそのまま動きます。
 
 ## 使用テストの結果と限界
 
@@ -138,8 +138,8 @@ Cloud Firestore、BigQuery、Cloud Natural Language API、Model Armor との連�
 | **Gemini Enterprise Agent Platform** | Gemini と埋め込みの呼び出し | 画面側にAPIキーを置かず、Cloud Run のサービスアカウントで認証できる。利用枠と費用をプロジェクトごとに管理できる |
 | **Agent Platform の Text embeddings API**：`text-multilingual-embedding-002` | 規則で分類できなかった指示の型を、典型的な指示との近さで補う | 指示の型は規則で決めるのが基本。規則に当てはまらない言い回しだけを、多言語対応の埋め込みで補う |
 | **Cloud Text-to-Speech** | 店長、お助けAI、お客さん9人の、11人分の声 | 誰が話しているかを声で区別でき、文字を読むのが苦手な人も会話を追える |
-| **Model Armor**：Sensitive Data Protection と連携 | 学習者の発言を Gemini に渡す前に調べる | 生成AIのアプリ向けの検査で、個人情報とプロンプトインジェクションと有害な内容をまとめて止められる。学習者が自由に書く欄があるので、個人情報を受け取らない仕組みが要る。公開の前に有効にする |
-| **Cloud Firestore**、**BigQuery** | 挑戦ごとの一時的な記録と、同意した挑戦の集計 | 挑戦の記録を期限つきで置けるので、Cloud Run のインスタンスをまたいでも振り返りが欠けない。BigQuery ではクラス全体の変化を、サーバーを管理せずに SQL で集計できる。公開の前に有効にする |
+| **Model Armor**：Sensitive Data Protection と連携 | 学習者の発言を Gemini に渡す前に調べる | 生成AIのアプリ向けの検査で、個人情報とプロンプトインジェクションと有害な内容をまとめて止められる。学習者が自由に書く欄があるので、個人情報を受け取らない仕組みが要る |
+| **Cloud Firestore**、**BigQuery** | 挑戦ごとの一時的な記録と、同意した挑戦の集計 | 挑戦の記録を期限つきで置けるので、Cloud Run のインスタンスをまたいでも振り返りが欠けない。BigQuery ではクラス全体の変化を、サーバーを管理せずに SQL で集計できる |
 | **Cloud Run** | 画面とAPIを1つのコンテナで配信する | ビルド済みの画面とAPIサーバーを `Dockerfile` 1つで出せる。最小インスタンス数を0にすれば、使われないときの費用がかからない |
 
 Gemini では、次の機能を使っています。
@@ -178,7 +178,7 @@ AIに任せないことも、はっきり分けています。お客さんが買
 - [`src/shared/sandboxValidator.ts`](src/shared/sandboxValidator.ts)：画面の整合性の検査と、部品の役割にもとづく操作シミュレーション
 - [`src/shared/promptTelemetry.ts`](src/shared/promptTelemetry.ts)：質問と手直しの指示の区別、指示の型の分類、直し直しの判定、クリア時の記録の集計
 - [`src/server/gemini.ts`](src/server/gemini.ts)：3つのAIのプロンプト、Structured Outputs のスキーマ、発言の意図の判定、Function Calling による判断の記録
-- [`src/server/store.ts`](src/server/store.ts)：規則による分類と抽出、それを補う Agent Platform の Text embeddings API と Cloud Natural Language API、Cloud Text-to-Speech、BigQuery、Cloud Firestore との連携。Natural Language API は有効なプロジェクトでだけ使う
+- [`src/server/store.ts`](src/server/store.ts)：規則による分類と抽出、それを補う Agent Platform の Text embeddings API と Cloud Natural Language API、Cloud Text-to-Speech、BigQuery、Cloud Firestore との連携
 - [`src/server/rateLimit.ts`](src/server/rateLimit.ts)：予期しないトラフィックへの守り。1分あたりと1日あたりの呼び出し回数、同時に処理する数、本文の大きさ、呼び出し元の確認
 - [`src/server/modelArmor.ts`](src/server/modelArmor.ts)：発言を Gemini に渡す前に、規則と Model Armor で調べて止める
 - [`src/server/logSafe.ts`](src/server/logSafe.ts)：ログに発言や返事を出さないための、エラーの書き方
@@ -188,7 +188,7 @@ AIに任せないことも、はっきり分けています。お客さんが買
 
 - **フロントエンド**：TypeScript / Vite / HTML5 Canvas / Sandbox `iframe`
 - **生成AI・音声**：`@google/genai` で Gemini Enterprise Agent Platform の Gemini を呼ぶ。赤ペンで囲んだ画像と画面のスクリーンショットのマルチモーダル入力、Structured Outputs、Function Calling の `record_human_decision` / Google Cloud Text-to-Speech API で11人分の声を合成し、決まったせりふの音声は同梱
-- **LLMを使わない分析と記録**：規則による分類と、それを補う Agent Platform の Text embeddings API / 規則によるキーワード抽出と、有効なプロジェクトでだけ補う Google Cloud Natural Language API / 指示の文章を含まない記録を、Cloud Firestore に期限つきで置き、同意した挑戦だけ BigQuery に送る
+- **LLMを使わない分析と記録**：規則による分類と、それを補う Agent Platform の Text embeddings API / 規則によるキーワード抽出と、それを補う Google Cloud Natural Language API / 指示の文章を含まない記録を、Cloud Firestore に期限つきで置き、同意した挑戦だけ BigQuery に送る
 - **実行環境と安全性**：Google Cloud Run 向けのコンテナ構成 / CSP ヘッダー、Sandbox `iframe` による分離、対象外の部品が変わらないことの検証と自動で戻す仕組み / Gemini と読み上げと記録のAPIの呼び出し回数の上限。接続元ごととサーバー全体の1分あたりで数え、`.env.example` の `RATE_LIMIT_*` で変えられる / Gemini を呼ぶ1日あたりの上限による費用の非常停止、接続元ごとの同時に処理する数の上限、APIごとの本文の大きさの上限、ほかのサイトの画面からの呼び出しを断る確認 / Model Armor と規則による、送る前の個人情報とプロンプトインジェクションの検査 / 受け付ける値の形と長さの確認
 - **品質と衛生管理**：Node.js Test Runner / `scripts/check-hygiene.mjs` によるコミット、機密情報、ローカルパスの混入の検査
 

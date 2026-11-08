@@ -35,10 +35,11 @@ import {
   maxBodyBytesFor,
   rateLimitGroupOf,
 } from '../src/server/rateLimit.ts';
-import { PromptRejectedError, assertPromptAllowed, findPersonalInfoByRules, reasonFromModelArmorResult } from '../src/server/modelArmor.ts';
+import { PromptRejectedError, assertPromptAllowed, findPersonalInfoByRules, reasonFromModelArmorResult, stripThemeSamplePhrases } from '../src/server/modelArmor.ts';
 import {
   ACTIVE_THEME,
   ALL_REVIEWER_PERSONAS,
+  TARGET_COHORTS,
   getReviewersByCohort,
 } from '../src/shared/initialTheme.ts';
 import {
@@ -63,6 +64,7 @@ import {
   cosineSimilarity,
   extractDeterministicNlSignal,
   fillTurnRefs,
+  formatPublicAggregateStats,
   inspectAppliedChangeForTelemetry,
   limitEntitiesToVocabulary,
   summarizePromptTelemetry,
@@ -71,7 +73,10 @@ import {
   classifyPromptWithAgentPlatformEmbeddings,
   clearPromptTelemetryEvents,
   finalizeTelemetryOnEvaluate,
+  mergeTelemetryEvents,
+  parseFirestoreTelemetryDoc,
   recordPromptTelemetryEvent,
+  toFirestoreTelemetryFields,
 } from '../src/server/store.ts';
 import { buildInitialSpec, buildScenarioSpec, findComponent } from '../src/shared/theme.ts';
 import type { AppComponent, AppSpec, ReviewOutcome, SpecPatch } from '../src/shared/types.ts';
@@ -201,6 +206,11 @@ describe('core-loop', () => {
     assert.equal(reasonFromModelArmorResult({ sanitizationResult: { filterMatchState: 'NO_MATCH_FOUND' } }), null);
     // 止めたときの文は、引っかかった文字そのものを繰り返さない
     assert.doesNotMatch(new PromptRejectedError('personal_info').message, /@|\d{3}/);
+    // 題材の画面に最初から載っている架空のお届け先を引用した発言は、検査の前に取り除く
+    assert.equal(
+      stripThemeSamplePhrases('お届け先の 〒150-0001 東京都渋谷区神宮前1-2-3 山田 花子 の文字を大きくして'),
+      'お届け先の    の文字を大きくして',
+    );
   });
 
   it('Gemini や読み上げを呼ぶAPIは、接続元ごととサーバー全体の両方で1分あたりの回数を超えたら断る', () => {
@@ -808,11 +818,138 @@ describe('core-loop', () => {
     const second = await recordPromptTelemetryEvent({ ...base, runId: 'run-2', turnIndex: 0, promptText: '定期便の初期チェックを外して', changedComponentIds: ['check-subscription'] });
     // 別の挑戦で同じ部品を触っていても、手戻りとは数えない
     assert.equal(second.isReworkOnSameComponent, false);
-    const summary = finalizeTelemetryOnEvaluate('thrifty', 3, 3, 'run-2');
+    const summary = await finalizeTelemetryOnEvaluate('thrifty', 3, 3, 'run-2');
     assert.equal(summary.executeTurns, 1);
     assert.equal(summary.reworkTurns, 0);
     assert.ok(!summary.systemLogLines.some((l) => l.includes('{{turn:5}}') || l.includes('{{turn:7}}')));
+
+    // 別のインスタンスが Firestore に残した記録（turn 0・1）と、今のインスタンスの記録（turn 2）を突合して振り返れる
+    const cloudDoc0 = {
+      name: 'projects/test-proj/databases/(default)/documents/prompt_telemetry/pt-cloud-0',
+      fields: toFirestoreTelemetryFields({
+        ...second,
+        id: 'pt-cloud-0',
+        runId: 'run-multi',
+        turnIndex: 0,
+        sessionMode: 'explore',
+        recipient: 'owner',
+        changedComponentIds: [],
+        removedNeededFeature: false,
+        nlSignal: extractDeterministicNlSignal('店長、定期便ってどうして付けてるの？'),
+        embeddingSignal: classifyDeterministicArchetype('店長、定期便ってどうして付けてるの？', 'explore'),
+        createdAt: '2026-11-08T05:00:00.000Z',
+      }),
+    };
+    const cloudDoc1 = {
+      name: 'projects/test-proj/databases/(default)/documents/prompt_telemetry/pt-cloud-1',
+      fields: toFirestoreTelemetryFields({
+        ...second,
+        id: 'pt-cloud-1',
+        runId: 'run-multi',
+        turnIndex: 1,
+        sessionMode: 'execute',
+        changedComponentIds: ['check-subscription'],
+        isReworkOnSameComponent: false,
+        removedNeededFeature: true,
+        nlSignal: extractDeterministicNlSignal('定期便を消して'),
+        embeddingSignal: classifyDeterministicArchetype('定期便を消して', 'execute'),
+        createdAt: '2026-11-08T05:01:00.000Z',
+      }),
+    };
+    const parsed0 = parseFirestoreTelemetryDoc(cloudDoc0, Date.parse('2026-11-08T06:00:00.000Z'));
+    const parsed1 = parseFirestoreTelemetryDoc(cloudDoc1, Date.parse('2026-11-08T06:00:00.000Z'));
+    assert.ok(parsed0 && parsed1);
+    // 期限（expireAt: 24時間後）を過ぎた記録は、TTL の削除前でも除外される
+    assert.equal(parseFirestoreTelemetryDoc(cloudDoc0, Date.parse('2026-11-10T06:00:00.000Z')), null);
+
+    const localTurn2 = {
+      ...second,
+      id: 'pt-local-2',
+      runId: 'run-multi',
+      turnIndex: 2,
+      sessionMode: 'execute' as const,
+      changedComponentIds: ['check-subscription'],
+      isReworkOnSameComponent: true,
+      removedNeededFeature: false,
+      nlSignal: extractDeterministicNlSignal('定期便を望む人だけが自分で選べるようにして'),
+      embeddingSignal: classifyDeterministicArchetype('定期便を望む人だけが自分で選べるようにして', 'execute'),
+      createdAt: '2026-11-08T05:02:00.000Z',
+    };
+    const merged = mergeTelemetryEvents([localTurn2], [parsed1, parsed0]);
+    assert.deepEqual(merged.map((e) => e.turnIndex), [0, 1, 2]);
+    const mergedSummary = summarizePromptTelemetry(merged, 'thrifty');
+    assert.equal(mergedSummary.exploreTurns, 1);
+    assert.equal(mergedSummary.executeTurns, 2);
+    assert.equal(mergedSummary.reworkTurns, 1);
+    assert.deepEqual(mergedSummary.turningPoint, { beforeTurn: 1, afterTurn: 2 });
+
     clearPromptTelemetryEvents();
+  });
+
+  it('公開する集計は3件未満の全体・客層区分を伏せ、題材の語彙だけを3回以上のときに出す', () => {
+    // 全体の挑戦が3件未満なら、すべて伏せる
+    const tooFew = formatPublicAggregateStats(
+      {
+        runTotals: { total_runs: 2, cleared_runs: 2, reset_runs: 0, abandoned_runs: 0 },
+        cohortStats: [{ cohort_id: 'thrifty', run_count: 2, cleared_count: 2 }],
+      },
+      TARGET_COHORTS,
+    );
+    assert.equal(tooFew.available, true);
+    assert.equal(tooFew.suppressed, true);
+    assert.equal(tooFew.totalRuns, undefined);
+    assert.ok(tooFew.cohorts.every((c) => c.suppressed && c.runCount === undefined));
+
+    // 全体が3件以上でも、3件未満の客層（careful: 2件、quick: 0件）は伏せ、3件以上の客層（thrifty: 4件）だけ出す
+    const enough = formatPublicAggregateStats(
+      {
+        runTotals: {
+          total_runs: 6,
+          cleared_runs: 4,
+          reset_runs: 1,
+          abandoned_runs: 1,
+          avg_execute_turns_on_clear: 3.75,
+        },
+        cohortStats: [
+          { cohort_id: 'thrifty', run_count: 4, cleared_count: 3, avg_execute_turns_on_clear: 3.666 },
+          { cohort_id: 'careful', run_count: 2, cleared_count: 1, avg_execute_turns_on_clear: 4.0 },
+        ],
+        promptTotals: {
+          total_prompts: 20,
+          execute_prompts: 15,
+          rework_prompts: 3,
+          removed_needed_prompts: 2,
+        },
+        archetypeStats: [
+          { archetype: 'goal_directed', cnt: 6 },
+          { archetype: 'condition_design', cnt: 5 },
+          { archetype: 'inquiry', cnt: 5 },
+          { archetype: 'simple_delete', cnt: 4 },
+        ],
+        entityStats: [
+          { term: '定期便', cnt: 8 },
+          { term: '山田太郎', cnt: 10 }, // 題材の語彙にない言葉は出さない
+          { term: 'クーポン', cnt: 2 }, // 3回未満は出さない
+        ],
+      },
+      TARGET_COHORTS,
+    );
+    assert.equal(enough.suppressed, false);
+    assert.equal(enough.totalRuns, 6);
+    assert.equal(enough.clearRatePercent, 67);
+    assert.equal(enough.avgExecuteTurnsOnClear, 3.8);
+    assert.equal(enough.reworkRatePercent, 20);
+    assert.equal(enough.removedNeededFeatureRatePercent, 13);
+    assert.deepEqual(enough.topEntities, [{ term: '定期便', count: 8 }]);
+
+    const thriftyCohort = enough.cohorts.find((c) => c.cohortId === 'thrifty');
+    const carefulCohort = enough.cohorts.find((c) => c.cohortId === 'careful');
+    assert.equal(thriftyCohort?.suppressed, false);
+    assert.equal(thriftyCohort?.runCount, 4);
+    assert.equal(thriftyCohort?.clearRatePercent, 75);
+    assert.equal(thriftyCohort?.avgExecuteTurnsOnClear, 3.7);
+    assert.equal(carefulCohort?.suppressed, true);
+    assert.equal(carefulCohort?.runCount, undefined);
   });
 
   it('チェック欄にAIが付けた閉じるボタンの設定は作業ログに出さず、店長には直近の申し込み件数を伝える', () => {
@@ -1622,7 +1759,7 @@ describe('core-loop', () => {
     assert.equal('promptText' in secondExecEvent, false);
 
     // 5. クリア時のサマリー生成とシステムメッセージ行（括弧なし・インラインコード付き）の確認
-    const summary = finalizeTelemetryOnEvaluate('careful', 3, 3);
+    const summary = await finalizeTelemetryOnEvaluate('careful', 3, 3);
     assert.equal(summary.exploreTurns, 2);
     assert.equal(summary.executeTurns, 2);
     assert.equal(summary.reworkTurns, 1);
