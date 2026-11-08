@@ -923,8 +923,12 @@ function speakerOfMessage(msg: Pick<TimelineMessage, 'role' | 'personaId'>): str
   return msg.role === 'customer' ? (msg.personaId ?? 'assistant') : msg.role;
 }
 
+function sanitizeTtsText(text: string): string {
+  return text.replace(/`/g, '').trim();
+}
+
 function fetchTtsAudio(text: string, speaker: string): Promise<TtsResponse> {
-  const trimmed = text.trim();
+  const trimmed = sanitizeTtsText(text);
   const key = `${speaker}::${trimmed}`;
   const cached = ttsPrefetchCache.get(key);
   if (cached) return cached;
@@ -997,7 +1001,7 @@ async function processNextTtsInQueue(): Promise<void> {
       });
     } else if ('speechSynthesis' in window) {
       await new Promise<void>((resolve) => {
-        const utter = new SpeechSynthesisUtterance(next.text);
+        const utter = new SpeechSynthesisUtterance(sanitizeTtsText(next.text));
         utter.lang = 'ja-JP';
         const profile = BROWSER_VOICE_PROFILES[next.speaker] ?? BROWSER_VOICE_PROFILES.assistant;
         utter.pitch = profile.pitch;
@@ -1754,6 +1758,8 @@ function tickWaitNote(): void {
 
 window.setInterval(tickWaitNote, 1000);
 
+const FOLLOW_UP_PROMPT_TEXT = '気になることを聞くか、直したい内容をチャットで伝えてください';
+
 async function reactToCircle(targetIds: string[]): Promise<void> {
   // 誰のために直すかを選ぶ前や、改造中・質問への回答待ちのときは割り込まない
   if (!state.selectedCohortId) return;
@@ -1799,7 +1805,7 @@ async function reactToCircle(targetIds: string[]): Promise<void> {
     if (data.suggestedFollowUps && data.suggestedFollowUps.length > 0) {
       pushMessage({
         role: 'system',
-        text: 'どう手直ししますか',
+        text: FOLLOW_UP_PROMPT_TEXT,
         targetComponentIds: targetIds,
         circleReaction: true,
         followUps: data.suggestedFollowUps,
@@ -2039,6 +2045,13 @@ async function toggleVoiceRecording(): Promise<void> {
   }
 }
 
+/** 赤ペンで囲んだときに出る質問ボタンの文言から、送り先の相手を決める */
+function resolveRecipientForFollowUp(text: string): 'assistant' | 'owner' | 'customer' {
+  if (text.includes('店長')) return 'owner';
+  if (text.includes('お客さん')) return 'customer';
+  return 'assistant';
+}
+
 async function handleSendMessage(
   overrideText?: string,
   targetIdsOverride?: string[],
@@ -2063,7 +2076,8 @@ async function handleSendMessage(
   }
 
   const spec = getCurrentSpec();
-  const recipientSnapshot = overrideText !== undefined ? 'assistant' : state.recipient;
+  const recipientSnapshot =
+    overrideText !== undefined ? resolveRecipientForFollowUp(text) : state.recipient;
   // 挑戦が終わったあとは、店長やお客さんへの質問だけを受け付ける
   if (state.runFinished && recipientSnapshot === 'assistant') {
     pushMessage({
@@ -2277,7 +2291,7 @@ async function handleSendMessage(
         data.suggestedFollowUps && data.suggestedFollowUps.length > 0
           ? {
               role: 'system',
-              text: 'どう手直ししますか',
+              text: FOLLOW_UP_PROMPT_TEXT,
               targetComponentIds: targetIdsSnapshot,
               followUps: data.suggestedFollowUps,
             }
@@ -2445,26 +2459,29 @@ async function handleEvaluate(): Promise<void> {
         totalCustomers: activePersonas.length,
       });
       const remaining = TARGET_COHORTS.filter((c) => !state.clearedCohortIds.includes(c.id));
-      const closing =
-        remaining.length > 0
-          ? ['おつかれさまでした！今回の挑戦のレポートです']
-          : ['おつかれさまでした！これで3つの客層すべてをクリアしました', '今回の挑戦のレポートです'];
-      for (const line of closing) {
+      const assistantFeedback = evaluation.telemetrySummary?.assistantFeedbackLines ?? [];
+      const allClearedLine = 'おつかれさまでした！これで3つの客層すべてをクリアしました';
+      const assistantLines =
+        assistantFeedback.length > 0
+          ? [...(remaining.length === 0 ? [allClearedLine] : []), ...assistantFeedback]
+          : remaining.length > 0
+            ? ['おつかれさまでした！今回の挑戦のレポートです']
+            : [allClearedLine, '今回の挑戦のレポートです'];
+      for (const rawLine of assistantLines) {
+        // 指示の引用は目印で届くので、このブラウザにある本文に置き換える
+        const filled = fillTurnRefs(rawLine, state.runTurnTexts);
         queued.push({
-          message: {
-            role: 'assistant',
-            text: line,
-          },
-          typingMs: typingDurationFor(line),
+          message: { role: 'assistant', text: filled },
+          typingMs: typingDurationFor(filled),
         });
       }
-      for (const telemetryLine of evaluation.telemetrySummary?.systemLogLines ?? []) {
+      // お助けAIが2通目の吹き出しで指示の引用を伝えるため、システム行は数値の記録行だけ出す
+      const rawSystemLines = evaluation.telemetrySummary?.systemLogLines ?? [];
+      const systemLinesToShow =
+        assistantFeedback.length > 0 ? rawSystemLines.slice(0, 1) : rawSystemLines;
+      for (const telemetryLine of systemLinesToShow) {
         queued.push({
-          message: {
-            role: 'system',
-            // 指示の引用は目印で届くので、このブラウザにある本文に置き換える
-            text: fillTurnRefs(telemetryLine, state.runTurnTexts),
-          },
+          message: { role: 'system', text: fillTurnRefs(telemetryLine, state.runTurnTexts) },
           typingMs: 0,
         });
       }
@@ -2743,7 +2760,7 @@ function createBubble(className: string, text: string): HTMLElement {
   bubble.className = className;
   const body = document.createElement('div');
   body.className = 'bubble-text';
-  body.textContent = text;
+  appendFormattedSystemText(body, text);
   bubble.appendChild(body);
   return bubble;
 }

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import {
   AiNotConfiguredError,
+  CIRCLE_INQUIRY_FOLLOW_UPS,
   applyOptionToSpec,
   applyPatchesToSpecWithValidation,
   chatWithStudio,
@@ -61,6 +62,7 @@ import {
 } from '../src/shared/owner.ts';
 import { applySpecPatches } from '../src/shared/specPatch.ts';
 import {
+  buildClearFeedbackFacts,
   classifyDeterministicArchetype,
   cosineSimilarity,
   extractDeterministicNlSignal,
@@ -1880,5 +1882,75 @@ describe('core-loop', () => {
       },
     ]);
     assert.equal(unrelatedSummary.turningPoint, undefined);
+
+    // 9. クリア後レポートのお助けAI 3通フィードバック（概要・よかった点・次にどうすると良くなるか）
+    const clearFactsWithTurningPoint = buildClearFeedbackFacts({
+      cohortLabel: '損をしたくない人',
+      summary: goalSummary,
+      owner: {
+        orders: 3,
+        customers: 3,
+        metrics: [{ label: 'おトク定期便', count: 1, missing: false }],
+        comment: '',
+        closingLines: [],
+      },
+      otherCohorts: {
+        achieved: 4,
+        total: 6,
+        unhappy: [{ name: '和子', reason: '文字が小さくて読めなかった' }],
+      },
+      couponStatus: 'usable_discount',
+    });
+    assert.equal(clearFactsWithTurningPoint.fallbackLines.length, 3);
+    assert.match(clearFactsWithTurningPoint.fallbackLines[0], /`損をしたくない人`/);
+    assert.match(clearFactsWithTurningPoint.fallbackLines[0], /おトク定期便も `1件` 入って/);
+    const filledGoodPoint = fillTurnRefs(clearFactsWithTurningPoint.fallbackLines[1], [
+      '定期便を消して',
+      goalPrompt,
+    ]);
+    assert.match(filledGoodPoint, /`定期便を消して`/);
+    assert.match(filledGoodPoint, /`定期便を望む人だけが自分で選べるようにして`/);
+    assert.match(clearFactsWithTurningPoint.fallbackLines[2], /`和子` が `文字が小さくて読めなかった`/);
+    for (const line of clearFactsWithTurningPoint.fallbackLines) {
+      assert.doesNotMatch(line, /[()（）「」『』]/);
+    }
+
+    // 定期便やクーポンを消してクリアした場合は、消さずに正直な形へ変える伸びしろを提案する
+    const clearFactsDeleted = buildClearFeedbackFacts({
+      cohortLabel: '急いでいる人',
+      summary: oneShotSummary,
+      owner: {
+        orders: 3,
+        customers: 3,
+        metrics: [{ label: 'おトク定期便', count: 0, missing: true }],
+        comment: '',
+        closingLines: [],
+      },
+      otherCohorts: {
+        achieved: 6,
+        total: 6,
+        unhappy: [],
+      },
+      couponStatus: 'removed',
+    });
+    assert.match(clearFactsDeleted.fallbackLines[0], /おトク定期便は消えて0件になりましたが/);
+    assert.match(clearFactsDeleted.fallbackLines[2], /おトク定期便を消してクリアしましたが/);
+    assert.match(clearFactsDeleted.fallbackLines[2], /最初のチェックを外して条件が分かる形で残すと両立できます/);
+    for (const line of clearFactsDeleted.fallbackLines) {
+      assert.doesNotMatch(line, /[()（）「」『』]/);
+    }
+
+    // 10. 赤ペンで囲んだときの候補は、手直しの答えではなく調べるための質問候補3つにし、店長にも指した部品を伝える
+    assert.deepEqual(CIRCLE_INQUIRY_FOLLOW_UPS, [
+      'この部品の仕組みを聞く',
+      'お客さんの反応を聞く',
+      '店長の考えを聞く',
+    ]);
+    for (const inquiry of CIRCLE_INQUIRY_FOLLOW_UPS) {
+      assert.equal(classifyUserMessageIntent(inquiry), 'triage');
+      assert.equal(classifyDeterministicArchetype(inquiry, 'explore').closestArchetype, 'inquiry');
+    }
+    const ownerFactsWithTarget = describeOwnerContext(initial, undefined, ['check-subscription']);
+    assert.ok(ownerFactsWithTarget.some((f) => f.includes('赤ペンで指して聞いている部品')));
   });
 });

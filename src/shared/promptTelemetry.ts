@@ -1,7 +1,7 @@
 // プロンプト・テレメトリ分析と行動ベースの到達効率集計
 // 主指標はLLMの主観採点ではなく、探索と実行を分離した行動データ（初回到達率・往復数・手戻り有無）に置く。
 
-import type { AppSpec, SpecPatch, TargetCohortId } from './types.ts';
+import type { AppSpec, OwnerReport, SpecPatch, TargetCohortId } from './types.ts';
 
 /**
  * セッション内の発言の目的タイプ。
@@ -100,6 +100,32 @@ export interface PromptSessionSummary {
    * 指示の引用は turnRef の目印になっていて、ブラウザが fillTurnRefs で本文に置き換える
    */
   systemLogLines: string[];
+  /**
+   * クリア時にお助けAIが話す3つの振り返り吹き出し（1: 概要、2: よかった点、3: もっと良くなる点）。
+   * 指示の引用は turnRef の目印になっていて、ブラウザが fillTurnRefs で本文に置き換える
+   */
+  assistantFeedbackLines?: string[];
+}
+
+export interface ClearFeedbackInput {
+  cohortLabel: string;
+  summary: PromptSessionSummary;
+  owner: OwnerReport;
+  otherCohorts: {
+    achieved: number;
+    total: number;
+    unhappy: Array<{ name: string; reason: string }>;
+  };
+  /** クーポンが店にあったか、最終画面で割引として使える状態か */
+  couponStatus?: 'usable_discount' | 'kept_no_discount' | 'removed' | 'none';
+}
+
+export interface ClearFeedbackFacts {
+  overviewFacts: string[];
+  goodPointFacts: string[];
+  improvementFacts: string[];
+  /** AIが使えないときや失敗したときにそのままお助けAIの3つの吹き出しとして出す文 */
+  fallbackLines: [string, string, string];
 }
 
 const UI_ENTITY_TERMS = [
@@ -528,6 +554,226 @@ export function summarizePromptTelemetry(
     turningPoint,
     effectiveTurn,
     systemLogLines,
+  };
+}
+
+/**
+ * クリア時にお助けAIが話す「概要・どこがよかったか・もっと何をしたら良くなるか」の事実リストと、
+ * AIが使えないときの決定論的な3つの吹き出し文（fallbackLines）を組み立てる。
+ * 事実判定はすべてコードで行い、括弧は使わない
+ */
+export function buildClearFeedbackFacts(input: ClearFeedbackInput): ClearFeedbackFacts {
+  const { cohortLabel, summary, owner, otherCohorts, couponStatus = 'none' } = input;
+  const subMetric = owner.metrics.find((m) => m.label.includes('定期')) ?? owner.metrics[0];
+
+  // 1. 概要の事実とフォールバック文
+  const overviewFacts: string[] = [
+    `選んだ客層である \`${cohortLabel}\` の \`${owner.customers}人\` 全員が気持ちよく注文できた`,
+    `店長やお客さんへの質問は \`${summary.exploreTurns}回\`、手直しの指示は \`${summary.executeTurns}回\` だった`,
+  ];
+  let subClause = '';
+  if (subMetric) {
+    if (subMetric.missing) {
+      overviewFacts.push(`お店の${subMetric.label}の申し込み欄は画面から消えて0件になった`);
+      subClause = `お店の${subMetric.label}は消えて0件になりましたが、`;
+    } else if (subMetric.count > 0) {
+      overviewFacts.push(`お店の${subMetric.label}も消さずに残し、${subMetric.count}件の申し込みが入った`);
+      subClause = `お店の${subMetric.label}も \`${subMetric.count}件\` 入って、`;
+    } else {
+      overviewFacts.push(`お店の${subMetric.label}の欄は残したが、今回の客層での申し込みは0件だった`);
+      subClause = `お店の${subMetric.label}の欄も残したまま、`;
+    }
+  }
+  overviewFacts.push(
+    `選ばなかったほかの客層では、\`${otherCohorts.total}人中${otherCohorts.achieved}人\` がこの画面で満足して買える状態になった`,
+  );
+  const fallbackOverview = `おつかれさまでした！\`${cohortLabel}\` の${owner.customers}人全員が気持ちよく買えましたね。質問 \`${summary.exploreTurns}回\` と手直し \`${summary.executeTurns}回\` でクリアし、${subClause}ほかの客層も \`${otherCohorts.total}人中${otherCohorts.achieved}人\` が満足できる画面に整っています`;
+
+  // 2. どこがよかったかの事実とフォールバック文
+  const goodPointFacts: string[] = [];
+  const goodClauses: string[] = [];
+
+  if (summary.turningPoint) {
+    const beforeRef = `\`${turnRef(summary.turningPoint.beforeTurn)}\``;
+    const afterRef = `\`${turnRef(summary.turningPoint.afterTurn)}\``;
+    goodPointFacts.push(
+      `最初は ${beforeRef} と指示したあと、お店の事情やお客さんの反応を見て ${afterRef} へ切り替えられたこと`,
+    );
+    goodClauses.push(
+      `最初は ${beforeRef} としたあと、反応を見て ${afterRef} へ切り替えられたところ`,
+    );
+  } else if (summary.effectiveTurn !== undefined) {
+    const effRef = `\`${turnRef(summary.effectiveTurn)}\``;
+    if (summary.goalDirectedTurns > 0) {
+      goodPointFacts.push(
+        `決め手になった ${effRef} で、誰がどうできるようにしたいかという目的を言葉にして伝えられたこと`,
+      );
+      goodClauses.push(
+        `決め手になった ${effRef} のように、誰のためにどうしたいかという目的を伝えてくれたところ`,
+      );
+    } else {
+      goodPointFacts.push(
+        `決め手になった ${effRef} で、直したい部品と条件をはっきり伝えられたこと`,
+      );
+      goodClauses.push(
+        `決め手になった ${effRef} のように、直したい部品と条件をはっきり伝えてくれたところ`,
+      );
+    }
+  }
+
+  if (subMetric && !subMetric.missing && subMetric.count > 0) {
+    goodPointFacts.push(
+      `${subMetric.label}をただ消すのではなく、望む人が安心して選べる形で残して店長の売上とお客さんの満足を両立できたこと`,
+    );
+    goodClauses.push(
+      `${subMetric.label}を消さずに正直な形で残してお客さんの安心と店長の売上を両立できた点`,
+    );
+  }
+  if (couponStatus === 'usable_discount') {
+    goodPointFacts.push(
+      'クーポン広告をただ消すのではなく、画面内でその場で割引が効く使いやすい形に整えて残せたこと',
+    );
+    goodClauses.push('クーポンもその場で割引が使える形に整えて残せた点');
+  }
+  if (summary.exploreTurns > 0) {
+    goodPointFacts.push(
+      `手直しする前にお客さんや店長へ \`${summary.exploreTurns}回\` 質問して、困りごとや事情を確かめてから判断できたこと`,
+    );
+    goodClauses.push('事前に質問して事情を確かめてから手直しできた点');
+  }
+  if (summary.reworkTurns === 0 && summary.executeTurns > 0) {
+    goodPointFacts.push('同じ部品の直し直しが0回で、1回で狙いどおりに画面を整えられたこと');
+    goodClauses.push('同じ箇所を直し直すことなく1回で狙いどおりに進められた点');
+  }
+  if (otherCohorts.achieved === otherCohorts.total && otherCohorts.total > 0) {
+    goodPointFacts.push(
+      `選んだ3人だけでなく、選ばなかった客層の${otherCohorts.total}人全員も同時に満足できる画面に仕上げられたこと`,
+    );
+  }
+  if (goodPointFacts.length === 0) {
+    goodPointFacts.push(`選んだ \`${cohortLabel}\` の3人が迷わず買える画面までしっかり手直しできたこと`);
+    goodClauses.push(`選んだ \`${cohortLabel}\` の3人が迷わず買える画面までしっかり手直しできたところ`);
+  }
+
+  const primaryGood = goodClauses[0];
+  const secondaryGood = goodClauses[1];
+  const fallbackGoodPoints = secondaryGood
+    ? `よかったのは、${primaryGood}です。さらに${secondaryGood}も素敵でした`
+    : `よかったのは、${primaryGood}です`;
+
+  // 3. もっと何をしたら良くなるかの事実とフォールバック文
+  const improvementFacts: string[] = [];
+  const improvementClauses: string[] = [];
+
+  if (subMetric?.missing) {
+    improvementFacts.push(
+      `今回は${subMetric.label}の欄を消してクリアしたため、毎月届けてほしいお客さんや店長が残念がっている。次は消さずに最初のチェックを外し、条件が分かる形で残すと両方満足できること`,
+    );
+    improvementClauses.push(
+      `今回は${subMetric.label}を消してクリアしましたが、毎月届けてほしいお客さんや店長は残念がっているので、次は消さずに最初のチェックを外して条件が分かる形で残すと両立できます`,
+    );
+  }
+
+  const hasCouponMissing =
+    couponStatus === 'removed' ||
+    otherCohorts.unhappy.some((u) => u.reason.includes('クーポンがなくなって'));
+  const hasCouponNoDiscount =
+    couponStatus === 'kept_no_discount' ||
+    otherCohorts.unhappy.some(
+      (u) => u.reason.includes('クーポンがあったのに') || u.reason.includes('クーポンを使っても'),
+    );
+
+  if (hasCouponMissing) {
+    improvementFacts.push(
+      'クーポンを消したため、少しでも安く買いたいお客さんが残念がっている。次は画面内で押すとその場で割引になるクーポンとして残すとさらに良くなること',
+    );
+    improvementClauses.push(
+      'クーポンを消したことで損をしたくないお客さんが残念がっているので、次は画面内でその場で割引が効く形にして残すとさらに良くなります',
+    );
+  } else if (hasCouponNoDiscount) {
+    improvementFacts.push(
+      'クーポンの表示はあるが合計金額が下がらない状態のため、押すとその場で割引が効くように整えると損をしたくないお客さんも満足できること',
+    );
+    improvementClauses.push(
+      'クーポンを押したときに合計金額が下がるように整えると、損をしたくないお客さんも満足できます',
+    );
+  }
+
+  const needsConfirm = otherCohorts.unhappy.some((u) =>
+    u.reason.includes('確かめる画面がなかった'),
+  );
+  const tooManySteps = otherCohorts.unhappy.some(
+    (u) => u.reason.includes('手順が多すぎる') || u.reason.includes('時間がかかりすぎる'),
+  );
+
+  if (needsConfirm) {
+    improvementFacts.push(
+      '選ばなかった確実に買いたい人の客層では、注文を確定する前に内容を確かめる画面がないため離脱する人がいる。次は確認画面を足すか、さっと買いたい人とも両立できるよう前回設定のショートカットと組み合わせるとさらに良くなること',
+    );
+    improvementClauses.push(
+      '選ばなかった客層では注文前に内容を確かめる画面がないため離脱する人がいるので、次は確認画面を足すか、前回設定で一括入力できるボタンと組み合わせるとさらに多くの人が買えるようになります',
+    );
+  } else if (tooManySteps) {
+    improvementFacts.push(
+      '選ばなかったさっと買いたい人の客層では、手数や時間がかかりすぎて離脱する人がいる。前回と同じ設定で一括入力できるボタンを足すと、確認の安心と手数の少なさを両立できること',
+    );
+    improvementClauses.push(
+      '選ばなかったさっと買いたい人の客層では手数が増えて離脱する人がいるので、前回と同じ設定でまとめて入力できるボタンを足すと両立できます',
+    );
+  } else if (otherCohorts.unhappy.length > 0 && improvementClauses.length === 0) {
+    const firstUnhappy = otherCohorts.unhappy[0];
+    improvementFacts.push(
+      `選ばなかった客層では、\`${firstUnhappy.name}\` が \`${firstUnhappy.reason}\` ため満足できていない。ここも整えるとさらに多くの人が気持ちよく買えること`,
+    );
+    improvementClauses.push(
+      `選ばなかった客層では \`${firstUnhappy.name}\` が \`${firstUnhappy.reason}\` 状態で困っているので、次はそこも整えるとさらに良くなります`,
+    );
+  }
+
+  if (summary.exploreTurns === 0) {
+    improvementFacts.push(
+      '今回は店長やお客さんへの質問が0回だったため、次は手直しの前に誰が何に困っているかを質問してから直すと、より少ない手数で両立しやすくなること',
+    );
+    improvementClauses.push(
+      '次は手直しの前に店長やお客さんへ質問して事情を確かめてから直すと、もっと少ない手数で狙いどおりに直せますよ',
+    );
+  } else if (summary.goalDirectedTurns === 0) {
+    improvementFacts.push(
+      '次は部品の具体的な直し方だけでなく、誰がどうできるようにしたいかという目的を伝えてみると、お助けAIが細かい直し方をまとめて担えること',
+    );
+    improvementClauses.push(
+      '次は部品の細かい直し方だけでなく、誰がどうできるようにしたいかという目的で伝えてみると、お助けAIがまとめて形にできますよ',
+    );
+  } else if (summary.reworkTurns > 0) {
+    improvementFacts.push(
+      `同じ箇所を \`${summary.reworkTurns}回\` 直し直したため、消す前に店長やお客さんの希望を確かめて条件を伝えると1回で決まりやすくなること`,
+    );
+    improvementClauses.push(
+      '消す前に店長やお客さんの希望を確かめてから条件を伝えると、直し直しを減らして1回で決めやすくなりますよ',
+    );
+  }
+
+  if (improvementFacts.length === 0) {
+    improvementFacts.push(
+      '9人全員の満足と店長の売上がすでに両立できており、指示の出し方も理想的だった。次は別の客層から始めてさらに少ない手数でのクリアを目指すと良い練習になること',
+    );
+    improvementClauses.push(
+      'すでに9人全員の満足と店長の売上が両立できているので、次は別の客層から始めてさらに少ない手数で同じ着地点を目指してみてくださいね',
+    );
+  }
+
+  const primaryImp = improvementClauses[0];
+  const secondaryImp = improvementClauses.length > 1 ? improvementClauses[improvementClauses.length - 1] : undefined;
+  const fallbackImprovements =
+    secondaryImp && secondaryImp !== primaryImp
+      ? `もっと良くするなら、${primaryImp}。あわせて、${secondaryImp}`
+      : `もっと良くするなら、${primaryImp}`;
+
+  return {
+    overviewFacts,
+    goodPointFacts,
+    improvementFacts,
+    fallbackLines: [fallbackOverview, fallbackGoodPoints, fallbackImprovements],
   };
 }
 

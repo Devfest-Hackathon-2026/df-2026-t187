@@ -390,7 +390,29 @@ async function routeApiRequest(
         sendJson(res, 400, { error: 'situation, facts, fallback が必要です' });
         return true;
       }
-      sendJson(res, 200, await voiceOwnerLine(body));
+      const userMessage =
+        typeof body.userMessage === 'string'
+          ? body.userMessage.slice(0, MAX_TEXT_INPUT_LENGTH)
+          : undefined;
+      const history = sanitizeHistory(body.history);
+      if (userMessage || history.some((e) => e.speaker === 'ユーザー')) {
+        await assertPromptAllowed(learnerTextsForScreening(userMessage ?? '', history));
+      }
+      const facts = body.facts
+        .filter((f): f is string => typeof f === 'string')
+        .slice(0, 12)
+        .map((f) => f.slice(0, 200));
+      sendJson(
+        res,
+        200,
+        await voiceOwnerLine({
+          situation: body.situation,
+          facts,
+          fallback: body.fallback.slice(0, 200),
+          userMessage,
+          history,
+        }),
+      );
       return true;
     }
 
@@ -416,7 +438,10 @@ async function routeApiRequest(
         sendJson(res, 400, { error: 'text が必要です' });
         return true;
       }
-      const result = await synthesizeStudioSpeech(body);
+      const result = await synthesizeStudioSpeech({
+        text: body.text.slice(0, 400),
+        speaker: typeof body.speaker === 'string' ? body.speaker.slice(0, 40) : 'assistant',
+      });
       sendJson(res, 200, result);
       return true;
     }
@@ -431,7 +456,10 @@ async function routeApiRequest(
         sendJson(res, 400, { error: 'audioBase64 と currentSpec が必要です' });
         return true;
       }
-      const result = await transcribeAndRefineUserAudio(body);
+      const result = await transcribeAndRefineUserAudio({
+        ...body,
+        targetComponentIds: sanitizeComponentIds(body.targetComponentIds),
+      });
       sendJson(res, 200, result);
       return true;
     }

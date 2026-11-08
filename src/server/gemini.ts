@@ -9,9 +9,15 @@ import {
 } from '@google/genai';
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { ACTIVE_THEME, getReviewersByCohort } from '../shared/initialTheme.ts';
+import {
+  ACTIVE_THEME,
+  ALL_REVIEWER_PERSONAS,
+  getReviewersByCohort,
+  TARGET_COHORTS,
+} from '../shared/initialTheme.ts';
 import { buildScenarioSpec } from '../shared/theme.ts';
 import { hasCompletionAction } from '../shared/appRuntime.ts';
+import { describeOtherCohortImpact } from '../shared/otherCohorts.ts';
 import {
   buildOwnerChangeReaction,
   buildOwnerClosingLines,
@@ -30,7 +36,12 @@ import {
   detectExplicitRecipientMention,
 } from '../shared/intent.ts';
 import { applySpecPatches } from '../shared/specPatch.ts';
-import { inspectAppliedChangeForTelemetry } from '../shared/promptTelemetry.ts';
+import {
+  buildClearFeedbackFacts,
+  inspectAppliedChangeForTelemetry,
+  type ClearFeedbackFacts,
+  type ClearFeedbackInput,
+} from '../shared/promptTelemetry.ts';
 import { describeWorkSteps } from '../shared/workSteps.ts';
 
 export { classifyUserMessageIntent, detectExplicitRecipientMention };
@@ -334,6 +345,30 @@ export async function voiceOwnerLine(req: OwnerLineRequest): Promise<OwnerLineRe
 
 const OWNER_REPLY_FALLBACK = 'うーん、言いたいことは分かるんだけどなあ…売上のことを考えると悩ましいよ';
 
+/** 赤ペンで部品を囲んだときに出す、調べるための質問候補（手直しの答えは出さない） */
+export const CIRCLE_INQUIRY_FOLLOW_UPS = [
+  'この部品の仕組みを聞く',
+  'お客さんの反応を聞く',
+  '店長の考えを聞く',
+] as const;
+
+function formatCircledTargetLabel(targets: AppComponent[]): string {
+  const names = targets
+    .map(
+      (t) =>
+        t.label
+          .replace(/\{countdown\}/g, '2:59')
+          .replace(/\{[^}]+\}/g, '')
+          .replace(/\s+/g, ' ')
+          .trim() ||
+        t.caption?.trim() ||
+        '',
+    )
+    .filter(Boolean)
+    .map((n) => (n.length > 18 ? `${n.slice(0, 18)}…` : n));
+  return names.length > 0 ? names.slice(0, 2).join('と') : 'この部品';
+}
+
 /**
  * 店長が話しかけられたときに使う、今のお店の状況の事実。数字や事実をでっちあげないよう、
  * 画面とお客さんの結果から分かることだけをコードでまとめる
@@ -341,9 +376,18 @@ const OWNER_REPLY_FALLBACK = 'うーん、言いたいことは分かるんだ�
 export function describeOwnerContext(
   spec: AppSpec,
   latestReviews: LatestReviewRecord | undefined,
+  targetComponentIds?: string[],
 ): string[] {
   const owner = ACTIVE_THEME.owner;
   const facts: string[] = [];
+  if (targetComponentIds && targetComponentIds.length > 0) {
+    const targetComponents = spec.components.filter((c) => targetComponentIds.includes(c.id));
+    if (targetComponents.length > 0) {
+      facts.push(
+        `いま相手が赤ペンで指して聞いている部品は「${formatCircledTargetLabel(targetComponents)}」である`,
+      );
+    }
+  }
   const state = Object.fromEntries(spec.state.map((s) => [s.key, s.initialValue]));
   for (const m of owner.metrics) {
     // 店にもともとない項目（状態の変数がない）は伝えない。消された欄を嘆くのは、店にあったものだけ
@@ -448,8 +492,17 @@ async function voiceCohortCustomers(
     actionTrace: trace,
   }));
 
+  const targetComponents = req.currentSpec.components.filter((c) =>
+    req.targetComponentIds.includes(c.id),
+  );
+  const targetNote =
+    targetComponents.length > 0
+      ? `相手は画面の部品である ${formatCircledTargetLabel(targetComponents)} を指して聞いています。`
+      : '';
+
   const prompt = [
     `あなたは注文画面を使いに来た3人のお客さんです。お店の画面を手直ししている人から、お客さんに向けてこう質問・声かけされました：${req.userMessage}`,
+    ...(targetNote ? [targetNote] : []),
     '【3人のお客さんそれぞれのプロフィールと実際に画面を操作した記録】',
     JSON.stringify(customerProfiles),
     '【絶対ルール】',
@@ -1168,6 +1221,140 @@ export async function applyOptionToSpec(req: ApplyRequest): Promise<ApplyRespons
   };
 }
 
+const CLEAR_FEEDBACK_SCHEMA: Schema = {
+  type: Type.OBJECT,
+  properties: {
+    overview: {
+      type: Type.STRING,
+      description:
+        '1つ目の吹き出し：今回の挑戦の概要。選んだ客層が全員買えたこと、質問や手直しの回数、お店の定期便やほかの客層の結果をねぎらいとともにまとめる。100文字以内、括弧なし',
+    },
+    goodPoints: {
+      type: Type.STRING,
+      description:
+        '2つ目の吹き出し：今回の挑戦でどこがよかったか。よかった点の事実にもとづき、画面の両立や指示の出し方で良かったところを具体的に褒める。事実にある `{{turn:数字}}` の目印は1文字も変えずにそのまま文中に残す。110文字以内、括弧なし',
+    },
+    nextImprovements: {
+      type: Type.STRING,
+      description:
+        '3つ目の吹き出し：もっと何をしたら良くなるか。改善点の事実にもとづき、次に試すとさらに良くなる画面の工夫や指示の出し方を前向きに提案する。110文字以内、括弧なし',
+    },
+  },
+  required: ['overview', 'goodPoints', 'nextImprovements'],
+};
+
+/**
+ * 吹き出し文から丸括弧やかぎ括弧を取り除き、裸の {{turn:N}} 目印があればバッククォートで囲む
+ */
+function sanitizeClearFeedbackLine(raw: string, fallback: string): string {
+  const cleaned = cleanJapaneseText(raw.trim(), '')
+    .replace(/[()（）「」『』]/g, '')
+    .replace(/(?<!`)\{\{turn:(\d+)\}\}(?!`)/g, '`{{turn:$1}}`')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return cleaned || fallback;
+}
+
+/**
+ * クリア時のお助けAIの3つの振り返り吹き出し（概要・どこがよかったか・もっと何をしたら良くなるか）をAIに作らせる。
+ * 事実判定はコードで行った ClearFeedbackFacts だけを渡し、通信失敗や目印欠落時は fallbackLines を使う
+ */
+export async function voiceAssistantClearReport(
+  facts: ClearFeedbackFacts,
+): Promise<[string, string, string]> {
+  const aiInfo = createGenAIClient();
+  if (!aiInfo) return facts.fallbackLines;
+
+  const prompt = [
+    'あなたは注文画面の手直しを一緒に進めてきた進行役のお助けAIです。丁寧で親しみやすいです・ます調で話します。',
+    '学習者が選んだ客層の3人全員を満足させてクリアしました。コードで判定した事実だけをもとに、お助けAIからの振り返りを3つの吹き出しで作ってください。',
+    '',
+    '【1つ目の吹き出し overview に含める事実】',
+    ...facts.overviewFacts.map((f) => `- ${f}`),
+    '',
+    '【2つ目の吹き出し goodPoints に含める事実】',
+    ...facts.goodPointFacts.map((f) => `- ${f}`),
+    '',
+    '【3つ目の吹き出し nextImprovements に含める事実】',
+    ...facts.improvementFacts.map((f) => `- ${f}`),
+    '',
+    '【絶対ルール】',
+    '1. 上の事実に書かれていないことは絶対に作らないでください。回数や人数の数字も事実のとおりにしてください。',
+    '2. 事実の中に `{{turn:数字}}` という目印がある場合は、ブラウザ側で学習者の実際の発言に置き換える記号なので、1文字も変えずにバッククォート付きの `{{turn:数字}}` のまま goodPoints の文中に必ず残してください。',
+    '3. 丸括弧やかぎ括弧は一切使わないでください。強調したい語や数字はバッククォート `...` で囲んでよいです。',
+    '4. それぞれの吹き出しは80〜110文字程度の自然な話し言葉1〜2文にまとめてください。',
+  ].join('\n');
+
+  try {
+    const response = await generateContentWithTimeout(
+      aiInfo,
+      {
+        model: aiInfo.model,
+        contents: prompt,
+        config: {
+          responseMimeType: 'application/json',
+          responseSchema: CLEAR_FEEDBACK_SCHEMA,
+          temperature: 0.4,
+          ...thinkingConfig(),
+        },
+      },
+      TIMEOUTS.side,
+    );
+    const parsed = parseJsonResponse<{
+      overview: string;
+      goodPoints: string;
+      nextImprovements: string;
+    }>(response.text, 'clear_feedback');
+
+    const overview = sanitizeClearFeedbackLine(parsed.overview ?? '', facts.fallbackLines[0]);
+    let goodPoints = sanitizeClearFeedbackLine(parsed.goodPoints ?? '', facts.fallbackLines[1]);
+    const nextImprovements = sanitizeClearFeedbackLine(
+      parsed.nextImprovements ?? '',
+      facts.fallbackLines[2],
+    );
+
+    // 元のフォールバック文に含まれていた {{turn:N}} 目印が1つでも欠けていたらフォールバック文を使う
+    const expectedRefs = [...facts.fallbackLines[1].matchAll(/\{\{turn:\d+\}\}/g)].map((m) => m[0]);
+    if (expectedRefs.some((ref) => !goodPoints.includes(ref))) {
+      goodPoints = facts.fallbackLines[1];
+    }
+
+    return [overview, goodPoints, nextImprovements];
+  } catch (err) {
+    console.warn(
+      '[gemini:clear_feedback] クリア振り返りの生成に失敗したため決まった文面を使います:',
+      describeErrorForLog(err),
+    );
+    return facts.fallbackLines;
+  }
+}
+
+function detectCouponStatusForClearFeedback(
+  spec: AppSpec,
+  bounds?: EvaluateRequest['componentBounds'],
+  existingSimMap?: ReadonlyMap<string, ReturnType<typeof simulatePersonaComputerUse>>,
+): NonNullable<ClearFeedbackInput['couponStatus']> {
+  const hadCouponInShop = spec.state.some(
+    (s) => s.key === 'couponPopup' || s.key.toLowerCase().includes('coupon'),
+  );
+  if (!hadCouponInShop) return 'none';
+  const couponSeeker = ALL_REVIEWER_PERSONAS.find((p) => p.constraints.wantsCoupon);
+  if (!couponSeeker) return 'none';
+  const sim =
+    existingSimMap?.get(couponSeeker.id) ??
+    simulatePersonaComputerUse(spec, couponSeeker, bounds);
+  if (sim.actionTrace.some((t) => t.includes('クーポンを使いたかったが見当たらなかった'))) {
+    return 'removed';
+  }
+  if (
+    sim.actionTrace.some((t) => t.includes('の特典を適用した') || t.includes('の特典を適用して閉じた')) &&
+    !sim.actionTrace.some((t) => t.includes('合計金額が変わっていなかった'))
+  ) {
+    return 'usable_discount';
+  }
+  return 'kept_no_discount';
+}
+
 /**
  * レビューAI:
  * 改修意図も議論も一切知らず、画面と Computer Use 実操作シミュレーション結果（制約変数適用済み）のみを受け取る。
@@ -1195,7 +1382,7 @@ export async function evaluateAppWithPersonas(req: EvaluateRequest): Promise<Eva
       finalState: simMap.get(p.id)!.finalState,
     })),
   );
-  // 全員が満足したら、店長の締めのせりふを感想と同時に作る
+  // 全員が満足したら、店長の締めのせりふとお助けAIのクリア振り返りを感想と同時に作る
   const allAchieved = reviewers.every((p) => simMap.get(p.id)!.outcome === 'achieved');
   const closingPromise = allAchieved
     ? voiceOwnerLine({
@@ -1212,6 +1399,45 @@ export async function evaluateAppWithPersonas(req: EvaluateRequest): Promise<Eva
         history: req.history,
       })
     : Promise.resolve(undefined);
+
+  const buildFeedbackForSummary = async (summary: Awaited<ReturnType<typeof finalizeTelemetryOnEvaluate>>) => {
+    const cohortLabel =
+      TARGET_COHORTS.find((c) => c.id === req.cohortId)?.label ?? '選んだ客層';
+    const otherPersonas = ALL_REVIEWER_PERSONAS.filter(
+      (p) => !reviewers.some((r) => r.id === p.id),
+    );
+    const otherImpact = describeOtherCohortImpact(
+      req.currentSpec,
+      otherPersonas,
+      req.componentBounds,
+    );
+    const couponStatus = detectCouponStatusForClearFeedback(
+      req.currentSpec,
+      req.componentBounds,
+      simMap,
+    );
+    const facts = buildClearFeedbackFacts({
+      cohortLabel,
+      summary,
+      owner,
+      otherCohorts: {
+        achieved: otherImpact.achieved,
+        total: otherImpact.total,
+        unhappy: otherImpact.unhappy.map((u) => ({ name: u.name, reason: u.reason })),
+      },
+      couponStatus,
+    });
+    return voiceAssistantClearReport(facts);
+  };
+
+  const finalizeWithClearFeedback = () =>
+    finalizeTelemetryOnEvaluate(req.cohortId, reviewers.length, reviewers.length, req.runId).then(
+      async (summary) => ({
+        ...summary,
+        assistantFeedbackLines: await buildFeedbackForSummary(summary),
+      }),
+    );
+  const prestartedClearPromise = allAchieved ? finalizeWithClearFeedback() : undefined;
 
   const simulationSummary = reviewers.map((p) => {
     const sim = simMap.get(p.id)!;
@@ -1322,10 +1548,11 @@ export async function evaluateAppWithPersonas(req: EvaluateRequest): Promise<Eva
   });
 
   const achievedCount = results.filter((r) => r.outcome === 'achieved').length;
-  const [closing, telemetrySummary] = await Promise.all([
-    closingPromise,
-    finalizeTelemetryOnEvaluate(req.cohortId, achievedCount, results.length, req.runId),
-  ]);
+  const telemetryPromise =
+    achievedCount === results.length
+      ? (prestartedClearPromise ?? finalizeWithClearFeedback())
+      : finalizeTelemetryOnEvaluate(req.cohortId, achievedCount, results.length, req.runId);
+  const [closing, telemetrySummary] = await Promise.all([closingPromise, telemetryPromise]);
   if (closing) owner.closingLines = closing.text.split('\n').filter(Boolean);
 
   return {
@@ -1349,7 +1576,7 @@ const TRIAGE_SCHEMA: Schema = {
     reply: {
       type: Type.STRING,
       description:
-        'question なら仕様や記録にある事実だけの説明とどう変えたいかの問いかけ、unclear なら受け止めとどう変えるかの聞き返し。change なら空文字。70文字以内、お客さんの操作の記録を伝えるときだけ100文字以内。括弧なし',
+        'question なら仕様や記録にある事実だけの説明とどう変えたいかの問いかけ、unclear なら受け止めとどう変えるかの聞き返し。change なら空文字。どう直せばよいかの答えや手直し案は言わない。70文字以内、お客さんの操作の記録を伝えるときだけ100文字以内。括弧なし',
     },
     pointedComponentIds: {
       type: Type.ARRAY,
@@ -1357,14 +1584,8 @@ const TRIAGE_SCHEMA: Schema = {
       description:
         '学習者が自分で指した部品のID。赤ペンで囲んだ部品、発言で名前や見た目を挙げた部品、直前に自分で押して画面通知が出た部品だけ。お客さんの発言にだけ出てくる部品は含めない',
     },
-    suggestedFollowUps: {
-      type: Type.ARRAY,
-      items: { type: Type.STRING },
-      description:
-        'pointedComponentIds の部品をどう変えるかの具体的な短い指示（最大2個、各16文字以内）。合計金額・入力欄・内訳・本物の注文ボタンなど必要な部品を消す候補は絶対に出さない。両立する改善は1つにまとめてよい。指した部品がないときや正常な部品で変える必要がないとき、change のときは空配列',
-    },
   },
-  required: ['intent', 'reply', 'pointedComponentIds', 'suggestedFollowUps'],
+  required: ['intent', 'reply', 'pointedComponentIds'],
 };
 
 async function applyFromChat(req: ChatRequest): Promise<ChatResponse> {
@@ -1536,7 +1757,11 @@ export async function chatWithStudio(req: ChatRequest): Promise<ChatResponse> {
       voiceOwnerLine({
         situation: 'reply',
         userMessage: effectiveReq.userMessage,
-        facts: describeOwnerContext(effectiveReq.currentSpec, effectiveReq.latestReviews),
+        facts: describeOwnerContext(
+          effectiveReq.currentSpec,
+          effectiveReq.latestReviews,
+          effectiveReq.targetComponentIds,
+        ),
         fallback: OWNER_REPLY_FALLBACK,
         history: effectiveReq.history,
       }),
@@ -1591,6 +1816,16 @@ export async function chatWithStudio(req: ChatRequest): Promise<ChatResponse> {
   const targets = effectiveReq.currentSpec.components.filter((c) =>
     effectiveReq.targetComponentIds.includes(c.id),
   );
+  // 赤ペンで部品を囲んだだけの段階では、手直しの答えは出さず、調べるための質問ボタンだけを出す
+  if (circledOnly && targets.length > 0) {
+    const targetName = formatCircledTargetLabel(targets);
+    return {
+      intent: 'explain',
+      reply: `${targetName}ですね。気になることを聞くか、どう手直ししたいか教えてください`,
+      suggestedFollowUps: [...CIRCLE_INQUIRY_FOLLOW_UPS],
+    };
+  }
+
   const componentFacts = effectiveReq.currentSpec.components.map((c) => ({
     id: c.id,
     type: c.type,
@@ -1625,27 +1860,22 @@ export async function chatWithStudio(req: ChatRequest): Promise<ChatResponse> {
     '   - role が decoy の部品は押しても何も起きないおとり、role が trap の部品は最初からチェック等が入っている仕掛け、role が popup の部品は時間差で出る広告です。',
     '   - role が info や total の部品、actions が設定された primary_action の部品について聞かれたら、正常に動いている部品だと事実を伝えてください。',
     '   - お客さんの反応についてお助けAIに聞かれたら、お客さんが実際に操作した記録を根拠に、その人が何手目に何をしたかを、何も起きなかった操作も省かずに起きた順に伝え、最後にやめた理由・気づかなかったことを記録の言葉どおりに伝えてください。この場合に限り3文・100文字まで使ってよいです。記録が今の画面より前のものなら、どの画面での記録かも添えてください。',
-    '   - 記録に書かれていないことは推測で足さないでください。どう直せばよいか・どの部品が悪いかの判断は言わず、起きたことだけを伝えてください。',
+    '   - 記録に書かれていないことは推測で足さないでください。どう直せばよいか・どの部品が悪いかの判断や具体的な直し方の提案は言わず、起きたことだけを伝えてください。',
     '   - まだお客さんの反応を見ていないときは、左下のお客さんの反応を見るで試してもらえると伝えてください。',
     '   - 部品の仕様だけでは分からない動き（時間で変わる表示など）は、画面の仕組みの補足にある事実で答えてください。',
     '   - 「嘘じゃない？」のような感想まじりの問いかけには、まず気持ちを短く受け止めてから、事実を答えてください。',
-    '   - 「消した方がいい？」「残すべき？」のように判断を求められたら、自分の意見は言わず、決めるのはあなたで、お客さんの反応を見れば確かめられると伝えてください。',
+    '   - 「消した方がいい？」「残すべき？」のように判断を求められたら、自分の意見は言わず、決めるのはあなたで、お客さんの反応や店長の考えを聞けば確かめられると伝えてください。',
     '2. 画面や部品についての質問なら、最後にどう変えたいかを短く尋ねてください。使い方の質問なら尋ねなくてかまいません。',
     '【unclear のときのルール】',
     '1. 発言を短く受け止め、どこをどう変えたいかを聞き返してください。手直しはまだしません。',
-    '【どこが悪いかを見つけるのは学習者自身です。ヒントの出し方の絶対ルール】',
-    '1. 説明や手直しの候補は、学習者が自分で指した部品についてだけ出してください。自分で指した部品とは、赤ペンで囲んだ部品、発言で名前や見た目を挙げた部品、直前に自分で押して画面通知が出た部品です。',
-    '2. 学習者が何も指していないときは、どの部品が悪いか・どこを直すべきかを一切言わないでください。左のスマホで実際に買ってみるか、気になるところを赤ペンで囲むよう短く促すだけにし、suggestedFollowUps は空配列にしてください。',
-    '3. 画面全体の問題点を挙げたり、まだ話題に出ていない部品を勧めたりしないでください。',
+    '【どこが悪いか・どう直すかを決めるのは学習者自身です。絶対ルール】',
+    '1. 説明は、学習者が自分で指した部品についてだけ出してください。自分で指した部品とは、赤ペンで囲んだ部品、発言で名前や見た目を挙げた部品、直前に自分で押して画面通知が出た部品です。',
+    '2. 学習者が何も指していないときは、どの部品が悪いか・どこを直すべきかを一切言わないでください。左のスマホで実際に買ってみるか、気になるところを赤ペンで囲むよう短く促すだけにしてください。',
+    '3. 画面全体の問題点を挙げたり、まだ話題に出ていない部品を勧めたり、具体的な手直しの答えを先回りして教えたりしないでください。',
     '【共通のルール】',
     '1. 誰が喜ぶか・誰が困るかといったお客さんや店長の気持ちの先回り代弁や、それっぽい一般論は一切言わないでください（反応はお客さんや店長本人が言います）。',
-    '2. suggestedFollowUps は、指した部品をどう変えるかの、ユーザーがそのまま押して手直しを指示できる短い言葉（最大2個、各16文字以内）にしてください。',
-    '   - 広告や定期便などを指したときは、「消す」候補ばかりにせず、「閉じるボタンを大きく下に移動」「邪魔にならないクーポン枠にする」のように工夫して活かす候補も出してください。',
-    '   - role が total（合計金額）、required_input（必須の選択・入力）、info（内訳・見出し）、primary_action（本物の注文ボタン）の必要な部品に対して、「消す」「削除する」といった画面を壊す候補は絶対に出さないでください。消す候補を出してよいのは popup, decoy, distraction, trap, danger の部品だけです。',
-    '   - 同じ部品に対して同時にやると自然な改善（例：定期便のチェックを外して文字を大きくする）は、わざと別々の候補に分けず1つの候補にまとめてください。',
-    '   - すでに正常に動いている部品を指したときは、無理に2個ひねり出さず、自然な改善案が1個あれば1個、なければ空配列にしてください。',
-    '3. 若年層のチャットのように読みやすくするため、1文は35文字以内で短く区切り、合計2文以内（70文字以内）・括弧なしにしてください。',
-    '4. change のときは reply を空文字、suggestedFollowUps を空配列にしてください。',
+    '2. 若年層のチャットのように読みやすくするため、1文は35文字以内で短く区切り、合計2文以内（70文字以内）・括弧なしにしてください。',
+    '3. change のときは reply を空文字にしてください。',
     '',
     `【話題の部品】\n${targets.length > 0 ? JSON.stringify(targets) : '特定の部品は指していません'}`,
     `【画面にある全部品の実際の仕様】\n${JSON.stringify(componentFacts)}`,
@@ -1655,7 +1885,7 @@ export async function chatWithStudio(req: ChatRequest): Promise<ChatResponse> {
     `【お客さんが実際に操作した記録】\n${formatLatestReviews(effectiveReq.latestReviews)}`,
     `【これまでの会話と画面通知】\n${formatHistory(effectiveReq.history)}`,
     circledOnly
-      ? '【ユーザーの発言】\nまだ何も言っていません。赤ペンで話題の部品を囲んだところです。question として扱い、囲んだ部品が何かを1文で受け止めてから、どうしたいかを短く尋ねてください。部品の仕組みの説明は、聞かれるまでしないでください。suggestedFollowUps には、その部品に対する自然な改善の指示を最大2つ入れてください（必要な部品を消す候補は出さないこと）。'
+      ? '【ユーザーの発言】\nまだ何も言っていません。赤ペンで話題の部品を囲んだところです。question として扱い、囲んだ部品が何かを1文で受け止めてから、どうしたいかを短く尋ねてください。部品の仕組みの説明や直し方の提案は、聞かれるまでしないでください。'
       : `【ユーザーの発言】\n${effectiveReq.userMessage}`,
   ].join('\n');
 
@@ -1675,7 +1905,6 @@ export async function chatWithStudio(req: ChatRequest): Promise<ChatResponse> {
     intent: 'question' | 'change' | 'unclear';
     reply: string;
     pointedComponentIds?: string[];
-    suggestedFollowUps?: string[];
   };
   try {
     const response = await generateContentWithTimeout(
@@ -1697,12 +1926,11 @@ export async function chatWithStudio(req: ChatRequest): Promise<ChatResponse> {
     if (err instanceof AiNotConfiguredError) throw err;
     console.warn('[gemini:triage] 振り分け応答に失敗したためフォールバックします:', describeErrorForLog(err));
     if (circledOnly && targets.length > 0) {
-      const targetName =
-        targets[0].label.replace(/\{[^}]+\}/g, '').trim() || targets[0].caption || 'この部品';
+      const targetName = formatCircledTargetLabel(targets);
       return {
         intent: 'explain',
-        reply: `${targetName}ですね。ここをどう変えたいですか？`,
-        suggestedFollowUps: [],
+        reply: `${targetName}ですね。気になることを聞くか、どう手直ししたいか教えてください`,
+        suggestedFollowUps: [...CIRCLE_INQUIRY_FOLLOW_UPS],
       };
     }
     return {
@@ -1717,28 +1945,14 @@ export async function chatWithStudio(req: ChatRequest): Promise<ChatResponse> {
     return applyFromChat(effectiveReq);
   }
 
-  // 学習者が何も指していないのに直す候補を出すと、どこが悪いかの答えを教えてしまう。
-  // 赤ペンで囲んだ部品も、AIが「指した」と判断した実在の部品もなければ候補は出さない
   const existingIds = new Set(effectiveReq.currentSpec.components.map((c) => c.id));
   const pointedIds = new Set<string>([
     ...effectiveReq.targetComponentIds,
     ...(parsed.pointedComponentIds ?? []).filter((id) => existingIds.has(id)),
   ]);
-  const pointed = pointedIds.size > 0;
-  const pointedComponents = effectiveReq.currentSpec.components.filter((c) =>
-    pointedIds.has(c.id),
-  );
-  const removableRoles = new Set(['popup', 'decoy', 'distraction', 'trap', 'danger']);
-  const canSuggestRemove =
-    pointedComponents.length > 0 &&
-    pointedComponents.some(
-      (c) => removableRoles.has(c.role) || c.style.skin === 'intrusive',
-    );
-  const filteredFollowUps = pointed
-    ? (parsed.suggestedFollowUps ?? [])
-        .filter((chip) => canSuggestRemove || !/消す|削除|なくす|取り除く/.test(chip))
-        .slice(0, 2)
-    : [];
+  // 調査用の質問ボタンは、赤ペンで囲んだ直後だけに出し、通常の質問・相談では手直し案のボタンを出さない
+  const filteredFollowUps =
+    circledOnly && pointedIds.size > 0 ? [...CIRCLE_INQUIRY_FOLLOW_UPS] : [];
 
   const telemetryEvent =
     !circledOnly && effectiveReq.userMessage
