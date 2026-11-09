@@ -446,7 +446,7 @@ const STUDIO_GUIDE = [
   '赤ペンで囲むを選んでスマホの部品を囲み、チャットで指示を送ると、その部品を話題にできます。囲まずに文章だけで頼んでも大丈夫です。',
   'チャットで手直しを頼むと、お助けAIが画面を書き換えます。「1つ前の画面に戻して」「最初の画面に戻して」とチャットで伝えると、前の画面に戻れます。',
   'お客さんの反応を見るを押すと、選んだ3人がその画面で実際に買ってみて、感想を言います。',
-  '入力欄の上のボタンで、お助けAI・店長・お客さんの誰に話しかけるかを選べます。初期設定はお助けAIで、文頭や@で別の人を明確に呼びかけると宛先も切り替わります。',
+  '入力欄の上のボタンや吹き出しのアイコン・名前で、お助けAI・店長・お客さんの誰に話しかけるかを選べます。初期設定はお助けAIで、@店長のようにメンションを付けると宛先も切り替わります。',
   '目標は、選んだ3人全員が満足して買える画面にすることです。',
   '誰のために直すかは途中では変えられません。選んだ3人全員が満足して買えると、直した画面のまま別のお客さんを呼ぶか、最初の画面からやり直すかを選べます。',
 ];
@@ -1583,7 +1583,13 @@ export async function evaluateAppWithPersonas(req: EvaluateRequest): Promise<Eva
   };
 
   const finalizeWithClearFeedback = () =>
-    finalizeTelemetryOnEvaluate(req.cohortId, reviewers.length, reviewers.length, req.runId).then(
+    finalizeTelemetryOnEvaluate(
+      req.cohortId,
+      reviewers.length,
+      reviewers.length,
+      req.runId,
+      req.turnCount,
+    ).then(
       async (summary) => ({
         ...summary,
         assistantFeedbackLines: await buildFeedbackForSummary(summary),
@@ -1686,7 +1692,13 @@ export async function evaluateAppWithPersonas(req: EvaluateRequest): Promise<Eva
   const telemetryPromise =
     achievedCount === results.length
       ? (prestartedClearPromise ?? finalizeWithClearFeedback())
-      : finalizeTelemetryOnEvaluate(req.cohortId, achievedCount, results.length, req.runId);
+      : finalizeTelemetryOnEvaluate(
+          req.cohortId,
+          achievedCount,
+          results.length,
+          req.runId,
+          req.turnCount,
+        );
   const [closing, telemetrySummary] = await Promise.all([closingPromise, telemetryPromise]);
   if (closing) owner.closingLines = closing.text.split('\n').filter(Boolean);
 

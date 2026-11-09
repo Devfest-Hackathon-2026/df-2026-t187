@@ -13,16 +13,11 @@ const AT_MENTION_RE = new RegExp(
   'i',
 );
 
-const VOCATIVE_START_RE = new RegExp(
-  `^(?:(?:ねえ|ねぇ|あの|すみません|すいません|ちょっと|おい|なあ|もしもし|こんにちは|どうも)[、,，\\s！!]*)*(店長|お助けAI|お助けエージェント|${CUSTOMER_VOCATIVE_PART})(?:さん|くん|ちゃん|様)?(?:(?:[、,，：:！!]+|\\s+)|(?:へ|に(?:質問|聞きたい|聞くけど|聞くね|聞きます|相談|お願い|確認))(?:[、,，：:！!\\s]|$|だけど|なんだけど)|[！!？?]*$)`,
-  'i',
-);
-
 /**
- * 発言の中で別の相手を「明確にメンション（呼びかけ・宛先指定）」しているか判定する。
- * 「店長が付けた広告」「お客さんはどこで困った？」のように文中に名前が入っているだけ（第三者への言及）では反応しない。
+ * 発言の中で別の相手を「@メンション（@店長 / @お客さん / @お助けAI）」で明示指定しているか判定する。
+ * 本文中に「店長」「お客さん」などの言葉が入っているだけでは宛先を切り替えない。
  *
- * @returns 'assistant' | 'owner' | 'customer' | null（明確なメンションなし）
+ * @returns 'assistant' | 'owner' | 'customer' | null（明確な@メンションなし）
  */
 export function detectExplicitRecipientMention(
   message: string,
@@ -30,7 +25,7 @@ export function detectExplicitRecipientMention(
   const trimmed = message.trim();
   if (!trimmed) return null;
 
-  const rawTarget = (AT_MENTION_RE.exec(trimmed)?.[1] ?? VOCATIVE_START_RE.exec(trimmed)?.[1])
+  const rawTarget = AT_MENTION_RE.exec(trimmed)?.[1]
     ?.replace(/[Ａ-Ｃ]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xfee0))
     .toUpperCase();
 

@@ -1260,9 +1260,30 @@ body {
 }
 
 .composer-pending-note {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
   font-size: 0.74rem;
   color: var(--ink-60);
   padding: 0 4px 6px;
+}
+
+.composer-pending-cancel-btn {
+  background: transparent;
+  border: 1px solid var(--ink-15);
+  border-radius: 6px;
+  padding: 2px 8px;
+  font-family: inherit;
+  font-size: 0.7rem;
+  font-weight: 700;
+  color: var(--ink-60);
+  cursor: pointer;
+}
+
+.composer-pending-cancel-btn:hover {
+  border-color: var(--accent-red);
+  color: var(--accent-red);
 }
 
 .vibe-chat-stream.is-skippable {
@@ -1477,14 +1498,48 @@ body {
   word-break: break-word;
 }
 
+.bubble-text {
+  white-space: pre-wrap;
+}
+
 .chat-bubble.is-entering {
   animation: bubblePop 180ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.user-bubble-stack {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+  max-width: 96%;
+}
+
+.user-bubble-stack .chat-bubble.is-user {
+  max-width: 100%;
 }
 
 .chat-bubble.is-user {
   background: var(--ink);
   color: #ffffff;
   border-bottom-right-radius: 4px;
+}
+
+.user-message-undo-btn {
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  padding: 2px 6px;
+  font-family: inherit;
+  font-size: 0.7rem;
+  font-weight: 700;
+  color: var(--ink-60);
+  cursor: pointer;
+  transition: color 140ms ease, background-color 140ms ease;
+}
+
+.user-message-undo-btn:hover {
+  color: var(--accent-red);
+  background: rgba(220, 38, 38, 0.08);
 }
 
 .chat-bubble.is-loading {
@@ -1751,12 +1806,14 @@ body {
 
 .composer-form-row {
   display: flex;
+  align-items: stretch;
   gap: 8px;
 }
 
 .composer-input-wrap {
   flex: 1;
   min-width: 0;
+  min-height: 42px;
   display: flex;
   align-items: center;
   border-radius: 10px;
@@ -1793,12 +1850,17 @@ body {
 .composer-input {
   flex: 1;
   min-width: 0;
+  min-height: 40px;
   padding: 10px 8px 10px 13px;
   border: none;
   background: transparent;
+  font-family: inherit;
   font-size: 0.84rem;
   font-weight: 700;
+  line-height: 1.45;
   color: var(--ink);
+  resize: none;
+  overflow-y: hidden;
 }
 
 .composer-input:focus {
@@ -1846,15 +1908,33 @@ body {
 }
 
 .btn-composer-send {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  align-self: stretch;
+  box-sizing: border-box;
   background: var(--ink);
   color: #ffffff;
-  border: none;
+  border: 1px solid transparent;
   border-radius: 10px;
+  min-height: 42px;
   padding: 0 18px;
   font-size: 0.84rem;
   font-weight: 800;
+  white-space: nowrap;
   cursor: pointer;
   flex: none;
+  transition: background-color 140ms ease, color 140ms ease, border-color 140ms ease;
+}
+
+.btn-composer-send.is-cancel {
+  background: #fef2f2;
+  color: var(--accent-red);
+  border-color: #fecaca;
+}
+
+.btn-composer-send.is-cancel:hover {
+  background: #fee2e2;
 }
 
 .btn-composer-send:disabled {

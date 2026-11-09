@@ -425,6 +425,8 @@ export interface EvaluateRequest {
   cohortId?: TargetCohortId;
   /** 1回の挑戦ごとの番号。振り返りの記録を、ほかの挑戦やほかの人の記録と混ぜないために使う */
   runId?: string;
+  /** 取り消されずに残っている発言の数。直前の発言を取り消したあとに反応を見たとき、取り消した発言を集計から外すために使う */
+  turnCount?: number;
   screenshotBase64?: string;
   componentBounds?: ComponentBoundsInput[];
   /** 店長が同じ言い回しを繰り返さないための、これまでの会話 */

@@ -544,6 +544,7 @@ async function routeApiRequest(
         currentSpec: body.currentSpec,
         runId: sanitizeRunId(body.runId),
         cohortId: sanitizeCohortId(body.cohortId),
+        turnCount: sanitizeTurnIndex(body.turnCount),
         screenshotBase64: sanitizeBase64(body.screenshotBase64),
         componentBounds: sanitizeComponentBounds(body.componentBounds),
         history,

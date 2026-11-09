@@ -448,13 +448,28 @@ export function mergeTelemetryEvents(
   for (const ev of localEvents) {
     byId.set(ev.id, ev);
   }
-  return [...byId.values()].sort((a, b) => {
+  const sorted = [...byId.values()].sort((a, b) => {
     if (a.turnIndex >= 0 && b.turnIndex >= 0 && a.turnIndex !== b.turnIndex) {
       return a.turnIndex - b.turnIndex;
     }
     const timeCmp = a.createdAt.localeCompare(b.createdAt);
     return timeCmp !== 0 ? timeCmp : a.id.localeCompare(b.id);
   });
+  // 直前の発言を取り消して送り直したときは、同じ turnIndex に複数の記録が残るため新しい方を採用する
+  const deduped: PromptTelemetryEvent[] = [];
+  const turnPos = new Map<number, number>();
+  for (const ev of sorted) {
+    if (ev.turnIndex >= 0) {
+      const existingIdx = turnPos.get(ev.turnIndex);
+      if (existingIdx !== undefined) {
+        deduped[existingIdx] = ev;
+        continue;
+      }
+      turnPos.set(ev.turnIndex, deduped.length);
+    }
+    deduped.push(ev);
+  }
+  return deduped;
 }
 
 /**
@@ -621,6 +636,19 @@ export async function recordRunEvent(input: RunEventInput): Promise<void> {
   }
 }
 
+function pruneInMemoryTelemetryEventsFromTurn(
+  runId: string | undefined,
+  fromTurnIndex: number | undefined,
+): void {
+  if (!runId || fromTurnIndex === undefined || fromTurnIndex < 0) return;
+  for (let i = inMemoryTelemetryEvents.length - 1; i >= 0; i--) {
+    const ev = inMemoryTelemetryEvents[i];
+    if (ev.runId === runId && ev.turnIndex >= fromTurnIndex) {
+      inMemoryTelemetryEvents.splice(i, 1);
+    }
+  }
+}
+
 /**
  * 学習者の1回の発言・指示を Cloud Natural Language API + Agent Platform の埋め込みで分析し、
  * 行動テレメトリとして記録する。
@@ -641,6 +669,8 @@ export async function recordPromptTelemetryEvent(input: {
   shareForAggregate?: boolean;
 }): Promise<PromptTelemetryEvent> {
   const changedComponentIds = input.changedComponentIds ?? [];
+  // 取り消された発言のあとに同じ turnIndex で送り直された場合は、取り消された記録をメモリから取り除く
+  pruneInMemoryTelemetryEventsFromTurn(input.runId, input.turnIndex);
   const localPriorEvents = inMemoryTelemetryEvents.filter((e) =>
     input.runId
       ? e.runId === input.runId
@@ -703,13 +733,19 @@ export async function finalizeTelemetryOnEvaluate(
   achievedCount: number,
   totalCustomers: number,
   runId?: string,
+  turnCount?: number,
 ): Promise<PromptSessionSummary> {
   // 挑戦の番号があれば、その挑戦の記録だけで振り返る（やり直す前の挑戦や、ほかの人の記録を混ぜない）
+  pruneInMemoryTelemetryEventsFromTurn(runId, turnCount);
   const localEvents = runId
     ? inMemoryTelemetryEvents.filter((e) => e.runId === runId)
     : inMemoryTelemetryEvents;
   const cloudEvents = runId ? await fetchRunTelemetryFromFirestore(runId) : [];
-  const events = runId ? mergeTelemetryEvents(localEvents, cloudEvents) : localEvents;
+  const merged = runId ? mergeTelemetryEvents(localEvents, cloudEvents) : localEvents;
+  const events =
+    turnCount !== undefined && turnCount >= 0
+      ? merged.filter((e) => e.turnIndex < 0 || e.turnIndex < turnCount)
+      : merged;
   const latest = [...events]
     .reverse()
     .find((e) => !cohortId || !e.cohortId || e.cohortId === cohortId);

@@ -1086,11 +1086,12 @@ function pushMessage(
   return full;
 }
 
-async function postJson<T>(url: string, body: unknown): Promise<T> {
+async function postJson<T>(url: string, body: unknown, signal?: AbortSignal): Promise<T> {
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
+    signal,
   });
   const data = (await res.json().catch(() => ({}))) as T & { error?: string; code?: string };
   if (!res.ok) {
@@ -1553,6 +1554,7 @@ async function recordDecision(body: RecordDecisionRequest): Promise<void> {
 
 function handleSelectCohort(cohortId: TargetCohortId): void {
   if (state.selectedCohortId) return;
+  lastUserTurn = null;
   flushMessageQueue();
   clearTransientChoiceMessages();
   const selector = [...state.messages].reverse().find((m) => m.showCohortSelector);
@@ -1567,6 +1569,8 @@ function handleSelectCohort(cohortId: TargetCohortId): void {
  */
 function handleRestartFromScratch(sameCohortId?: TargetCohortId): void {
   if (isRunInProgress()) sendRunEvent('end', 'reset');
+  lastUserTurn = null;
+  abortActiveUserSend();
   flushMessageQueue();
   clearTransientChoiceMessages();
   state.runFinished = false;
@@ -1792,6 +1796,7 @@ async function reactToCircle(targetIds: string[]): Promise<void> {
   // 誰のために直すかを選ぶ前や、改造中・質問への回答待ちのときは割り込まない
   if (!state.selectedCohortId) return;
   if (state.chatLoading && !circleInFlight) return;
+  lastUserTurn = null;
   const seq = ++circleRequestSeq;
   circleInFlight = true;
   flushMessageQueue();
@@ -1919,6 +1924,7 @@ async function playWorkLog(
   logMessage: TimelineMessage,
   steps: Array<{ text: string; componentId?: string }>,
   rolledBack: boolean,
+  signal?: AbortSignal,
 ): Promise<void> {
   const log = logMessage.workLog!;
   if (rolledBack) {
@@ -1930,6 +1936,7 @@ async function playWorkLog(
     // 準備中の行は消して、実際に行った作業の行だけをシステムメッセージとして残す
     log.steps = [];
     for (const step of steps) {
+      if (signal?.aborted) return;
       state.justChangedIds = step.componentId ? [step.componentId] : [];
       addWorkStep(log, step.text, false, step.componentId);
       if (step.componentId && sandboxStageEl) {
@@ -1939,6 +1946,7 @@ async function playWorkLog(
         el?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
       }
       await sleep(WORK_STEP_INTERVAL_MS);
+      if (signal?.aborted) return;
       log.steps[log.steps.length - 1].done = true;
     }
     state.justChangedIds = [];
@@ -2044,14 +2052,7 @@ async function toggleVoiceRecording(): Promise<void> {
         } finally {
           state.isTranscribingAudio = false;
           renderStudio();
-          window.requestAnimationFrame(() => {
-            const inputEl = shellEl?.querySelector<HTMLInputElement>('.composer-input');
-            if (inputEl) {
-              inputEl.focus();
-              const len = inputEl.value.length;
-              inputEl.setSelectionRange(len, len);
-            }
-          });
+          focusComposerInput(true);
         }
       };
       reader.readAsDataURL(blob);
@@ -2075,6 +2076,84 @@ function resolveRecipientForFollowUp(text: string): 'assistant' | 'owner' | 'cus
   return 'assistant';
 }
 
+interface LastUserTurnSnapshot {
+  /** 送信したユーザー発言メッセージのID */
+  userMessageId: string;
+  /** 入力欄に戻すテキスト（自由入力から送ったときのみ復元） */
+  restoreInputText?: string;
+  /** 送信前のメッセージ履歴（一時的な選択肢も含む） */
+  messagesBefore: TimelineMessage[];
+  /** 送信前のチェックポイント一覧と現在位置 */
+  checkpointsBefore: Checkpoint[];
+  activeCheckpointIndexBefore: number;
+  liveAppStateBefore: Record<string, StateValue>;
+  /** 送信前の判断記録の数 */
+  decisionsLengthBefore: number;
+  /** 送信前の発言一覧の長さ */
+  turnTextsLengthBefore: number;
+  /** 送信前の赤ペン・話題の対象部品 */
+  circledComponentIdsBefore: string[];
+  topicTargetIdsBefore: string[];
+  penPointsBefore: Point2D[];
+  /** 送信前の宛先 */
+  recipientBefore: string;
+}
+
+let lastUserTurn: LastUserTurnSnapshot | null = null;
+let activeUserSendAbort: AbortController | null = null;
+let activeWorkLogTimers: number[] = [];
+
+function abortActiveUserSend(): void {
+  if (activeUserSendAbort) {
+    activeUserSendAbort.abort();
+    activeUserSendAbort = null;
+  }
+  for (const t of activeWorkLogTimers) {
+    window.clearTimeout(t);
+  }
+  activeWorkLogTimers = [];
+}
+
+function canCancelOrUndoLastUserTurn(): boolean {
+  if (!lastUserTurn || state.evaluateLoading || state.runFinished) return false;
+  return state.messages.some((m) => m.id === lastUserTurn!.userMessageId);
+}
+
+/**
+ * 送信中（AIの応答待ち）の中断、または直前に送信した発言の取り消しを行う。
+ * 発言とそれに続く返事・画面変更を送信前の状態に戻し、入力していた文面を入力欄に復元する。
+ */
+function handleCancelLastUserMessage(): void {
+  if (!canCancelOrUndoLastUserTurn() || !lastUserTurn) return;
+  const snap = lastUserTurn;
+  lastUserTurn = null;
+  abortActiveUserSend();
+  flushMessageQueue();
+  stopAllTtsPlayback();
+
+  state.messages = snap.messagesBefore;
+  state.checkpoints = snap.checkpointsBefore;
+  state.activeCheckpointIndex = snap.activeCheckpointIndexBefore;
+  state.liveAppState = snap.liveAppStateBefore;
+  state.decisions.length = snap.decisionsLengthBefore;
+  state.runTurnTexts.length = snap.turnTextsLengthBefore;
+  state.circledComponentIds = snap.circledComponentIdsBefore;
+  state.topicTargetIds = snap.topicTargetIdsBefore;
+  state.penPoints = snap.penPointsBefore;
+  state.recipient = snap.recipientBefore;
+  if (snap.restoreInputText !== undefined) {
+    state.inputText = snap.restoreInputText;
+  }
+  state.chatLoading = false;
+  state.pendingSend = false;
+  state.justChangedIds = [];
+  state.typingMessage = undefined;
+
+  renderStudio();
+  scrollToLatestMessage();
+  focusComposerInput(true);
+}
+
 async function handleSendMessage(
   overrideText?: string,
   targetIdsOverride?: string[],
@@ -2090,7 +2169,21 @@ async function handleSendMessage(
     }
     return;
   }
+  abortActiveUserSend();
   flushMessageQueue();
+  const snapshotBeforeSend: Omit<LastUserTurnSnapshot, 'userMessageId'> = {
+    restoreInputText: overrideText === undefined ? text : undefined,
+    messagesBefore: structuredClone(state.messages),
+    checkpointsBefore: structuredClone(state.checkpoints),
+    activeCheckpointIndexBefore: state.activeCheckpointIndex,
+    liveAppStateBefore: structuredClone(state.liveAppState),
+    decisionsLengthBefore: state.decisions.length,
+    turnTextsLengthBefore: state.runTurnTexts.length,
+    circledComponentIdsBefore: [...state.circledComponentIds],
+    topicTargetIdsBefore: [...state.topicTargetIds],
+    penPointsBefore: state.penPoints.map((p) => ({ ...p })),
+    recipientBefore: state.recipient,
+  };
   clearTransientChoiceMessages();
 
   if (overrideText === undefined) {
@@ -2129,6 +2222,10 @@ async function handleSendMessage(
     text,
     targetComponentIds: targetIdsSnapshot,
   });
+  lastUserTurn = {
+    ...snapshotBeforeSend,
+    userMessageId: userMessage.id,
+  };
   if (overrideText === undefined) {
     state.inputText = '';
   }
@@ -2182,6 +2279,8 @@ async function handleSendMessage(
     return;
   }
 
+  const abortController = new AbortController();
+  activeUserSendAbort = abortController;
   state.chatLoading = true;
   // はっきりした改造の指示（かつ店長やお客さん宛てでないとき）なら、返事を待つ間から作業の過程をシステムメッセージで見せる
   const canApplyDirectly = recipientSnapshot === 'assistant';
@@ -2197,6 +2296,7 @@ async function handleSendMessage(
       window.setTimeout(() => !log.finished && setPrepWorkStep(log, '変え方を考えています'), 2200),
     );
   }
+  activeWorkLogTimers = logTimers;
   renderStudio();
   scrollToLatestMessage();
 
@@ -2205,20 +2305,26 @@ async function handleSendMessage(
     const turnIndex = state.runTurnTexts.push(text) - 1;
     // お客さんへの質問の返事も、反応を見るときと同じ条件で測った座標で判定する
     const componentBounds = await measureFixedLayoutBounds(spec);
-    const data = await postJson<ChatResponse>('/api/chat', {
-      componentBounds,
-      currentSpec: spec,
-      latestReviews: buildLatestReviewRecord(),
-      targetComponentIds: targetIdsSnapshot,
-      userMessage: text,
-      cohortId: state.selectedCohortId,
-      runId: state.runId,
-      turnIndex,
-      shareForAggregate: state.runShareForAggregate,
-      annotatedImageBase64,
-      history,
-      recipient: recipientSnapshot,
-    });
+    if (abortController.signal.aborted) return;
+    const data = await postJson<ChatResponse>(
+      '/api/chat',
+      {
+        componentBounds,
+        currentSpec: spec,
+        latestReviews: buildLatestReviewRecord(),
+        targetComponentIds: targetIdsSnapshot,
+        userMessage: text,
+        cohortId: state.selectedCohortId,
+        runId: state.runId,
+        turnIndex,
+        shareForAggregate: state.runShareForAggregate,
+        annotatedImageBase64,
+        history,
+        recipient: recipientSnapshot,
+      },
+      abortController.signal,
+    );
+    if (abortController.signal.aborted) return;
 
     logTimers.forEach((t) => window.clearTimeout(t));
     if (data.applied) {
@@ -2232,7 +2338,13 @@ async function handleSendMessage(
         // 新しい画面にしてから作業を1行ずつ流し、変えた部品を光らせる
         pushNewCheckpoint(applied.commitMessage, applied.updatedSpec);
       }
-      await playWorkLog(logMessage, applied.workSteps ?? [], Boolean(applied.rolledBack));
+      await playWorkLog(
+        logMessage,
+        applied.workSteps ?? [],
+        Boolean(applied.rolledBack),
+        abortController.signal,
+      );
+      if (abortController.signal.aborted) return;
       if (applied.rolledBack) {
         pushMessage({
           role: 'assistant',
@@ -2266,6 +2378,7 @@ async function handleSendMessage(
               fallback: applied.ownerReaction ?? '',
             },
             evalChoiceMsg,
+            abortController.signal,
           );
           return;
         }
@@ -2344,11 +2457,13 @@ async function handleSendMessage(
     }
   } catch (err) {
     logTimers.forEach((t) => window.clearTimeout(t));
+    if (abortController.signal.aborted) return;
     if (logMessage?.workLog && !logMessage.workLog.finished) {
       state.messages = state.messages.filter((m) => m !== logMessage);
     }
     if ((err as { code?: string }).code === 'input_rejected') {
       // 送らなかった発言は、会話の履歴から外して以後 Gemini に渡さない。直せるように入力欄へ戻す
+      lastUserTurn = null;
       state.messages = state.messages.filter((m) => m !== userMessage);
       const sentIndex = state.runTurnTexts.lastIndexOf(text);
       if (sentIndex >= 0) state.runTurnTexts[sentIndex] = '';
@@ -2356,11 +2471,17 @@ async function handleSendMessage(
     }
     pushMessage({ role: 'system', tone: 'warning', text: describeError(err) });
   } finally {
-    state.justChangedIds = [];
-    state.chatLoading = false;
-    renderStudio();
-    scrollToLatestMessage();
-    sendPendingIfReady();
+    if (!abortController.signal.aborted) {
+      if (activeUserSendAbort === abortController) {
+        activeUserSendAbort = null;
+      }
+      activeWorkLogTimers = [];
+      state.justChangedIds = [];
+      state.chatLoading = false;
+      renderStudio();
+      scrollToLatestMessage();
+      sendPendingIfReady();
+    }
   }
 }
 
@@ -2371,20 +2492,27 @@ async function handleSendMessage(
 async function speakOwner(
   req: Omit<OwnerLineRequest, 'history'>,
   afterMessage?: Omit<TimelineMessage, 'id'>,
+  signal?: AbortSignal,
 ): Promise<void> {
+  if (signal?.aborted) return;
   state.typingMessage = { role: 'owner' };
   renderStudio();
   scrollToLatestMessage();
   let text = req.fallback;
   try {
-    const data = await postJson<OwnerLineResponse>('/api/owner-line', {
-      ...req,
-      history: buildOwnerHistory(),
-    });
+    const data = await postJson<OwnerLineResponse>(
+      '/api/owner-line',
+      {
+        ...req,
+        history: buildOwnerHistory(),
+      },
+      signal,
+    );
     text = data.text || req.fallback;
   } catch {
     // 決まったせりふを使う
   }
+  if (signal?.aborted) return;
   if (state.typingMessage?.role === 'owner') state.typingMessage = undefined;
   const chunks = text ? splitIntoChatChunks(text) : [];
   const queued: QueuedMessage[] = chunks.map((chunk, i) => ({
@@ -2405,6 +2533,7 @@ async function speakOwner(
 /** 「お客さんの反応を見る」を押したとき、まず1人目のお客さんがどう思うかを予想する選択肢をチャットに出す */
 function handleRequestEvaluate(): void {
   if (state.evaluateLoading || !state.selectedCohortId || state.runFinished) return;
+  lastUserTurn = null;
   flushMessageQueue();
   const existing = [...state.messages].reverse().find((m) => m.predictionPrompt);
   if (existing && state.messages[state.messages.length - 1] === existing) {
@@ -2430,6 +2559,7 @@ function handleRequestEvaluate(): void {
 
 async function handleEvaluate(predictions?: Record<string, ReviewOutcome>): Promise<void> {
   if (state.evaluateLoading || !state.selectedCohortId) return;
+  lastUserTurn = null;
   flushMessageQueue();
   clearTransientChoiceMessages();
   if (!predictions) {
@@ -2452,6 +2582,7 @@ async function handleEvaluate(predictions?: Record<string, ReviewOutcome>): Prom
       currentSpec,
       cohortId: state.selectedCohortId,
       runId: state.runId,
+      turnCount: state.runTurnTexts.length,
       screenshotBase64,
       componentBounds,
       history: buildOwnerHistory(),
@@ -2795,9 +2926,7 @@ function renderActionChoiceRow(msg: TimelineMessage): HTMLElement | null {
     skipEvalBtn.addEventListener('click', () => {
       clearTransientChoiceMessages();
       renderStudio();
-      window.requestAnimationFrame(() => {
-        shellEl?.querySelector<HTMLInputElement>('.composer-input')?.focus();
-      });
+      focusComposerInput();
     });
     pillRow.appendChild(skipEvalBtn);
   }
@@ -2904,13 +3033,54 @@ function getRecipientPlaceholder(recipient: string): string {
   return 'お助けAIに手直しの指示や質問を入力（例：注文ボタンを動くように直して）';
 }
 
+const COMPOSER_TEXTAREA_MIN_HEIGHT_PX = 40;
+const COMPOSER_TEXTAREA_MAX_HEIGHT_PX = 112;
+let composerInitialMinHeightPx = COMPOSER_TEXTAREA_MIN_HEIGHT_PX;
+
+function syncComposerTextareaHeight(el: HTMLTextAreaElement): void {
+  el.style.minHeight = `${COMPOSER_TEXTAREA_MIN_HEIGHT_PX}px`;
+  el.style.height = 'auto';
+  const measured = el.scrollHeight;
+  if (!el.value && measured > composerInitialMinHeightPx) {
+    composerInitialMinHeightPx = Math.min(measured, COMPOSER_TEXTAREA_MAX_HEIGHT_PX);
+  }
+  const minHeight = Math.max(COMPOSER_TEXTAREA_MIN_HEIGHT_PX, composerInitialMinHeightPx);
+  const nextHeight = Math.min(Math.max(measured, minHeight), COMPOSER_TEXTAREA_MAX_HEIGHT_PX);
+  el.style.minHeight = `${minHeight}px`;
+  el.style.height = `${nextHeight}px`;
+  el.style.overflowY = measured > COMPOSER_TEXTAREA_MAX_HEIGHT_PX ? 'auto' : 'hidden';
+
+  const outerMinHeightPx = `${minHeight + 2}px`;
+  const wrapEl = el.closest<HTMLElement>('.composer-input-wrap');
+  if (wrapEl) {
+    wrapEl.style.minHeight = outerMinHeightPx;
+  }
+  const sendBtnEl = el
+    .closest<HTMLElement>('.composer-form-row')
+    ?.querySelector<HTMLElement>('.btn-composer-send');
+  if (sendBtnEl) {
+    sendBtnEl.style.minHeight = outerMinHeightPx;
+  }
+}
+
+function focusComposerInput(moveCursorToEnd = false): void {
+  window.requestAnimationFrame(() => {
+    const inputEl = shellEl?.querySelector<HTMLTextAreaElement>('.composer-input');
+    if (!inputEl) return;
+    syncComposerTextareaHeight(inputEl);
+    inputEl.focus();
+    if (moveCursorToEnd) {
+      const len = inputEl.value.length;
+      inputEl.setSelectionRange(len, len);
+    }
+  });
+}
+
 function selectRecipientAndFocus(recipient: string): void {
   if (!state.selectedCohortId) return;
   state.recipient = recipient;
   renderStudio();
-  window.requestAnimationFrame(() => {
-    shellEl?.querySelector<HTMLInputElement>('.composer-input')?.focus();
-  });
+  focusComposerInput();
 }
 
 function createBubble(className: string, text: string): HTMLElement {
@@ -3136,7 +3306,22 @@ function renderChatPanel(): HTMLElement {
     // 学習者の発言
     const row = document.createElement('div');
     row.className = 'chat-bubble-row is-user';
-    row.appendChild(createBubble(`chat-bubble is-user${enteringClass}`, msg.text));
+    const stack = document.createElement('div');
+    stack.className = 'user-bubble-stack';
+    stack.appendChild(createBubble(`chat-bubble is-user${enteringClass}`, msg.text));
+    if (canCancelOrUndoLastUserTurn() && lastUserTurn?.userMessageId === msg.id) {
+      const undoBtn = document.createElement('button');
+      undoBtn.type = 'button';
+      undoBtn.className = 'user-message-undo-btn is-selectable';
+      undoBtn.textContent = '取消';
+      undoBtn.title = '直前の発言を取り消して入力欄に戻す';
+      undoBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        handleCancelLastUserMessage();
+      });
+      stack.appendChild(undoBtn);
+    }
+    row.appendChild(stack);
     stream.appendChild(row);
   }
 
@@ -3295,14 +3480,44 @@ function renderChatPanel(): HTMLElement {
   formRow.className = 'composer-form-row';
   formRow.addEventListener('submit', (e) => {
     e.preventDefault();
+    if (sendBtn.classList.contains('is-cancel')) {
+      handleCancelLastUserMessage();
+      return;
+    }
     void handleSendMessage();
   });
 
   const inputWrap = document.createElement('div');
   inputWrap.className = `composer-input-wrap${state.isRecordingAudio ? ' is-recording' : ''}${state.isTranscribingAudio ? ' is-transcribing' : ''}${isCohortLocked ? ' is-locked' : ''}`;
 
-  const input = document.createElement('input');
-  input.type = 'text';
+  const sendBtn = document.createElement('button');
+  sendBtn.type = 'submit';
+  const syncSendButtonState = (): void => {
+    const canCancelLast =
+      canCancelOrUndoLastUserTurn() &&
+      !state.inputText.trim() &&
+      !state.isRecordingAudio &&
+      !state.isTranscribingAudio;
+    if (canCancelLast) {
+      sendBtn.className = 'btn-composer-send is-cancel';
+      sendBtn.disabled = false;
+      sendBtn.textContent = '取消';
+      sendBtn.title = '直前の送信を取り消して入力欄に戻す';
+    } else {
+      sendBtn.className = 'btn-composer-send';
+      sendBtn.disabled =
+        isCohortLocked ||
+        !state.inputText.trim() ||
+        state.isRecordingAudio ||
+        state.isTranscribingAudio;
+      sendBtn.textContent = '送信';
+      sendBtn.title = '';
+    }
+  };
+  syncSendButtonState();
+
+  const input = document.createElement('textarea');
+  input.rows = 1;
   input.className = 'composer-input';
   input.disabled = isCohortLocked;
   input.placeholder = isCohortLocked
@@ -3315,9 +3530,24 @@ function renderChatPanel(): HTMLElement {
         ? '音声から指示を整えています…'
         : getRecipientPlaceholder(state.recipient);
   input.value = state.inputText;
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      if (e.isComposing || e.keyCode === 229) return;
+      e.preventDefault();
+      if (
+        !isCohortLocked &&
+        state.inputText.trim() &&
+        !state.isRecordingAudio &&
+        !state.isTranscribingAudio
+      ) {
+        void handleSendMessage();
+      }
+    }
+  });
   input.addEventListener('input', () => {
     state.inputText = input.value;
-    sendBtn.disabled = !state.inputText.trim() || isCohortLocked;
+    syncComposerTextareaHeight(input);
+    syncSendButtonState();
     const switched = detectExplicitRecipientMention(state.inputText);
     if (switched && switched !== state.recipient) {
       state.recipient = switched;
@@ -3362,18 +3592,23 @@ function renderChatPanel(): HTMLElement {
 
   inputWrap.append(input, micBtn);
 
-  const sendBtn = document.createElement('button');
-  sendBtn.type = 'submit';
-  sendBtn.className = 'btn-composer-send';
-  sendBtn.disabled =
-    isCohortLocked || !state.inputText.trim() || state.isRecordingAudio || state.isTranscribingAudio;
-  sendBtn.textContent = '送信';
-
   formRow.append(inputWrap, sendBtn);
   if (state.pendingSend) {
     const note = document.createElement('div');
     note.className = 'composer-pending-note';
-    note.textContent = '返事が届いたら送ります';
+    const noteText = document.createElement('span');
+    noteText.textContent = '返事が届いたら送ります';
+    const cancelPendingBtn = document.createElement('button');
+    cancelPendingBtn.type = 'button';
+    cancelPendingBtn.className = 'composer-pending-cancel-btn';
+    cancelPendingBtn.textContent = '取消';
+    cancelPendingBtn.addEventListener('click', () => {
+      if (!state.pendingSend) return;
+      state.pendingSend = false;
+      renderStudio();
+      focusComposerInput(true);
+    });
+    note.append(noteText, cancelPendingBtn);
     composer.appendChild(note);
   }
   composer.appendChild(formRow);
@@ -3457,12 +3692,12 @@ function renderStudio(): void {
   const spec = getCurrentSpec();
 
   const activeEl = document.activeElement;
-  const focusedClass =
-    activeEl instanceof HTMLInputElement && activeEl.classList.contains('composer-input')
-      ? 'composer-input'
+  const focusedComposer =
+    activeEl instanceof HTMLTextAreaElement && activeEl.classList.contains('composer-input')
+      ? activeEl
       : null;
-  const selectionStart = activeEl instanceof HTMLInputElement ? activeEl.selectionStart : null;
-  const selectionEnd = activeEl instanceof HTMLInputElement ? activeEl.selectionEnd : null;
+  const selectionStart = focusedComposer ? focusedComposer.selectionStart : null;
+  const selectionEnd = focusedComposer ? focusedComposer.selectionEnd : null;
   const prevScrollTop = chatScrollEl ? chatScrollEl.scrollTop : 0;
 
   if (headerSlotEl) {
@@ -3625,6 +3860,10 @@ function renderStudio(): void {
     chatSlotEl.innerHTML = '';
     const chatPanel = renderChatPanel();
     chatSlotEl.appendChild(chatPanel);
+    const composerTextarea = chatPanel.querySelector<HTMLTextAreaElement>('.composer-input');
+    if (composerTextarea) {
+      syncComposerTextareaHeight(composerTextarea);
+    }
     if (chatScrollEl) {
       chatScrollEl.scrollTop = prevScrollTop;
     }
@@ -3663,8 +3902,8 @@ function renderStudio(): void {
     );
   }
 
-  if (focusedClass && shellEl) {
-    const nextInput = shellEl.querySelector<HTMLInputElement>(`.${focusedClass}`);
+  if (focusedComposer && shellEl) {
+    const nextInput = shellEl.querySelector<HTMLTextAreaElement>('.composer-input');
     if (nextInput) {
       nextInput.focus();
       if (selectionStart !== null && selectionEnd !== null) {
@@ -3680,6 +3919,10 @@ function renderStudio(): void {
 
 window.addEventListener('resize', () => {
   redrawPenCanvas();
+  const composerTextarea = shellEl?.querySelector<HTMLTextAreaElement>('.composer-input');
+  if (composerTextarea) {
+    syncComposerTextareaHeight(composerTextarea);
+  }
 });
 
 // 利用上の注意に同意してから、店長の紹介を始める。一度同意したブラウザでは、すぐに始める

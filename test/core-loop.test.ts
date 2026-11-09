@@ -1050,24 +1050,28 @@ describe('core-loop', () => {
     }
   });
 
-  it('明確なメンション・呼びかけだけ宛先を切り替え、文中に名前が入っているだけでは切り替えない', () => {
-    // 明確なメンション・呼びかけ
-    assert.equal(detectExplicitRecipientMention('店長、広告を消してもいい？'), 'owner');
+  it('@メンションのときだけ宛先を切り替え、文頭や文中に名前があるだけでは切り替えない', () => {
+    // 明示的な @ メンションのみ切り替える
     assert.equal(detectExplicitRecipientMention('@店長 定期便はどうする？'), 'owner');
-    assert.equal(detectExplicitRecipientMention('ねえ店長！売上って大事？'), 'owner');
-    assert.equal(detectExplicitRecipientMention('お客さん、どこで困ったの？'), 'customer');
+    assert.equal(detectExplicitRecipientMention('＠店長、広告を消してもいい？'), 'owner');
     assert.equal(detectExplicitRecipientMention('@お客さん 何が嫌だった？'), 'customer');
-    assert.equal(detectExplicitRecipientMention('目が遠いお客さん、文字は読めた？'), 'customer');
-    assert.equal(detectExplicitRecipientMention('お助けAI、注文ボタンを直して'), 'assistant');
+    assert.equal(detectExplicitRecipientMention('@目が遠いお客さん 文字は読めた？'), 'customer');
     assert.equal(detectExplicitRecipientMention('@お助けAI これ何の部品？'), 'assistant');
+    assert.equal(detectExplicitRecipientMention('＠お助けエージェント 直して'), 'assistant');
 
-    // 文中に名前が入っているだけ（第三者としての言及）では切り替えない
+    // @ なしで「店長」等を入力した途中や文中言及では切り替えない
     for (const msg of [
+      '店長',
+      '店長、広告を消してもいい？',
+      'ねえ店長！売上って大事？',
       '店長が付けた広告を消して',
       '店長の言ってる定期便って何？',
+      'お客さん',
+      'お客さん、どこで困ったの？',
       'お客さんはどこで困ったの？',
       '目が遠いお客さんが買えなかった原因を教えて',
       'お客さんの言ってるボタンを直して',
+      'お助けAI、注文ボタンを直して',
       'お助けAIに頼む前にどう思う？',
     ]) {
       assert.equal(detectExplicitRecipientMention(msg), null, msg);
@@ -2039,6 +2043,41 @@ describe('core-loop', () => {
     }
     const ownerFactsWithTarget = describeOwnerContext(initial, undefined, ['check-subscription']);
     assert.ok(ownerFactsWithTarget.some((f) => f.includes('赤ペンで指して聞いている部品')));
+
+    // 11. 誤送信を取り消して送り直したとき（同じ turnIndex の上書き・turnCount 指定）に、取り消した発言が集計に残らない
+    await recordPromptTelemetryEvent({
+      runId: 'run-undo-test',
+      cohortId: 'thrifty',
+      turnIndex: 0,
+      promptText: '間違えて送った質問',
+      sessionMode: 'explore',
+      recipient: 'owner',
+      hasPenAnnotation: false,
+    });
+    await recordPromptTelemetryEvent({
+      runId: 'run-undo-test',
+      cohortId: 'thrifty',
+      turnIndex: 1,
+      promptText: 'これも取り消す質問',
+      sessionMode: 'explore',
+      recipient: 'customer',
+      hasPenAnnotation: false,
+    });
+    // turnIndex: 0 から送り直した場合は turnIndex >= 0 の古い記録が置き換わる
+    await recordPromptTelemetryEvent({
+      runId: 'run-undo-test',
+      cohortId: 'thrifty',
+      turnIndex: 0,
+      promptText: '定期便を望む人だけが自分で選べるようにして',
+      sessionMode: 'execute',
+      recipient: 'assistant',
+      hasPenAnnotation: false,
+      changedComponentIds: ['check-subscription'],
+      removedNeededFeature: false,
+    });
+    const undoSummary = await finalizeTelemetryOnEvaluate('thrifty', 3, 3, 'run-undo-test', 1);
+    assert.equal(undoSummary.exploreTurns, 0);
+    assert.equal(undoSummary.executeTurns, 1);
   });
 
   it('お客さんの反応を見る前の予想と結果を突き合わせ、困りごとを見抜けたかも含めて振り返り文を作れる', () => {
