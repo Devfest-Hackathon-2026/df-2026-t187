@@ -141,6 +141,114 @@ function nameOf(comp: AppComponent | undefined, spec: AppSpec): string {
   return token(base || comp.id, MAX_LABEL_LENGTH);
 }
 
+/**
+ * 画面上の生のラベル文字列（「🎉会員限定🎉 500円OFF!!」など）ではなく、
+ * その部品が画面で果たしている役割・機能名（「クーポン広告のポップアップ」「注文確定ボタン」など）を返す。
+ */
+export function describeComponentFunctionName(comp: AppComponent): string {
+  const id = comp.id;
+  const label = comp.label ?? '';
+  const stateKey = comp.stateKey ?? '';
+
+  if (
+    id === 'popup-coupon' ||
+    /coupon/i.test(id) ||
+    /coupon|discount/i.test(stateKey) ||
+    /クーポン|OFF|割引/.test(label)
+  ) {
+    if (comp.type === 'popup') return 'クーポン広告のポップアップ';
+    if (comp.type === 'button') return 'クーポン適用のボタン';
+    return 'クーポンの選択欄';
+  }
+  if (id === 'popup-survey' || (comp.type === 'popup' && /アンケート/.test(label))) {
+    return comp.type === 'popup' ? 'アンケートのポップアップ' : 'アンケートの入力欄';
+  }
+  if (id === 'btn-order' || comp.role === 'primary_action') {
+    if (
+      comp.actions?.some(
+        (a) => a.type === 'set_state' && a.targetKey === 'step' && a.value === 'confirm',
+      )
+    ) {
+      return '確認画面へ進むボタン';
+    }
+    if (comp.visibleWhen?.stateKey === 'step' && comp.visibleWhen?.value === 'confirm') {
+      return '確認画面の注文確定ボタン';
+    }
+    return '注文確定ボタン';
+  }
+  if (id === 'btn-buy-now' || comp.role === 'decoy') {
+    return '今すぐ購入ボタン';
+  }
+  if (id === 'check-subscription' || stateKey === 'subscription' || /定期/.test(label)) {
+    return '定期便の選択欄';
+  }
+  if (
+    id === 'check-newsletter' ||
+    stateKey === 'newsletter' ||
+    /メルマガ|お知らせメール/.test(label)
+  ) {
+    return 'メルマガ登録の選択欄';
+  }
+  if (
+    id === 'banner-countdown' ||
+    comp.darkPattern === 'false_urgency' ||
+    /残り.*売り切れ|カウントダウン/.test(label)
+  ) {
+    return '売り切れカウントダウンの表示';
+  }
+  if (id === 'btn-clear-cart' || /カートを空/.test(label)) {
+    return 'カートを空にするボタン';
+  }
+  if (id === 'btn-cancel' || /注文をやめる|キャンセル/.test(label)) {
+    return '注文をやめるボタン';
+  }
+  if (id === 'product-card' || comp.type === 'product_card' || stateKey === 'quantity') {
+    return '商品と数量の選択欄';
+  }
+  if (id === 'heading-address') {
+    return 'お届け先の見出し';
+  }
+  if (id === 'choice-address' || stateKey === 'deliveryAddress') {
+    return 'お届け先の選択欄';
+  }
+  if (id === 'heading-payment') {
+    return 'お支払い方法の見出し';
+  }
+  if (id === 'choice-payment' || stateKey === 'paymentMethod') {
+    return 'お支払い方法の選択欄';
+  }
+  if (id === 'summary' || comp.type === 'summary') {
+    if (comp.visibleWhen?.stateKey === 'step' && comp.visibleWhen?.value === 'confirm') {
+      return '確認画面の注文内容表示';
+    }
+    return 'お支払い金額の内訳';
+  }
+  if (id === 'total-price' || comp.role === 'total') {
+    return '合計金額の表示';
+  }
+  if (id === 'note-shipping' || /別途送料/.test(label)) {
+    return '送料の注意書き';
+  }
+  if (id === 'input-signup' || stateKey === 'signupPassword' || /会員登録/.test(label)) {
+    return '会員登録パスワードの入力欄';
+  }
+  if (id === 'input-favorite-color' || stateKey === 'favoriteColor' || /アンケート/.test(label)) {
+    return 'アンケートの入力欄';
+  }
+  if (id === 'progress' || comp.type === 'progress_steps') {
+    return '注文手順ステップの表示';
+  }
+  if (comp.visibleWhen?.stateKey === 'step' && comp.visibleWhen?.value === 'confirm') {
+    if (comp.type === 'button') {
+      return comp.actions?.some((a) => a.type === 'complete_task')
+        ? '確認画面の注文確定ボタン'
+        : '入力画面へ戻るボタン';
+    }
+    return '確認画面の注文内容表示';
+  }
+  return TYPE_LABELS[comp.type] ?? '画面の部品';
+}
+
 function formatStateValue(val: StateValue, key?: string): string {
   if (typeof val === 'boolean') {
     if (key && /popup/i.test(key)) {

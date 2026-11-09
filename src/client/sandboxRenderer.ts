@@ -28,8 +28,10 @@ export interface SandboxCallbacks {
   onStatePatch: (patch: AppState) => void;
   /** スマホの中で起きたことのお知らせ。画面を邪魔しないよう、画面の外（チャット）に出す */
   onNotice: (message: string, type: 'info' | 'success' | 'warning') => void;
-  /** 改造の作業ログを流している間に光らせる部品 */
+  /** 改造の作業ログやシステムメッセージ内の部品名クリックで光らせる部品 */
   justChangedIds?: Set<string>;
+  /** スマホ画面の本文がスクロールしたときの通知（色ペンの丸囲み位置を追従させる用） */
+  onScroll?: () => void;
 }
 
 /**
@@ -133,8 +135,12 @@ function schedulePopups(
     clearPopupTimers();
     return;
   }
-  // ポップアップ以外の部品を赤ペンで囲んでいる最中は、閉じた広告が勝手に被さらないようにする
-  const hasNonPopupCircled = Array.from(selectedComponentIds).some((id) => {
+  // ポップアップ以外の部品を赤ペンで囲んでいる最中や、発言者が裏の部品を指し示している最中は、閉じた広告が勝手に被さらないようにする
+  const activeFocusIds = [
+    ...Array.from(selectedComponentIds),
+    ...Array.from(callbacks.justChangedIds ?? []),
+  ];
+  const hasNonPopupCircled = activeFocusIds.some((id) => {
     const comp = spec.components.find((c) => c.id === id);
     return comp && comp.type !== 'popup';
   });
@@ -1232,7 +1238,14 @@ function renderSandboxAppInner(
     body.scrollTop = 0;
     return;
   }
-  body.addEventListener('scroll', () => updateScrollHint(body), { passive: true });
+  body.addEventListener(
+    'scroll',
+    () => {
+      updateScrollHint(body);
+      callbacks.onScroll?.();
+    },
+    { passive: true },
+  );
   scheduleFit(iframeDoc ? iframe : null, targetDoc, body, previousScrollTop);
 }
 

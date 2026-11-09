@@ -31,6 +31,7 @@ import {
 } from '../shared/prediction.ts';
 import { ARCHETYPE_PUBLIC_LABELS, fillTurnRefs } from '../shared/promptTelemetry.ts';
 import { buildInitialSpec, buildScenarioSpec, type DifficultyLevel } from '../shared/theme.ts';
+import { describeComponentFunctionName } from '../shared/workSteps.ts';
 import type {
   AppSpec,
   ChatHistoryEntry,
@@ -138,8 +139,14 @@ interface StudioState {
   typingMessage?: Pick<TimelineMessage, 'role' | 'personaId'>;
   /** お助けエージェントが考え中に送ろうとした。返事が届いたら送る */
   pendingSend: boolean;
-  /** 改造の作業ログを流している間、スマホで光らせる部品 */
+  /** 改造の作業ログを流している間や指し示し中に、スマホで光らせる部品 */
   justChangedIds: string[];
+  /** お客さん・お助けAI・店長が指し示して色ペンで囲んでいる部品 */
+  speakerPointed?: {
+    componentIds: string[];
+    role: 'customer' | 'assistant' | 'owner';
+    startedAt: number;
+  } | null;
   /** 選んだ3人が全員達成してレポートを出したあと。やり直すまで手直しは受け付けない */
   runFinished: boolean;
   /** 1回の挑戦ごとの番号。客層を選ぶたび・やり直すたびに新しくする */
@@ -838,6 +845,7 @@ const state: StudioState = {
   typingMessage: undefined,
   pendingSend: false,
   justChangedIds: [],
+  speakerPointed: null,
   runFinished: false,
   runId: '',
   runTurnTexts: [],
@@ -1107,7 +1115,7 @@ function pushMessage(
     full.pointedComponentIds &&
     full.pointedComponentIds.length > 0
   ) {
-    highlightSandboxComponent(full.pointedComponentIds[0]);
+    highlightSandboxComponent(full.pointedComponentIds, full.role);
   }
   if (!options?.skipAutoTts) {
     playCloudTtsForMessage(full);
@@ -1437,6 +1445,189 @@ function collectComponentRects(container: HTMLElement): Rect2D[] {
   return clipToVisibleRects(rects, viewport);
 }
 
+const SPEAKER_PEN_COLORS: Record<'customer' | 'assistant' | 'owner', string> = {
+  customer: '#f97316', // お客さん：鮮やかなオレンジ
+  assistant: '#2563eb', // お助けAI：鮮やかな青
+  owner: '#16a34a', // 店長：鮮やかな緑
+};
+const USER_RED_PEN_COLOR = '#dc2626';
+
+const SPEAKER_PEN_HOLD_MS = 3600;
+const SPEAKER_PEN_FADE_MS = 1400;
+const SPEAKER_PEN_TOTAL_MS = SPEAKER_PEN_HOLD_MS + SPEAKER_PEN_FADE_MS;
+
+const USER_PEN_HOLD_HIT_MS = 2600;
+const USER_PEN_HOLD_MISS_MS = 450;
+const USER_PEN_FADE_MS = 1100;
+
+let speakerPenAnimFrame: number | null = null;
+let speakerPenWakeTimer: number | null = null;
+let userPenFinishedAt: number | null = null;
+let userPenAnimFrame: number | null = null;
+let userPenWakeTimer: number | null = null;
+let lastUserPenSnapshotBase64: string | undefined;
+
+function clearPenFadeTimers(): void {
+  if (speakerPenAnimFrame !== null) {
+    window.cancelAnimationFrame(speakerPenAnimFrame);
+    speakerPenAnimFrame = null;
+  }
+  if (speakerPenWakeTimer !== null) {
+    window.clearTimeout(speakerPenWakeTimer);
+    speakerPenWakeTimer = null;
+  }
+  if (userPenAnimFrame !== null) {
+    window.cancelAnimationFrame(userPenAnimFrame);
+    userPenAnimFrame = null;
+  }
+  if (userPenWakeTimer !== null) {
+    window.clearTimeout(userPenWakeTimer);
+    userPenWakeTimer = null;
+  }
+}
+
+function buildSpeakerLoopPoints(
+  rect: { left: number; top: number; right: number; bottom: number },
+  progress: number,
+  canvasWidth: number,
+  canvasHeight: number,
+  seedOffset = 0,
+): Point2D[] {
+  const pad = 10;
+  const safeLeft = Math.max(pad, rect.left);
+  const safeRight = Math.min(canvasWidth - pad, rect.right);
+  const safeTop = Math.max(pad, rect.top);
+  const safeBottom = Math.min(canvasHeight - pad, rect.bottom);
+  const cx = (safeLeft + safeRight) / 2;
+  const cy = (safeTop + safeBottom) / 2;
+  const hw = Math.max(20, (safeRight - safeLeft) / 2 + 4);
+  const hh = Math.max(16, (safeBottom - safeTop) / 2 + 4);
+  const totalSteps = 84;
+  const activeSteps = Math.max(2, Math.round(totalSteps * progress));
+  const startAngle = -Math.PI * 0.72 + seedOffset * 0.12;
+  const totalSweep = Math.PI * 2.32;
+  const pts: Point2D[] = [];
+
+  for (let i = 0; i <= activeSteps; i++) {
+    const u = i / totalSteps;
+    const angle = startAngle + u * totalSweep;
+    const cosA = Math.cos(angle);
+    const sinA = Math.sin(angle);
+    const nx = Math.sign(cosA) * Math.pow(Math.abs(cosA), 0.56);
+    const ny = Math.sign(sinA) * Math.pow(Math.abs(sinA), 0.56);
+    const wobble =
+      1 +
+      0.024 * Math.sin(angle * 2 + 0.8 + seedOffset) +
+      0.016 * Math.cos(angle * 3 - 0.5 + seedOffset);
+    const secondPassOffset = u > 0.78 ? (u - 0.78) * 18 : 0;
+    const rawX = cx + nx * (hw * wobble + secondPassOffset);
+    const rawY = cy + ny * (hh * wobble + secondPassOffset * 0.7);
+    pts.push({
+      x: Math.min(canvasWidth - pad, Math.max(pad, rawX)),
+      y: Math.min(canvasHeight - pad, Math.max(pad, rawY)),
+    });
+  }
+  return pts;
+}
+
+function traceSmoothPenPath(ctx: CanvasRenderingContext2D, pts: Point2D[]): void {
+  ctx.beginPath();
+  ctx.moveTo(pts[0].x, pts[0].y);
+  if (pts.length === 2) {
+    ctx.lineTo(pts[1].x, pts[1].y);
+    return;
+  }
+  for (let i = 1; i < pts.length - 1; i++) {
+    const midX = (pts[i].x + pts[i + 1].x) / 2;
+    const midY = (pts[i].y + pts[i + 1].y) / 2;
+    ctx.quadraticCurveTo(pts[i].x, pts[i].y, midX, midY);
+  }
+  const last = pts[pts.length - 1];
+  ctx.lineTo(last.x, last.y);
+}
+
+/**
+ * どんな背景色の上でもはっきり見分けられるよう、白縁＋影を下敷きにして太めの手書きマーカー線を描く。
+ * ユーザーの赤ペンと、お客さん・お助けAI・店長の色ペンで共通の描画スタイルを使う。
+ */
+function drawHighlightedPenPath(
+  ctx: CanvasRenderingContext2D,
+  pts: Point2D[],
+  color: string,
+  opacity = 1,
+): void {
+  if (pts.length < 2 || opacity <= 0.01) return;
+
+  ctx.save();
+  ctx.globalAlpha = opacity;
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.96)';
+  ctx.lineWidth = 10;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.shadowColor = `rgba(0, 0, 0, ${0.38 * opacity})`;
+  ctx.shadowBlur = 6;
+  ctx.shadowOffsetY = 1.5;
+  traceSmoothPenPath(ctx, pts);
+  ctx.stroke();
+  ctx.restore();
+
+  ctx.save();
+  ctx.globalAlpha = opacity;
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 5;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  traceSmoothPenPath(ctx, pts);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawSpeakerPenLoop(
+  ctx: CanvasRenderingContext2D,
+  rect: { left: number; top: number; right: number; bottom: number },
+  role: 'customer' | 'assistant' | 'owner',
+  progress: number,
+  opacity: number,
+  canvasWidth: number,
+  canvasHeight: number,
+  seedOffset = 0,
+): void {
+  const color = SPEAKER_PEN_COLORS[role];
+  const pts = buildSpeakerLoopPoints(rect, progress, canvasWidth, canvasHeight, seedOffset);
+  drawHighlightedPenPath(ctx, pts, color, opacity);
+}
+
+function resolveSpeakerTargetRect(
+  container: HTMLElement,
+  componentId: string,
+  collectedRects: Rect2D[],
+  canvasWidth: number,
+  canvasHeight: number,
+): { left: number; top: number; right: number; bottom: number } | null {
+  const matched = collectedRects.filter((r) => r.id === componentId);
+  if (matched.length > 0) {
+    return {
+      left: Math.min(...matched.map((r) => r.left)),
+      top: Math.min(...matched.map((r) => r.top)),
+      right: Math.max(...matched.map((r) => r.right)),
+      bottom: Math.max(...matched.map((r) => r.bottom)),
+    };
+  }
+  const el = querySandboxComponentElements(container).find(
+    (node) => node.dataset.componentId === componentId,
+  );
+  if (!el) return null;
+  const containerRect = container.getBoundingClientRect();
+  const r = el.getBoundingClientRect();
+  const isInsideIframe = el.ownerDocument !== document;
+  const left = Math.max(0, isInsideIframe ? r.left : r.left - containerRect.left);
+  const top = Math.max(0, isInsideIframe ? r.top : r.top - containerRect.top);
+  const right = Math.min(canvasWidth, isInsideIframe ? r.right : r.right - containerRect.left);
+  const bottom = Math.min(canvasHeight, isInsideIframe ? r.bottom : r.bottom - containerRect.top);
+  if (right - left < 8 || bottom - top < 8) return null;
+  return { left, top, right, bottom };
+}
+
 function redrawPenCanvas(): void {
   if (!penCanvasEl || !sandboxStageEl) return;
   const rect = sandboxStageEl.getBoundingClientRect();
@@ -1451,20 +1642,90 @@ function redrawPenCanvas(): void {
   if (!ctx) return;
   ctx.clearRect(0, 0, penCanvasEl.width, penCanvasEl.height);
 
+  // お客さん・お助けAI・店長が指し示している部品を、その人のペン色で手書き風に丸く囲み、時間経過でフェードアウトさせる
+  if (state.speakerPointed && state.speakerPointed.componentIds.length > 0) {
+    const elapsed = Math.max(0, performance.now() - state.speakerPointed.startedAt);
+    if (elapsed >= SPEAKER_PEN_TOTAL_MS) {
+      state.speakerPointed = null;
+      return;
+    }
+    const rawProgress = Math.min(1, elapsed / 380);
+    const easedProgress = Math.max(0.08, 1 - Math.pow(1 - rawProgress, 3));
+    const fadeProgress =
+      elapsed <= SPEAKER_PEN_HOLD_MS
+        ? 0
+        : Math.min(1, (elapsed - SPEAKER_PEN_HOLD_MS) / SPEAKER_PEN_FADE_MS);
+    const opacity = 0.5 * (1 + Math.cos(Math.PI * fadeProgress));
+
+    const collected = collectComponentRects(sandboxStageEl);
+    state.speakerPointed.componentIds.forEach((id, idx) => {
+      const targetRect = resolveSpeakerTargetRect(
+        sandboxStageEl!,
+        id,
+        collected,
+        penCanvasEl!.width,
+        penCanvasEl!.height,
+      );
+      if (!targetRect) return;
+      drawSpeakerPenLoop(
+        ctx,
+        targetRect,
+        state.speakerPointed!.role,
+        easedProgress,
+        opacity,
+        penCanvasEl!.width,
+        penCanvasEl!.height,
+        idx * 1.3,
+      );
+    });
+
+    if (elapsed < 600 || elapsed >= SPEAKER_PEN_HOLD_MS) {
+      if (speakerPenAnimFrame === null) {
+        speakerPenAnimFrame = window.requestAnimationFrame(() => {
+          speakerPenAnimFrame = null;
+          redrawPenCanvas();
+        });
+      }
+    } else if (speakerPenWakeTimer === null) {
+      speakerPenWakeTimer = window.setTimeout(() => {
+        speakerPenWakeTimer = null;
+        redrawPenCanvas();
+      }, Math.max(16, SPEAKER_PEN_HOLD_MS - elapsed));
+    }
+    return;
+  }
+
   if (state.penPoints.length < 2) return;
 
-  ctx.save();
-  ctx.strokeStyle = '#dc2626';
-  ctx.lineWidth = 4;
-  ctx.lineCap = 'round';
-  ctx.lineJoin = 'round';
-  ctx.beginPath();
-  ctx.moveTo(state.penPoints[0].x, state.penPoints[0].y);
-  for (let i = 1; i < state.penPoints.length; i++) {
-    ctx.lineTo(state.penPoints[i].x, state.penPoints[i].y);
+  let userOpacity = 1;
+  if (userPenFinishedAt !== null) {
+    const holdMs =
+      state.circledComponentIds.length > 0 ? USER_PEN_HOLD_HIT_MS : USER_PEN_HOLD_MISS_MS;
+    const totalMs = holdMs + USER_PEN_FADE_MS;
+    const elapsed = Math.max(0, performance.now() - userPenFinishedAt);
+    if (elapsed >= totalMs) {
+      state.penPoints = [];
+      userPenFinishedAt = null;
+      return;
+    }
+    if (elapsed > holdMs) {
+      const fadeProgress = Math.min(1, (elapsed - holdMs) / USER_PEN_FADE_MS);
+      userOpacity = 0.5 * (1 + Math.cos(Math.PI * fadeProgress));
+      if (userPenAnimFrame === null) {
+        userPenAnimFrame = window.requestAnimationFrame(() => {
+          userPenAnimFrame = null;
+          redrawPenCanvas();
+        });
+      }
+    } else if (userPenWakeTimer === null) {
+      userPenWakeTimer = window.setTimeout(() => {
+        userPenWakeTimer = null;
+        redrawPenCanvas();
+      }, Math.max(16, holdMs - elapsed));
+    }
   }
-  ctx.stroke();
-  ctx.restore();
+
+  drawHighlightedPenPath(ctx, state.penPoints, USER_RED_PEN_COLOR, userOpacity);
 }
 
 function attachPenEvents(canvas: HTMLCanvasElement, stage: HTMLElement): void {
@@ -1482,6 +1743,11 @@ function attachPenEvents(canvas: HTMLCanvasElement, stage: HTMLElement): void {
     if (state.interactionMode !== 'pen') return;
     drawing = true;
     canvas.setPointerCapture(e.pointerId);
+    clearPenFadeTimers();
+    userPenFinishedAt = null;
+    lastUserPenSnapshotBase64 = undefined;
+    state.speakerPointed = null;
+    state.justChangedIds = [];
     state.penPoints = [getLocalPoint(e)];
     redrawPenCanvas();
   });
@@ -1498,7 +1764,21 @@ function attachPenEvents(canvas: HTMLCanvasElement, stage: HTMLElement): void {
     const rects = collectComponentRects(stage);
     const hits = detectHitComponents(state.penPoints, rects);
     state.circledComponentIds = hits;
+    userPenFinishedAt = null;
     renderStudio();
+    redrawPenCanvas();
+    if (hits.length > 0 && sandboxStageEl) {
+      lastUserPenSnapshotBase64 = captureSandboxSnapshot(
+        getCurrentSpec(),
+        state.liveAppState,
+        sandboxStageEl,
+        penCanvasEl,
+      );
+    } else {
+      lastUserPenSnapshotBase64 = undefined;
+    }
+    userPenFinishedAt = performance.now();
+    redrawPenCanvas();
     // 囲めたら、お助けエージェントがその部品を受け止めて、どうしたいかを尋ねる
     if (hits.length > 0) void reactToCircle(hits);
   };
@@ -1568,6 +1848,8 @@ function pushNewCheckpoint(commitMessage: string, updatedSpec: AppSpec): void {
   state.penPoints = [];
   state.circledComponentIds = [];
   state.topicTargetIds = [];
+  state.justChangedIds = [];
+  state.speakerPointed = null;
   state.interactionMode = 'play';
 }
 
@@ -1621,6 +1903,8 @@ function handleRestartFromScratch(sameCohortId?: TargetCohortId): void {
   state.penPoints = [];
   state.circledComponentIds = [];
   state.topicTargetIds = [];
+  state.justChangedIds = [];
+  state.speakerPointed = null;
   pushMessage({ role: 'system', text: '画面を最初の状態に戻しました' });
   if (sameCohortId) {
     startCohort(sameCohortId);
@@ -1845,9 +2129,11 @@ async function reactToCircle(targetIds: string[]): Promise<void> {
   scrollToLatestMessage();
   try {
     const spec = getCurrentSpec();
-    const annotatedImageBase64 = sandboxStageEl
-      ? captureSandboxSnapshot(spec, state.liveAppState, sandboxStageEl, penCanvasEl)
-      : undefined;
+    const annotatedImageBase64 =
+      lastUserPenSnapshotBase64 ??
+      (sandboxStageEl
+        ? captureSandboxSnapshot(spec, state.liveAppState, sandboxStageEl, penCanvasEl)
+        : undefined);
     const data = await postJson<ChatResponse>('/api/chat', {
       currentSpec: spec,
       latestReviews: buildLatestReviewRecord(),
@@ -1927,14 +2213,28 @@ function startWorkLog(targetIds: string[]): TimelineMessage {
 
 let highlightClearTimer: number | null = null;
 
-/** システムメッセージの作業行や指し示しチップをクリックしたとき、スマホ内の該当部品を表示してスクロール・発光させる（赤ペン選択の代わりにはしない） */
-function highlightSandboxComponent(componentId: string): void {
+/**
+ * 発言やシステムメッセージ内の部品名・作業行が指し示すスマホ内の部品を表示し、
+ * 発言者の場合はそのペン色（お客さん＝オレンジ、お助けAI＝青、店長＝緑）で手書き風に丸く囲む。
+ * （手直しするには学習者自身が赤ペンで囲む必要があるため、circledComponentIds は変更しない）
+ */
+function highlightSandboxComponent(
+  componentIdOrIds: string | string[],
+  role?: 'customer' | 'assistant' | 'owner',
+): void {
+  const ids = Array.from(
+    new Set((Array.isArray(componentIdOrIds) ? componentIdOrIds : [componentIdOrIds]).filter(Boolean)),
+  ).slice(0, 1);
+  if (ids.length === 0) return;
+
   if (highlightClearTimer !== null) {
     window.clearTimeout(highlightClearTimer);
     highlightClearTimer = null;
   }
+  clearPenFadeTimers();
   const spec = getCurrentSpec();
-  const comp = spec.components.find((c) => c.id === componentId);
+  const primaryId = ids[0];
+  const comp = spec.components.find((c) => c.id === primaryId);
   if (comp) {
     if (comp.visibleWhen && comp.visibleWhen.operator === 'eq') {
       state.liveAppState = {
@@ -1958,21 +2258,28 @@ function highlightSandboxComponent(componentId: string): void {
       }
     }
   }
-  state.justChangedIds = [componentId];
+  state.justChangedIds = role ? [] : ids;
+  state.speakerPointed = role
+    ? {
+        componentIds: ids,
+        role,
+        startedAt: performance.now(),
+      }
+    : null;
   renderStudio();
   if (sandboxStageEl) {
     const el = querySandboxComponentElements(sandboxStageEl).find(
-      (node) => node.dataset.componentId === componentId,
+      (node) => node.dataset.componentId === primaryId,
     );
     el?.scrollIntoView({ behavior: 'smooth', block: 'center' });
   }
+  const durationMs = role ? SPEAKER_PEN_TOTAL_MS : 1800;
   highlightClearTimer = window.setTimeout(() => {
     highlightClearTimer = null;
-    if (state.justChangedIds.length === 1 && state.justChangedIds[0] === componentId) {
-      state.justChangedIds = [];
-      renderStudio();
-    }
-  }, 1800);
+    state.justChangedIds = [];
+    state.speakerPointed = null;
+    renderStudio();
+  }, durationMs);
 }
 
 /**
@@ -1994,6 +2301,7 @@ async function playWorkLog(
   } else {
     // 準備中の行は消して、実際に行った作業の行だけをシステムメッセージとして残す
     log.steps = [];
+    state.speakerPointed = null;
     for (const step of steps) {
       if (signal?.aborted) return;
       state.justChangedIds = step.componentId ? [step.componentId] : [];
@@ -2270,11 +2578,13 @@ async function handleSendMessage(
     : [...(targetIdsOverride ?? state.topicTargetIds)];
   state.topicTargetIds = targetIdsSnapshot;
   const history = buildChatHistory();
-  // 囲みを消す前に、赤ペン付きの画面を撮っておく
-  const annotatedImageBase64 =
-    hasPenAnnotation && sandboxStageEl
-      ? captureSandboxSnapshot(spec, state.liveAppState, sandboxStageEl, penCanvasEl)
-      : undefined;
+  // 囲みを消す前に、赤ペン付きの画面を撮っておく（手書き線がフェードアウト済みの場合は囲んだ直後の撮影を使う）
+  const annotatedImageBase64 = hasPenAnnotation
+    ? (lastUserPenSnapshotBase64 ??
+      (sandboxStageEl
+        ? captureSandboxSnapshot(spec, state.liveAppState, sandboxStageEl, penCanvasEl)
+        : undefined))
+    : undefined;
 
   const userMessage = pushMessage({
     role: 'user',
@@ -2289,6 +2599,8 @@ async function handleSendMessage(
     state.inputText = '';
   }
   state.penPoints = [];
+  userPenFinishedAt = null;
+  lastUserPenSnapshotBase64 = undefined;
   state.circledComponentIds = [];
 
   // チャットから「1つ前に戻して」「最初の画面に戻して」と指示されたときは、会話の流れを保ったまま即座に画面を戻す
@@ -2457,7 +2769,7 @@ async function handleSendMessage(
         state.topicTargetIds = [...targetIdsSnapshot];
       }
       if (data.pointedComponentIds?.length) {
-        highlightSandboxComponent(data.pointedComponentIds[0]);
+        highlightSandboxComponent(data.pointedComponentIds, 'owner');
       }
       state.chatLoading = false;
       const chunks = splitIntoChatChunks(data.reply);
@@ -2480,7 +2792,7 @@ async function handleSendMessage(
         state.topicTargetIds = [...targetIdsSnapshot];
       }
       if (data.pointedComponentIds?.length) {
-        highlightSandboxComponent(data.pointedComponentIds[0]);
+        highlightSandboxComponent(data.pointedComponentIds, 'customer');
       }
       state.chatLoading = false;
       const replies =
@@ -2521,7 +2833,7 @@ async function handleSendMessage(
         state.topicTargetIds = [...targetIdsSnapshot];
       }
       if (data.pointedComponentIds?.length) {
-        highlightSandboxComponent(data.pointedComponentIds[0]);
+        highlightSandboxComponent(data.pointedComponentIds, 'assistant');
       }
       const replyChunks = splitIntoChatChunks(data.reply);
       const [firstChunk, ...restChunks] = replyChunks;
@@ -2583,7 +2895,9 @@ async function handleSendMessage(
         activeUserSendAbort = null;
       }
       activeWorkLogTimers = [];
-      state.justChangedIds = [];
+      if (!state.speakerPointed) {
+        state.justChangedIds = [];
+      }
       state.chatLoading = false;
       renderStudio();
       scrollToLatestMessage();
@@ -2622,6 +2936,9 @@ async function speakOwner(
   }
   if (signal?.aborted) return;
   if (state.typingMessage?.role === 'owner') state.typingMessage = undefined;
+  if (pointedComponentIds && pointedComponentIds.length > 0) {
+    highlightSandboxComponent(pointedComponentIds, 'owner');
+  }
   const chunks = text ? splitIntoChatChunks(text) : [];
   const queued: QueuedMessage[] = chunks.map((chunk, i) => ({
     message: {
@@ -3216,34 +3533,52 @@ function createTypingBubble(className: string, label: string): HTMLElement {
 }
 
 /**
- * 発言が指し示しているスマホ上の部品チップを作る。
- * クリックするとスマホ画面のその部品を表示・ハイライトする（手直しには赤ペンで囲む必要がある）。
+ * 発言者が気にしているスマホ上の部品を、システムメッセージ行として描画する。
+ * 例: `時間のないお客さん` は `クーポン広告のポップアップ` を気にしています
+ * 部品名のトークンをクリックすると、スマホ画面のその部品を表示し、発言者のペン色で丸く囲む。
  */
-function createPointedComponentChips(componentIds: string[] | undefined): HTMLElement | null {
+function createPointedSystemRow(
+  speakerName: string,
+  componentIds: string[] | undefined,
+  role: 'customer' | 'assistant' | 'owner',
+  isEntering: boolean,
+): HTMLElement | null {
   if (!componentIds || componentIds.length === 0) return null;
   const spec = getCurrentSpec();
-  const validComps = Array.from(new Set(componentIds))
+  const comp = Array.from(new Set(componentIds))
     .map((id) => spec.components.find((c) => c.id === id))
-    .filter((c): c is AppSpec['components'][number] => Boolean(c));
-  if (validComps.length === 0) return null;
+    .find((c): c is AppSpec['components'][number] => Boolean(c));
+  if (!comp) return null;
 
-  const wrap = document.createElement('div');
-  wrap.className = 'pointed-comp-chips';
-  for (const comp of validComps) {
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = 'pointed-comp-chip is-selectable';
-    const rawLabel = comp.label.replace(/\{[^}]+\}/g, '').trim() || comp.id;
-    const shortLabel = rawLabel.length > 18 ? `${rawLabel.slice(0, 18)}…` : rawLabel;
-    btn.textContent = `📍 ${shortLabel}`;
-    btn.title = 'クリックするとスマホ画面のこの部品を表示して光らせます（手直しするときは赤ペンで囲んでください）';
-    btn.addEventListener('click', (e) => {
-      e.stopPropagation();
-      highlightSandboxComponent(comp.id);
-    });
-    wrap.appendChild(btn);
-  }
-  return wrap;
+  const funcName = describeComponentFunctionName(comp);
+  const row = document.createElement('div');
+  row.className = `chat-system-row${isEntering ? ' is-entering' : ''}`;
+
+  const line = document.createElement('div');
+  line.className = 'chat-system-line';
+
+  const speakerToken = document.createElement('code');
+  speakerToken.className = 'chat-system-token';
+  speakerToken.textContent = speakerName;
+
+  const compBtn = document.createElement('button');
+  compBtn.type = 'button';
+  compBtn.className = 'chat-system-token is-comp-link is-selectable';
+  compBtn.textContent = funcName;
+  compBtn.title = 'クリックするとスマホ画面のこの部品を表示してペンで囲みます（手直しするときは赤ペンで囲んでください）';
+  compBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    highlightSandboxComponent([comp.id], role);
+  });
+
+  line.append(
+    speakerToken,
+    document.createTextNode(' は '),
+    compBtn,
+    document.createTextNode(' を気にしています'),
+  );
+  row.appendChild(line);
+  return row;
 }
 
 /**
@@ -3405,11 +3740,10 @@ function renderChatPanel(): HTMLElement {
     // お客さんの発言：アイコンと名前つきの吹き出し
     if (msg.role === 'customer') {
       const persona = findPersona(msg.personaId);
+      const speakerName = persona?.name ?? 'お客さん';
       const outcomeClass = msg.review ? ` is-${msg.review.outcome}` : '';
       const bubble = createBubble(`chat-bubble is-customer${outcomeClass}${enteringClass}`, msg.text);
       const extras: HTMLElement[] = [];
-      const pointedChips = createPointedComponentChips(msg.pointedComponentIds);
-      if (pointedChips) extras.push(pointedChips);
       if (msg.review?.predictedOutcome) {
         const badgeInfo = formatPredictionBadgeText(msg.review.predictedOutcome, msg.review.outcome);
         const badge = document.createElement('div');
@@ -3421,37 +3755,63 @@ function renderChatPanel(): HTMLElement {
         createSpeakerRow(
           'customer',
           persona?.icon ?? '客',
-          persona?.name ?? 'お客さん',
+          speakerName,
           bubble,
           extras,
           isContinuation,
           'customer',
         ),
       );
+      const pointedSystemRow = createPointedSystemRow(
+        speakerName,
+        msg.pointedComponentIds,
+        'customer',
+        isFirstSeen,
+      );
+      if (pointedSystemRow) {
+        stream.appendChild(pointedSystemRow);
+        prevSpeakerKey = 'system';
+      }
       continue;
     }
 
     // 店長の発言
     if (msg.role === 'owner') {
       const bubble = createBubble(`chat-bubble is-owner${enteringClass}`, msg.text);
-      const extras: HTMLElement[] = [];
-      const pointedChips = createPointedComponentChips(msg.pointedComponentIds);
-      if (pointedChips) extras.push(pointedChips);
       stream.appendChild(
-        createSpeakerRow('owner', OWNER.icon, OWNER.name, bubble, extras, isContinuation, 'owner'),
+        createSpeakerRow('owner', OWNER.icon, OWNER.name, bubble, [], isContinuation, 'owner'),
       );
+      const pointedSystemRow = createPointedSystemRow(
+        OWNER.name,
+        msg.pointedComponentIds,
+        'owner',
+        isFirstSeen,
+      );
+      if (pointedSystemRow) {
+        stream.appendChild(pointedSystemRow);
+        prevSpeakerKey = 'system';
+      }
       continue;
     }
 
     // お助けエージェントの発言：進行案内・質問回答・改造完了の報告
     if (msg.role === 'assistant') {
       const bubble = createBubble(`chat-bubble is-agent${enteringClass}`, msg.text);
-      const extras: HTMLElement[] = [];
-      const pointedChips = createPointedComponentChips(msg.pointedComponentIds);
-      if (pointedChips) extras.push(pointedChips);
       stream.appendChild(
-        createSpeakerRow('agent', AGENT_ICON, AGENT_NAME, bubble, extras, isContinuation, 'assistant'),
+        createSpeakerRow('agent', AGENT_ICON, AGENT_NAME, bubble, [], isContinuation, 'assistant'),
       );
+      if (!msg.circleReaction) {
+        const pointedSystemRow = createPointedSystemRow(
+          AGENT_NAME,
+          msg.pointedComponentIds,
+          'assistant',
+          isFirstSeen,
+        );
+        if (pointedSystemRow) {
+          stream.appendChild(pointedSystemRow);
+          prevSpeakerKey = 'system';
+        }
+      }
       continue;
     }
 
@@ -4026,7 +4386,7 @@ function renderStudio(): void {
     spec,
     liveAppState: state.liveAppState,
     circled: state.circledComponentIds,
-    // 作業ログの行を押したときに部品を光らせるため、光らせる部品が変わったときも描き直す
+    // 作業ログの行やシステムメッセージ内の部品名を押したときに部品を光らせるため、光らせる部品が変わったときも描き直す
     justChanged: state.justChangedIds,
   });
   if (sandboxAppMountEl && nextSandboxKey !== lastSandboxRenderKey) {
@@ -4050,6 +4410,7 @@ function renderStudio(): void {
           renderStudio();
         },
         onNotice: (msg, t) => postSandboxNotice(msg, t),
+        onScroll: () => redrawPenCanvas(),
       },
     );
   }

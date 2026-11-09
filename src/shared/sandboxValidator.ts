@@ -620,24 +620,23 @@ export function simulatePersonaComputerUse(
     reason: FailureReason,
     componentIds: string[] = lastFailureComponentIds,
   ): ComputerUseSimulationResult => {
-    const extraIds =
+    // 1人が同時に複数箇所を指摘すると分かりにくいため、その離脱の直接の原因になった1箇所だけに絞る
+    const primaryCandidates =
       reason === 'too_many_steps' || reason === 'timeout'
-        ? [...Array.from(triedDecoyIds), ...bothers.flatMap((b) => b.componentIds)]
-        : reason === 'no_confirmation'
-          ? [
-              ...Array.from(triedDecoyIds),
-              ...bothers
-                .filter((b) => b.friction === '残り時間で急かされた')
-                .flatMap((b) => b.componentIds),
-            ]
-          : [];
+        ? [
+            ...Array.from(triedDecoyIds),
+            ...bothers.flatMap((b) => b.componentIds),
+            ...componentIds,
+          ]
+        : componentIds;
+    const singleId = primaryCandidates.find(Boolean);
     return {
       outcome: 'abandoned',
       frictionPoint: FAILURE_TEXT[reason].friction,
       simulatedComment: FAILURE_TEXT[reason].comment,
       actionTrace,
       appliedConstraintNote,
-      frictionComponentIds: Array.from(new Set([...extraIds, ...componentIds].filter(Boolean))),
+      frictionComponentIds: singleId ? [singleId] : [],
     };
   };
 
@@ -1097,7 +1096,7 @@ export function simulatePersonaComputerUse(
           simulatedComment: `注文はできたけど、あとで${activeTraps[0].label}になっていたと気づいた`,
           actionTrace,
           appliedConstraintNote,
-          frictionComponentIds: activeTraps.map((t) => t.id),
+          frictionComponentIds: [activeTraps[0].id],
           finalState: state,
         };
       }
@@ -1146,13 +1145,14 @@ export function simulatePersonaComputerUse(
         }
       }
       if (bothers.length > 0) {
+        const primaryBotherId = bothers[0].componentIds.find(Boolean);
         return {
           outcome: 'bothered',
           frictionPoint: bothers[0].friction,
           simulatedComment: `買えたけど、${bothers[0].comment}`,
           actionTrace,
           appliedConstraintNote,
-          frictionComponentIds: Array.from(new Set(bothers.flatMap((b) => b.componentIds).filter(Boolean))),
+          frictionComponentIds: primaryBotherId ? [primaryBotherId] : [],
           finalState: state,
         };
       }

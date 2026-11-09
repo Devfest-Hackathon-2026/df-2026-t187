@@ -97,6 +97,7 @@ import {
   toFirestoreTelemetryFields,
 } from '../src/server/store.ts';
 import { buildInitialSpec, buildScenarioSpec, findComponent } from '../src/shared/theme.ts';
+import { describeComponentFunctionName } from '../src/shared/workSteps.ts';
 import { readFileSync } from 'node:fs';
 import {
   clearCustomProfileMemoryCache,
@@ -2690,14 +2691,11 @@ describe('任意の選択欄と押しやすいチェック欄', () => {
     };
     const kentaAfterPopupFix = simulatePersonaComputerUse(salesPushFixedOrderAndPopup, persona('kenta'));
     assert.equal(kentaAfterPopupFix.outcome, 'abandoned');
-    assert.ok(kentaAfterPopupFix.frictionComponentIds.includes('btn-buy-now'));
-    assert.ok(kentaAfterPopupFix.frictionComponentIds.includes('btn-order'));
+    assert.deepEqual(kentaAfterPopupFix.frictionComponentIds, ['btn-buy-now']);
 
     const harueAfterPopupFix = simulatePersonaComputerUse(salesPushFixedOrderAndPopup, persona('harue'));
     assert.equal(harueAfterPopupFix.outcome, 'abandoned');
-    assert.ok(harueAfterPopupFix.frictionComponentIds.includes('banner-countdown'));
-    assert.ok(harueAfterPopupFix.frictionComponentIds.includes('btn-buy-now'));
-    assert.ok(harueAfterPopupFix.frictionComponentIds.includes('btn-order'));
+    assert.deepEqual(harueAfterPopupFix.frictionComponentIds, ['btn-order']);
 
     // 5. 画面上に存在する部品の手直し・削除には赤ペン囲みを必須とし、削除済み部品の復活だけ赤ペンなしでも許可する
     assert.equal(canApplyWithoutRedPen(salesPush, '500円OFFの広告ポップアップを消してください'), false);
@@ -2708,6 +2706,32 @@ describe('任意の選択欄と押しやすいチェック欄', () => {
     assert.equal(
       canApplyWithoutRedPen(salesPushFixedOrderAndPopup, 'さっき消したクーポンをその場で使えるように戻して'),
       true,
+    );
+
+    // 6. 部品の言及表示では生のラベル文言ではなく機能名を返す
+    assert.equal(
+      describeComponentFunctionName(findComponent(salesPush, 'popup-coupon')),
+      'クーポン広告のポップアップ',
+    );
+    assert.equal(
+      describeComponentFunctionName(findComponent(salesPush, 'btn-order')),
+      '注文確定ボタン',
+    );
+    assert.equal(
+      describeComponentFunctionName(findComponent(salesPush, 'btn-buy-now')),
+      '今すぐ購入ボタン',
+    );
+    assert.equal(
+      describeComponentFunctionName(findComponent(salesPush, 'check-subscription')),
+      '定期便の選択欄',
+    );
+    assert.equal(
+      describeComponentFunctionName(findComponent(salesPush, 'product-card')),
+      '商品と数量の選択欄',
+    );
+    assert.equal(
+      describeComponentFunctionName(findComponent(salesPush, 'banner-countdown')),
+      '売り切れカウントダウンの表示',
     );
   });
 });

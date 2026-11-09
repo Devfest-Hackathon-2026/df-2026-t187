@@ -494,8 +494,9 @@ async function voiceCohortCustomers(
       latestForPersona?.frictionComponentIds && latestForPersona.frictionComponentIds.length > 0
         ? latestForPersona.frictionComponentIds
         : sim.frictionComponentIds;
-    const pointedComponentIds =
-      req.targetComponentIds.length > 0 ? req.targetComponentIds : frictionIds;
+    const pointedComponentIds = (
+      req.targetComponentIds.length > 0 ? req.targetComponentIds : frictionIds
+    ).slice(0, 1);
     const frictionLabels = frictionIds
       .map((id) => req.currentSpec.components.find((c) => c.id === id)?.label)
       .filter((l): l is string => Boolean(l));
@@ -594,7 +595,7 @@ function formatLatestReviews(record: LatestReviewRecord | undefined): string {
   const lines = record.reviews.map((r) => {
     const compNote =
       r.frictionComponentIds && r.frictionComponentIds.length > 0
-        ? ` [つまずいた部品ID: ${r.frictionComponentIds.join(', ')}]`
+        ? ` [${r.outcome === 'achieved' ? '満足した部品ID' : 'つまずいた部品ID'}: ${r.frictionComponentIds.join(', ')}]`
         : '';
     return `${r.name}: ${OUTCOME_LABELS[r.outcome]}${compNote}\n${r.actionTrace.map((t) => `  ${t}`).join('\n')}`;
   });
@@ -1859,7 +1860,7 @@ async function buildRequireRedPenResponse(
     intent: 'clarify',
     reply,
     suggestedFollowUps: [],
-    pointedComponentIds: pointedIds,
+    pointedComponentIds: pointedIds.slice(0, 1),
     telemetryEvent,
   };
 }
@@ -2083,7 +2084,7 @@ export async function chatWithStudio(req: ChatRequest): Promise<ChatResponse> {
       intent: 'owner',
       reply: owner.text || OWNER_REPLY_FALLBACK,
       suggestedFollowUps: [],
-      pointedComponentIds: fallbackOwnerIds,
+      pointedComponentIds: fallbackOwnerIds.slice(0, 1),
       telemetryEvent,
     };
   }
@@ -2092,7 +2093,7 @@ export async function chatWithStudio(req: ChatRequest): Promise<ChatResponse> {
       voiceCohortCustomers(effectiveReq),
       recordPromptTelemetryEvent({
         cohortId: effectiveReq.cohortId,
-        runId: effectiveReq.runId,
+        runId: effectiveReq.cohortId ? effectiveReq.runId : undefined,
         turnIndex: effectiveReq.turnIndex,
         shareForAggregate: effectiveReq.shareForAggregate,
         promptText: effectiveReq.userMessage,
@@ -2104,7 +2105,7 @@ export async function chatWithStudio(req: ChatRequest): Promise<ChatResponse> {
     ]);
     const allCustomerPointedIds = Array.from(
       new Set(customerReplies.flatMap((r) => r.pointedComponentIds ?? [])),
-    );
+    ).slice(0, 1);
     return {
       intent: 'customer',
       customerPersonaId: customerReplies[0]?.personaId,
@@ -2280,7 +2281,7 @@ export async function chatWithStudio(req: ChatRequest): Promise<ChatResponse> {
     intent: parsed.intent === 'unclear' ? 'clarify' : 'explain',
     reply: cleanJapaneseText(parsed.reply, 'どこをどう変えたいか教えてください'),
     suggestedFollowUps: filteredFollowUps,
-    pointedComponentIds: [...pointedIds],
+    pointedComponentIds: [...pointedIds].slice(0, 1),
     telemetryEvent,
   };
 }

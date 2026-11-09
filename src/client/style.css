@@ -581,14 +581,16 @@ body {
   transition: outline-color 140ms ease;
 }
 
-.sandbox-comp-item.is-just-changed {
+.sandbox-comp-item.is-just-changed,
+.inapp-popup-card.is-just-changed {
   outline: 2.5px solid #2563eb;
   outline-offset: 0.2rem;
   border-radius: 1rem;
   box-shadow: 0 0 0 0.45rem rgba(37, 99, 235, 0.18);
 }
 
-.sandbox-comp-item.is-circled-target {
+.sandbox-comp-item.is-circled-target,
+.inapp-popup-card.is-circled-target {
   outline: 2.5px solid var(--accent-red);
   outline-offset: 0.2rem;
   border-radius: 1rem;
@@ -1363,6 +1365,27 @@ body {
   color: var(--accent-blue);
 }
 
+.chat-system-token.is-comp-link {
+  cursor: pointer;
+  color: var(--accent-blue);
+  background: #eff6ff;
+  border-color: rgba(37, 99, 235, 0.35);
+  transition:
+    background-color 140ms ease,
+    border-color 140ms ease,
+    transform 120ms ease;
+}
+
+.chat-system-token.is-comp-link:hover {
+  background: #dbeafe;
+  border-color: #60a5fa;
+  transform: translateY(-1px);
+}
+
+.chat-system-token.is-comp-link:active {
+  transform: translateY(0);
+}
+
 .chat-system-line.is-warning {
   color: #92400e;
 }
@@ -1425,42 +1448,6 @@ body {
   gap: 3px;
   min-width: 0;
   max-width: 90%;
-}
-
-.pointed-comp-chips {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 5px;
-  margin-top: 2px;
-}
-
-.pointed-comp-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  font-family: inherit;
-  font-size: 0.72rem;
-  font-weight: 800;
-  color: #1e40af;
-  background: #eff6ff;
-  border: 1px solid #bfdbfe;
-  border-radius: 999px;
-  padding: 2px 9px;
-  cursor: pointer;
-  transition:
-    background 0.14s ease,
-    border-color 0.14s ease,
-    transform 0.12s ease;
-}
-
-.pointed-comp-chip:hover {
-  background: #dbeafe;
-  border-color: #93c5fd;
-  transform: translateY(-1px);
-}
-
-.pointed-comp-chip:active {
-  transform: translateY(0);
 }
 
 /* 作戦カードを載せるため、エージェントの吹き出しは広めにとる */
