@@ -700,7 +700,6 @@ export const COFFEE_BEANS_THEME: ThemeDefinition = {
   owner: {
     name: '店長',
     icon: '店',
-    afterCohortLine: '{cohort}か。じゃあ、そのお客さんたちに来てもらおう',
     metrics: [
       { label: '定期便', stateKey: 'subscription', countWhen: true, reportWhenMissing: true },
       { label: '会員登録', stateKey: 'signupPassword', countWhen: 'filled' },

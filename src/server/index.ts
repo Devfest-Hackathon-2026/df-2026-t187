@@ -2,6 +2,7 @@ import { existsSync, readFileSync, statSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { extname, join, normalize, resolve, sep } from 'node:path';
 import { handleApiRequest } from './api.ts';
+import { COMMON_SECURITY_HEADERS } from './rateLimit.ts';
 
 const PORT = Number(process.env.PORT || 8080);
 const DIST_DIR = resolve(process.cwd(), 'dist');
@@ -20,10 +21,8 @@ const MIME_TYPES: Record<string, string> = {
 };
 
 const SECURITY_HEADERS: Record<string, string> = {
-  'X-Content-Type-Options': 'nosniff',
+  ...COMMON_SECURITY_HEADERS,
   'X-Frame-Options': 'SAMEORIGIN',
-  'X-Robots-Tag': 'noindex, nofollow, noarchive',
-  'Referrer-Policy': 'strict-origin-when-cross-origin',
   'Content-Security-Policy':
     "default-src 'self'; img-src 'self' data: blob:; media-src 'self' data: blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; connect-src 'self'; frame-ancestors 'self'; object-src 'none'; base-uri 'self'; form-action 'self'",
 };

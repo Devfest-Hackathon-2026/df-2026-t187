@@ -11,7 +11,7 @@ export const TARGET_COHORTS: TargetCohortInfo[] = ACTIVE_THEME.cohorts;
 export const ALL_REVIEWER_PERSONAS: ReviewerPersona[] = ACTIVE_THEME.personas;
 
 /** 顧客層が未選択のときにレビューする代表3人 */
-export const INITIAL_REVIEWERS: ReviewerPersona[] = ACTIVE_THEME.defaultReviewerIds.map((id) => {
+const INITIAL_REVIEWERS: ReviewerPersona[] = ACTIVE_THEME.defaultReviewerIds.map((id) => {
   const persona = ALL_REVIEWER_PERSONAS.find((p) => p.id === id);
   if (!persona) throw new Error(`代表レビュアーが見つかりません: ${id}`);
   return persona;

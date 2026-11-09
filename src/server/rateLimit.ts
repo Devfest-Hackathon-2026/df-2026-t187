@@ -215,6 +215,14 @@ const LARGE_BODY_PATHS = new Set(['/api/chat', '/api/apply', '/api/evaluate', '/
 export const LARGE_BODY_BYTES = 2 * 1024 * 1024;
 export const SMALL_BODY_BYTES = 16 * 1024;
 
+/** 静的配信と API 応答で共通して付与するセキュリティヘッダー */
+export const COMMON_SECURITY_HEADERS: Record<string, string> = {
+  'X-Content-Type-Options': 'nosniff',
+  'X-Robots-Tag': 'noindex, nofollow, noarchive',
+  'Referrer-Policy': 'strict-origin-when-cross-origin',
+  'Permissions-Policy': 'camera=(), geolocation=(), payment=(), usb=()',
+};
+
 export function maxBodyBytesFor(path: string): number {
   return LARGE_BODY_PATHS.has(path) ? LARGE_BODY_BYTES : SMALL_BODY_BYTES;
 }

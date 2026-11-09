@@ -702,7 +702,9 @@ function renderSandboxAppInner(
     const templated = sanitizeCustomHtml(renderTemplate(rawHtml, liveState, comp.style.numberFormat));
     wrapper.innerHTML = templated;
     wrapper
-      .querySelectorAll('script, style, iframe, object, embed, applet, meta, link, base, form')
+      .querySelectorAll(
+        'script, style, iframe, object, embed, applet, meta, link, base, form, noscript, template',
+      )
       .forEach((node) => node.remove());
     wrapper.querySelectorAll('*').forEach((node) => {
       for (const attr of Array.from(node.attributes)) {
@@ -721,12 +723,15 @@ function renderSandboxAppInner(
         if (
           attrName.startsWith('on') ||
           attrName === 'srcdoc' ||
+          attrName === 'ping' ||
           ((attrName === 'href' ||
             attrName === 'src' ||
             attrName === 'srcset' ||
             attrName === 'xlink:href' ||
             attrName === 'action' ||
-            attrName === 'formaction') &&
+            attrName === 'formaction' ||
+            attrName === 'poster' ||
+            attrName === 'background') &&
             (attrVal.startsWith('javascript:') ||
               attrVal.startsWith('vbscript:') ||
               (attrVal.startsWith('data:') && !isSafeDataImage)))

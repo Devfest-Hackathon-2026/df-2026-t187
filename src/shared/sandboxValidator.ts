@@ -7,11 +7,14 @@ import {
   isHonestOptInComponent,
   isInputFilled,
   matchesCondition,
-  parseSetStateAttribute,
   renderLabel,
   withDerivedValues,
   type AppState,
 } from './appRuntime.ts';
+import {
+  parseCustomHtmlActions,
+  TAP_HEIGHT_BY_SIZE as HEIGHT_BY_SIZE,
+} from './customComponentProfile.ts';
 import type {
   AppComponent,
   AppSpec,
@@ -46,11 +49,13 @@ export function sanitizeCssColor(raw: string | undefined, fallback: string): str
 export function sanitizeCustomCss(raw: string | undefined): string {
   if (!raw) return '';
   return raw
-    .replace(/\/\*[\s\S]*?\*\//g, '')
-    .replace(/@import\b[^;]*;?/gi, '')
-    .replace(/url\s*\([^)]*\)/gi, 'none')
-    .replace(/expression\s*\([^)]*\)/gi, 'none')
-    .replace(/(?:behavior|-moz-binding)\s*:[^;]+;?/gi, '')
+    .slice(0, 4000)
+    .replace(/\/\*[\s\S]*?(?:\*\/|$)/g, '')
+    .replace(/\\/g, '')
+    .replace(/@(?:import|charset|namespace)\b[^;{}]*;?/gi, '')
+    .replace(/url\s*\([^)]*\)?/gi, 'none')
+    .replace(/expression\s*\([^)]*\)?/gi, 'none')
+    .replace(/(?:behavior|-moz-binding)\s*:[^;{}]+;?/gi, '')
     .replace(/(?:javascript|vbscript|data)\s*:/gi, '')
     .replace(/[<>]/g, '')
     .trim();
@@ -61,12 +66,20 @@ export function sanitizeCustomCss(raw: string | undefined): string {
  */
 export function sanitizeCustomHtml(raw: string): string {
   return raw
-    .replace(/<(script|style|iframe|object|embed|applet|meta|link|base|form)\b[\s\S]*?<\/\1>/gi, '')
-    .replace(/<(script|style|iframe|object|embed|applet|meta|link|base|form)\b[^>]*\/?>/gi, '')
-    .replace(/\son[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '')
-    .replace(/\ssrcdoc\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '')
+    .slice(0, 8000)
+    .replace(/<!--[\s\S]*?(?:-->|$)/g, '')
     .replace(
-      /\s(href|src|srcset|xlink:href|action|formaction)\s*=\s*(?:"\s*(?:javascript|vbscript|data)\s*:[^"]*"|'\s*(?:javascript|vbscript|data)\s*:[^']*'|(?:\s*(?:javascript|vbscript|data)\s*:[^\s>]+))/gi,
+      /<(script|style|iframe|object|embed|applet|meta|link|base|form|noscript|template)\b[\s\S]*?<\/\1>/gi,
+      '',
+    )
+    .replace(
+      /<(script|style|iframe|object|embed|applet|meta|link|base|form|noscript|template)\b[^>]*\/?>/gi,
+      '',
+    )
+    .replace(/\son[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '')
+    .replace(/\s(?:srcdoc|ping)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '')
+    .replace(
+      /\s(href|src|srcset|xlink:href|action|formaction|poster|background)\s*=\s*(?:"\s*(?:javascript|vbscript|data)\s*:[^"]*"|'\s*(?:javascript|vbscript|data)\s*:[^']*'|(?:\s*(?:javascript|vbscript|data)\s*:[^\s>]+))/gi,
       '',
     )
     .replace(/\sstyle\s*=\s*"([^"]*)"/gi, (_m, css: string) => {
@@ -250,7 +263,6 @@ interface SimulatedBox {
 }
 
 const SCREEN_WIDTH = 320;
-const HEIGHT_BY_SIZE: Record<ComponentSize, number> = { xs: 26, sm: 34, md: 44, lg: 56, xl: 68 };
 const SIZE_RANK: Record<ComponentSize, number> = { xs: 0, sm: 1, md: 2, lg: 3, xl: 4 };
 /** 片手の親指が届く横位置の上限 */
 const ONE_HAND_REACH_X = 230;
@@ -496,13 +508,20 @@ function describeConstraints(persona: ReviewerPersona): string {
     .join('・');
 }
 
-function isSubscriptionComponent(comp: AppComponent): boolean {
+export function isSubscriptionComponent(comp: AppComponent): boolean {
   return (
     comp.stateKey === 'subscription' ||
+    comp.stateKey === 'subscribe' ||
     comp.id === 'check-subscription' ||
+    comp.id === 'sub-trap' ||
     comp.label.includes('定期') ||
     Boolean(comp.customHtml && (comp.customHtml.includes('定期') || comp.customHtml.includes('subscription')))
   );
+}
+
+/** 店に最初からクーポンの仕掛け・状態変数があるか */
+export function hasCouponFeatureInShop(spec: AppSpec): boolean {
+  return spec.state.some((s) => s.key === 'couponPopup' || s.key.toLowerCase().includes('coupon'));
 }
 
 /** クーポンを使いたかった人の不満。使えなかったか、使っても安くならなかったか、無くなっていたか */
@@ -518,14 +537,10 @@ export const COUPON_FRICTIONS = {
  */
 function couponActionsOf(spec: AppSpec, comp: AppComponent): ComponentAction[] {
   if (comp.actions.length > 0 || !comp.customHtml) return comp.actions;
-  const acts: ComponentAction[] = [];
-  for (const m of comp.customHtml.matchAll(/data-set-state\s*=\s*(?:"([^"]*)"|'([^']*)')/gi)) {
-    acts.push(...parseSetStateAttribute(spec, m[1] ?? m[2] ?? ''));
-  }
-  return acts;
+  return parseCustomHtmlActions(spec, comp.customHtml);
 }
 
-function isCouponComponent(comp: AppComponent): boolean {
+export function isCouponComponent(comp: AppComponent): boolean {
   const text = `${comp.label} ${comp.caption ?? ''} ${comp.customHtml ?? ''}`;
   return (
     comp.id === 'popup-coupon' ||
@@ -1008,8 +1023,7 @@ export function simulatePersonaComputerUse(
           comment: '毎月届けてほしいのに設定がなくて残念',
         });
       }
-      const hadCouponInShop =
-        spec.state.some((s) => s.key === 'couponPopup' || s.key.toLowerCase().includes('coupon'));
+      const hadCouponInShop = hasCouponFeatureInShop(spec);
       if (c.wantsCoupon && hadCouponInShop && !sawCouponFeature) {
         actionTrace.push('画面確認: クーポンを使いたかったが見当たらなかった');
         bothers.push({

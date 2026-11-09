@@ -1,6 +1,7 @@
 // プロンプト・テレメトリ分析と行動ベースの到達効率集計
 // 主指標はLLMの主観採点ではなく、探索と実行を分離した行動データ（初回到達率・往復数・手戻り有無）に置く。
 
+import { isCouponComponent, isSubscriptionComponent } from './sandboxValidator.ts';
 import type { AppSpec, OwnerReport, SpecPatch, TargetCohortId } from './types.ts';
 
 /**
@@ -311,23 +312,10 @@ export function inspectAppliedChangeForTelemetry(
     }
   }
 
-  const isSubComp = (c: AppSpec['components'][number]) =>
-    c.id === 'check-subscription' ||
-    c.id === 'sub-trap' ||
-    c.stateKey === 'subscription' ||
-    c.stateKey === 'subscribe' ||
-    /定期/.test(c.label);
-  const isCouponComp = (c: AppSpec['components'][number]) =>
-    c.id === 'popup-coupon' ||
-    c.id === 'coupon-Box' ||
-    c.stateKey === 'useCoupon' ||
-    /クーポン/.test(c.label) ||
-    /クーポン/.test(c.caption ?? '');
-
-  const hasSubBefore = beforeSpec.components.some(isSubComp);
-  const hasSubAfter = afterSpec.components.some(isSubComp);
-  const hasCouponBefore = beforeSpec.components.some(isCouponComp);
-  const hasCouponAfter = afterSpec.components.some(isCouponComp);
+  const hasSubBefore = beforeSpec.components.some(isSubscriptionComponent);
+  const hasSubAfter = afterSpec.components.some(isSubscriptionComponent);
+  const hasCouponBefore = beforeSpec.components.some(isCouponComponent);
+  const hasCouponAfter = afterSpec.components.some(isCouponComponent);
 
   const removedNeededFeature =
     (hasSubBefore && !hasSubAfter) || (hasCouponBefore && !hasCouponAfter);

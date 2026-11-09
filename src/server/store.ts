@@ -99,6 +99,7 @@ export async function saveHumanDecision(
           createdAt: { stringValue: decision.createdAt },
         },
       }),
+      signal: AbortSignal.timeout(2500),
     });
     return { persistedToFirestore: res.ok };
   } catch {
@@ -123,7 +124,7 @@ let cachedAnchorEmbeddings: Map<PromptArchetype, number[]> | null = null;
  * Cloud Natural Language API (`documents:annotateText`) を用いて指示文のエンティティと感情極性を抽出する。
  * GCP 未設定または通信失敗時は決定論的抽出へフォールバックする。
  */
-export async function analyzePromptWithCloudNaturalLanguage(
+async function analyzePromptWithCloudNaturalLanguage(
   promptText: string,
 ): Promise<NaturalLanguageSignal> {
   const base = extractDeterministicNlSignal(promptText);

@@ -3,7 +3,7 @@
 // 読み取った結果からシミュレーター用の部品を組み立てるのは、このファイルのコードの規則で行う。
 // 同じ読み取り結果なら、必ず同じ部品と同じ座標になる
 
-import { parseSetStateAttribute } from './appRuntime.ts';
+import { isSafeStateKey, parseSetStateAttribute } from './appRuntime.ts';
 import type {
   AppComponent,
   AppSpec,
@@ -121,9 +121,9 @@ export function parseCustomHtmlActions(spec: AppSpec, customHtml: string | undef
     const raw = (m[2] ?? m[3] ?? '').trim();
     if (kind === 'set-state') {
       acts.push(...parseSetStateAttribute(spec, raw));
-    } else if (kind === 'toggle-state' && raw) {
+    } else if (kind === 'toggle-state' && raw && isSafeStateKey(raw)) {
       acts.push({ type: 'toggle_state', targetKey: raw });
-    } else if (kind === 'increment-state' && raw) {
+    } else if (kind === 'increment-state' && raw && isSafeStateKey(raw)) {
       acts.push({ type: 'increment_state', targetKey: raw });
     } else if (kind === 'complete-task') {
       acts.push({ type: 'complete_task', message: raw || 'ご購入ありがとうございます' });
@@ -142,11 +142,11 @@ function stateKeyFromActions(actions: ComponentAction[], prefer?: (key: string) 
 }
 
 /** 独自の部品のHTMLで、入力欄やチェック欄が状態と結び付いているキー（data-state-key） */
-export function stateKeysFromCustomHtml(customHtml: string | undefined): string[] {
+function stateKeysFromCustomHtml(customHtml: string | undefined): string[] {
   if (!customHtml) return [];
   return [...customHtml.matchAll(/data-state-key\s*=\s*(?:"([^"]*)"|'([^']*)')/gi)]
     .map((m) => (m[1] ?? m[2] ?? '').trim())
-    .filter(Boolean);
+    .filter((key) => Boolean(key) && isSafeStateKey(key));
 }
 
 /** いつでも当てはまる条件。状態のキーが分からない隠れた条件を、罠として扱うために使う */
@@ -156,7 +156,7 @@ const ALWAYS_TRUE_CONDITION = { stateKey: '__customHiddenCondition', operator: '
  * 読み取り結果から、シミュレーター用の部品を組み立てる。
  * 部品のID・表示条件・固定表示などの置き場所はそのまま残し、種類・役割・文字の大きさ・動きを、既存の部品と同じ基準で表す
  */
-export function buildCustomComponentProxy(
+function buildCustomComponentProxy(
   spec: AppSpec,
   comp: AppComponent,
   profile: CustomComponentProfile,
@@ -257,7 +257,7 @@ export function buildCustomComponentProxy(
   }
 }
 
-const TAP_HEIGHT_BY_SIZE: Record<ComponentSize, number> = { xs: 26, sm: 34, md: 44, lg: 56, xl: 68 };
+export const TAP_HEIGHT_BY_SIZE: Record<ComponentSize, number> = { xs: 26, sm: 34, md: 44, lg: 56, xl: 68 };
 
 /**
  * 押す部分が部品全体より小さい独自の部品は、測った枠を押す部分の高さまで縮める（広げることはしない）。

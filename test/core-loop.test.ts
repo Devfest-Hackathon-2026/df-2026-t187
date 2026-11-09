@@ -13,6 +13,8 @@ import {
   getAiConnectionStatus,
   normalizeUpdatedSpec,
   recordHumanDecisionWithFunctionCalling,
+  relaxUnrequestedRequiredChoices,
+  simulateReviewers,
 } from '../src/server/gemini.ts';
 import {
   applyActions,
@@ -24,6 +26,12 @@ import {
   withDerivedValues,
 } from '../src/shared/appRuntime.ts';
 import { clipToVisibleRects, detectHitComponents, type Rect2D } from '../src/shared/hitTest.ts';
+import {
+  isValidAppSpec,
+  sanitizeBase64,
+  sanitizeComponentBounds,
+  sanitizeComponentIds,
+} from '../src/server/api.ts';
 import {
   ConcurrencyGate,
   DailyCounter,
@@ -89,12 +97,12 @@ import {
 } from '../src/server/store.ts';
 import { buildInitialSpec, buildScenarioSpec, findComponent } from '../src/shared/theme.ts';
 import { readFileSync } from 'node:fs';
-import { relaxUnrequestedRequiredChoices, simulateReviewers } from '../src/server/gemini.ts';
 import {
   clearCustomProfileMemoryCache,
   resolveCustomComponentProfiles,
 } from '../src/server/customComponentProfiles.ts';
 import {
+  parseCustomHtmlActions,
   prepareSimulationInput,
   type CustomComponentProfile,
 } from '../src/shared/customComponentProfile.ts';
@@ -105,8 +113,13 @@ import {
   mergeBoundsVariants,
   type MeasuredComponentRect,
 } from '../src/shared/fixedLayout.ts';
-import type { ComponentBoundsInput } from '../src/shared/types.ts';
-import type { AppComponent, AppSpec, ReviewOutcome, SpecPatch } from '../src/shared/types.ts';
+import type {
+  AppComponent,
+  AppSpec,
+  ComponentBoundsInput,
+  ReviewOutcome,
+  SpecPatch,
+} from '../src/shared/types.ts';
 
 // テストは AI に接続しない前提で実行する（package.json の test スクリプトで接続設定を空にしている）
 
@@ -1425,18 +1438,62 @@ describe('core-loop', () => {
     assert.equal(sanitizeCssColor('#ff0000', '#ffffff'), '#ff0000');
     assert.equal(sanitizeCssColor('red; background: url(https://evil.example)', '#ffffff'), '#ffffff');
     const sanitizedCss = sanitizeCustomCss(
-      'padding: 8px; background: url("https://evil.example/x.png"); @import "https://evil.example"; width: expression(alert(1));',
+      'padding: 8px; background: url("https://evil.example/x.png"); @import "https://evil.example"; width: expression(alert(1)); background-image: u/**/rl("https://evil.example/y.png"); list-style: u\\rl("https://evil.example/z.png");',
     );
     assert.ok(!sanitizedCss.includes('url('));
+    assert.ok(!sanitizedCss.includes('evil.example'));
     assert.ok(!sanitizedCss.includes('@import'));
     assert.ok(!sanitizedCss.includes('expression('));
     const sanitizedHtml = sanitizeCustomHtml(
-      '<div>安全<script>alert(1)</script><style>body{display:none}</style><a href="javascript:alert(1)" onclick="alert(2)">リンク</a></div>',
+      '<div>安全<!-- 隠しコメント --><script>alert(1)</script><style>body{display:none}</style><template><img src="x" onerror="alert(3)"></template><a href="javascript:alert(1)" ping="https://evil.example" onclick="alert(2)">リンク</a></div>',
     );
     assert.ok(!sanitizedHtml.includes('<script'));
     assert.ok(!sanitizedHtml.includes('<style'));
+    assert.ok(!sanitizedHtml.includes('<template'));
+    assert.ok(!sanitizedHtml.includes('<!--'));
     assert.ok(!sanitizedHtml.includes('javascript:'));
+    assert.ok(!sanitizedHtml.includes('ping='));
     assert.ok(!sanitizedHtml.includes('onclick='));
+
+    // API 入力の境界検証（AppSpec 上限・部品座標・Base64・対象ID）
+    assert.equal(isValidAppSpec(reformed.updatedSpec), true);
+    assert.equal(
+      isValidAppSpec({
+        ...reformed.updatedSpec,
+        components: Array.from({ length: 61 }, (_, i) => ({
+          id: `c-${i}`,
+          type: 'text',
+        })),
+      }),
+      false,
+    );
+    assert.equal(
+      isValidAppSpec({
+        ...reformed.updatedSpec,
+        state: [...reformed.updatedSpec.state, { key: '__proto__', label: '危険', type: 'boolean', initialValue: false }],
+      }),
+      false,
+    );
+    assert.deepEqual(
+      parseCustomHtmlActions(
+        reformed.updatedSpec,
+        '<button data-toggle-state="__proto__" data-increment-state="constructor" data-set-state="prototype:1">x</button>',
+      ),
+      [],
+    );
+    assert.deepEqual(sanitizeComponentIds(['btn-order', '', 123, 'a'.repeat(81)]), ['btn-order']);
+    assert.deepEqual(
+      sanitizeComponentBounds([
+        { id: 'btn-order', left: 10, top: 20, right: 100, bottom: 60 },
+        { id: 'bad-nan', left: Number.NaN, top: 0, right: 10, bottom: 10 },
+        { id: 'bad-inverted', left: 50, top: 20, right: 10, bottom: 60 },
+        { id: 'bad-huge', left: 0, top: 0, right: 999_999, bottom: 60 },
+        { id: '', left: 0, top: 0, right: 10, bottom: 10 },
+      ]),
+      [{ id: 'btn-order', left: 10, top: 20, right: 100, bottom: 60 }],
+    );
+    assert.equal(sanitizeBase64('data:image/png;base64,iVBORw0KGgo='), 'data:image/png;base64,iVBORw0KGgo=');
+    assert.equal(sanitizeBase64('<script>alert(1)</script>'), undefined);
   });
 
   it('広告を削除せずに閉じるボタンの位置・大きさ・文字を変えたりバナー化する工夫も通り、客も店長も納得する', () => {

@@ -2,7 +2,7 @@
 // 描画と測る処理はブラウザ（src/client/fixedLayoutMeasure.ts）が行い、
 // 測った値を判定用の座標にそろえる計算と、どの状態で描画するかはここで決める（テストできるように画面に依存しない）
 
-import { createInitialState, isComponentVisible, type AppState } from './appRuntime.ts';
+import { createInitialState, isComponentVisible, isSafeStateKey, type AppState } from './appRuntime.ts';
 import type { AppSpec, ComponentBoundsInput, StateValue } from './types.ts';
 
 /**
@@ -88,6 +88,7 @@ export function fixedLayoutStateVariants(spec: AppSpec): AppState[] {
   for (const comp of spec.components) {
     if (comp.type === 'popup' || !comp.visibleWhen || isComponentVisible(comp, initial)) continue;
     const { stateKey, operator, value } = comp.visibleWhen;
+    if (!isSafeStateKey(stateKey)) continue;
     let next: StateValue;
     if (operator === 'eq') next = value;
     else if (operator === 'gt') next = Number(value) + 1;

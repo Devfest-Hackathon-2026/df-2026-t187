@@ -25,7 +25,7 @@ import {
   describeOwnerChange,
 } from '../shared/owner.ts';
 import {
-  COUPON_FRICTIONS,
+  hasCouponFeatureInShop,
   simulatePersonaComputerUse,
   validateSandboxSpec,
 } from '../shared/sandboxValidator.ts';
@@ -941,7 +941,7 @@ const PATCH_ITEM_SCHEMA: Schema = {
   required: ['op'],
 };
 
-export const APPLY_SCHEMA: Schema = {
+const APPLY_SCHEMA: Schema = {
   type: Type.OBJECT,
   properties: {
     commitMessage: {
@@ -1310,7 +1310,7 @@ function sanitizeClearFeedbackLine(raw: string, fallback: string): string {
  * クリア時のお助けAIの3つの振り返り吹き出し（概要・どこがよかったか・もっと何をしたら良くなるか）をAIに作らせる。
  * 事実判定はコードで行った ClearFeedbackFacts だけを渡し、通信失敗や目印欠落時は fallbackLines を使う
  */
-export async function voiceAssistantClearReport(
+async function voiceAssistantClearReport(
   facts: ClearFeedbackFacts,
 ): Promise<[string, string, string]> {
   const aiInfo = createGenAIClient();
@@ -1385,10 +1385,7 @@ function detectCouponStatusForClearFeedback(
   bounds?: EvaluateRequest['componentBounds'],
   existingSimMap?: ReadonlyMap<string, ReturnType<typeof simulatePersonaComputerUse>>,
 ): NonNullable<ClearFeedbackInput['couponStatus']> {
-  const hadCouponInShop = spec.state.some(
-    (s) => s.key === 'couponPopup' || s.key.toLowerCase().includes('coupon'),
-  );
-  if (!hadCouponInShop) return 'none';
+  if (!hasCouponFeatureInShop(spec)) return 'none';
   const couponSeeker = ALL_REVIEWER_PERSONAS.find((p) => p.constraints.wantsCoupon);
   if (!couponSeeker) return 'none';
   const sim =
@@ -1470,7 +1467,7 @@ const CUSTOM_PROFILE_SCHEMA: Schema = {
  * 同じ部品からはできるだけ同じ値が返るよう temperature を 0 にし、seed も固定する。
  * それでも揺れうるため、読み取った値は customComponentProfiles.ts で部品の定義ごとに保存して使い回す
  */
-export async function convertCustomComponentWithGemini(comp: AppComponent): Promise<CustomComponentProfile> {
+async function convertCustomComponentWithGemini(comp: AppComponent): Promise<CustomComponentProfile> {
   const aiInfo = requireGenAIClient();
   const prompt = [
     'あなたは通販の注文画面に置かれた独自の部品を読み取る係です。部品の定義（HTML・CSS・押したときの動き）だけを根拠に、この部品が何の代わりになるか、文字や押す部分の大きさ、利用者が損をする仕掛けがあるかを答えてください。',
@@ -1498,7 +1495,7 @@ export async function convertCustomComponentWithGemini(comp: AppComponent): Prom
 }
 
 /** 画面にある独自の部品の読み取り結果をそろえる。AIの接続設定がなければ、どれも読み取れなかったものとして扱う */
-export async function resolveProfilesForSpec(spec: AppSpec): Promise<ResolvedCustomProfiles> {
+async function resolveProfilesForSpec(spec: AppSpec): Promise<ResolvedCustomProfiles> {
   if (!spec.components.some(isCustomComponent)) return { profiles: {}, fallbackIds: [] };
   const model = createGenAIClient()?.model ?? 'unconfigured';
   return resolveCustomComponentProfiles(spec, convertCustomComponentWithGemini, model);
@@ -2065,14 +2062,6 @@ export async function chatWithStudio(req: ChatRequest): Promise<ChatResponse> {
   } catch (err) {
     if (err instanceof AiNotConfiguredError) throw err;
     console.warn('[gemini:triage] 振り分け応答に失敗したためフォールバックします:', describeErrorForLog(err));
-    if (circledOnly && targets.length > 0) {
-      const targetName = formatCircledTargetLabel(targets);
-      return {
-        intent: 'explain',
-        reply: `${targetName}ですね。気になることを聞くか、どう手直ししたいか教えてください`,
-        suggestedFollowUps: [...CIRCLE_INQUIRY_FOLLOW_UPS],
-      };
-    }
     return {
       intent: 'clarify',
       reply: 'どこをどう変えたいか、もう少し詳しく教えてください',

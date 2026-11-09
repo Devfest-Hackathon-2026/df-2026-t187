@@ -29,7 +29,7 @@ import {
   scorePredictionRound,
   type PredictionRound,
 } from '../shared/prediction.ts';
-import { fillTurnRefs } from '../shared/promptTelemetry.ts';
+import { ARCHETYPE_PUBLIC_LABELS, fillTurnRefs } from '../shared/promptTelemetry.ts';
 import { buildInitialSpec, buildScenarioSpec, type DifficultyLevel } from '../shared/theme.ts';
 import type {
   AppSpec,
@@ -401,16 +401,6 @@ function toggleAggregateConsent(): void {
   scrollToLatestMessage();
 }
 
-/** 指示や質問の型の全6分類（集計画面の枠組み表示にも使う） */
-const ALL_ARCHETYPE_LABELS: ReadonlyArray<{ label: string }> = [
-  { label: '目的を伝えた指示' },
-  { label: '条件を具体化した指示' },
-  { label: '具体的に直した指示' },
-  { label: '店長やお客さんへの質問' },
-  { label: '単純に消す指示' },
-  { label: '丸投げした指示' },
-];
-
 const STATS_STAGGER_MS = 45;
 
 function applyStaggerEnter(el: HTMLElement, step: number): void {
@@ -495,7 +485,7 @@ function appendAggregateStatsBody(
   const archRows =
     !isInsufficient && stats.archetypeBreakdown && stats.archetypeBreakdown.length > 0
       ? stats.archetypeBreakdown
-      : ALL_ARCHETYPE_LABELS.map((item) => ({
+      : ARCHETYPE_PUBLIC_LABELS.map((item) => ({
           label: item.label,
           count: null as number | null,
           percent: null as number | null,
@@ -1969,11 +1959,6 @@ function sendPendingIfReady(): void {
   else renderStudio();
 }
 
-/** 発言内で別の相手を明確にメンションしているときだけ、切り替え先の宛先キーを返す */
-function resolveExplicitRecipientSwitch(text: string): string | null {
-  return detectExplicitRecipientMention(text);
-}
-
 let activeMediaRecorder: MediaRecorder | null = null;
 let recordedAudioChunks: Blob[] = [];
 
@@ -2046,7 +2031,7 @@ async function toggleVoiceRecording(): Promise<void> {
             state.inputText = state.inputText.trim()
               ? `${state.inputText.trim()} ${cleaned}`
               : cleaned;
-            const switched = resolveExplicitRecipientSwitch(state.inputText);
+            const switched = detectExplicitRecipientMention(state.inputText);
             if (switched) state.recipient = switched;
           } else {
             pushMessage({
@@ -2109,7 +2094,7 @@ async function handleSendMessage(
   clearTransientChoiceMessages();
 
   if (overrideText === undefined) {
-    const switched = resolveExplicitRecipientSwitch(text);
+    const switched = detectExplicitRecipientMention(text);
     if (switched) state.recipient = switched;
   }
 
@@ -3333,7 +3318,7 @@ function renderChatPanel(): HTMLElement {
   input.addEventListener('input', () => {
     state.inputText = input.value;
     sendBtn.disabled = !state.inputText.trim() || isCohortLocked;
-    const switched = resolveExplicitRecipientSwitch(state.inputText);
+    const switched = detectExplicitRecipientMention(state.inputText);
     if (switched && switched !== state.recipient) {
       state.recipient = switched;
       for (const pillEl of recipientRow.querySelectorAll<HTMLButtonElement>(

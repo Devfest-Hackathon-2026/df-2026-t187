@@ -4,6 +4,7 @@ import type {
   AppSpec,
   ChatHistoryEntry,
   ChatRequest,
+  ComponentBoundsInput,
   DecisionStage,
   EvaluateRequest,
   OwnerLineRequest,
@@ -13,6 +14,7 @@ import type {
   TranscribeRequest,
   TtsRequest,
 } from '../shared/types.ts';
+import { isSafeStateKey } from '../shared/appRuntime.ts';
 import { ACTIVE_THEME } from '../shared/initialTheme.ts';
 import {
   AiNotConfiguredError,
@@ -32,8 +34,10 @@ import {
   type RunEventInput,
 } from './store.ts';
 import {
+  COMMON_SECURITY_HEADERS,
   ConcurrencyGate,
   DailyLimitError,
+  LARGE_BODY_BYTES,
   MAX_CONCURRENT_PER_CLIENT,
   RateLimiter,
   clientKeyOf,
@@ -44,7 +48,11 @@ import {
   rateLimitGroupOf,
 } from './rateLimit.ts';
 import { describeErrorForLog } from './logSafe.ts';
-import { PromptRejectedError, assertPromptAllowed } from './modelArmor.ts';
+import {
+  PromptRejectedError,
+  assertPromptAllowed,
+  findPersonalInfoByRules,
+} from './modelArmor.ts';
 
 const apiRateLimiter = new RateLimiter();
 const geminiConcurrency = new ConcurrencyGate(MAX_CONCURRENT_PER_CLIENT);
@@ -85,10 +93,53 @@ function sanitizeCohortId(value: unknown): TargetCohortId | undefined {
   return typeof value === 'string' && COHORT_IDS.has(value) ? (value as TargetCohortId) : undefined;
 }
 
-function sanitizeComponentIds(value: unknown): string[] {
+export function sanitizeComponentIds(value: unknown): string[] {
   return Array.isArray(value)
-    ? value.filter((id): id is string => typeof id === 'string' && id.length <= 80).slice(0, 20)
+    ? value
+        .filter((id): id is string => typeof id === 'string' && id.length > 0 && id.length <= 80)
+        .slice(0, 20)
     : [];
+}
+
+/** 部品の座標一覧は、数値が有限で形の正しいものだけを上限件数まで受け付ける */
+export function sanitizeComponentBounds(value: unknown): ComponentBoundsInput[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const inCoordRange = (n: unknown): n is number =>
+    typeof n === 'number' && Number.isFinite(n) && n >= -10_000 && n <= 100_000;
+  return value
+    .filter(
+      (b): b is ComponentBoundsInput =>
+        Boolean(b) &&
+        typeof b === 'object' &&
+        typeof (b as ComponentBoundsInput).id === 'string' &&
+        (b as ComponentBoundsInput).id.length > 0 &&
+        (b as ComponentBoundsInput).id.length <= 80 &&
+        inCoordRange((b as ComponentBoundsInput).left) &&
+        inCoordRange((b as ComponentBoundsInput).top) &&
+        inCoordRange((b as ComponentBoundsInput).right) &&
+        inCoordRange((b as ComponentBoundsInput).bottom) &&
+        (b as ComponentBoundsInput).right >= (b as ComponentBoundsInput).left &&
+        (b as ComponentBoundsInput).bottom >= (b as ComponentBoundsInput).top,
+    )
+    .slice(0, 60)
+    .map((b) => ({
+      id: b.id,
+      left: b.left,
+      top: b.top,
+      right: b.right,
+      bottom: b.bottom,
+    }));
+}
+
+const BASE64_PAYLOAD_RE =
+  /^(?:data:[a-z0-9.+-]+\/[a-z0-9.+-]+(?:;[a-z0-9.+-]+=[^;,]+)*;base64,)?[A-Za-z0-9+/=\s]+$/i;
+
+/** 画像・音声の Base64 文字列は、形式と長さの上限を満たすものだけを通す */
+export function sanitizeBase64(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length > LARGE_BODY_BYTES) return undefined;
+  return BASE64_PAYLOAD_RE.test(trimmed) ? trimmed : undefined;
 }
 
 /** 会話の履歴は件数と長さを抑え、形の正しいものだけを Gemini に渡す */
@@ -127,15 +178,75 @@ function sanitizeLatestReviews(value: unknown): LatestReviewRecord | undefined {
   };
 }
 
-/** 学習者が自分で書いた発言を集める。今の発言に加え、会話の履歴にある学習者の発言も調べる */
-function learnerTextsForScreening(message: string, history: ChatHistoryEntry[]): string {
-  return [...history.filter((e) => e.speaker === 'ユーザー').map((e) => e.text), message].join('\n');
+/**
+ * 今の発言と会話の履歴に、個人情報やAIへの指示の乗っ取りが含まれていないかを調べる。
+ * 発言者名を偽装した履歴から個人情報が混入しないよう、全履歴に対して規則検査も行う
+ */
+async function assertMessageAndHistoryAllowed(
+  message: string,
+  history: ChatHistoryEntry[],
+): Promise<void> {
+  for (const entry of history) {
+    if (findPersonalInfoByRules(entry.text)) {
+      throw new PromptRejectedError('personal_info');
+    }
+  }
+  const combined = [
+    ...history.filter((e) => e.speaker === 'ユーザー').map((e) => e.text),
+    message,
+  ].join('\n');
+  if (combined.trim()) {
+    await assertPromptAllowed(combined);
+  }
 }
 
-function isValidAppSpec(value: unknown): value is AppSpec {
+/** 画面の仕様を直接書き換えて送られた場合でも、部品の文字やHTMLから個人情報が Gemini に渡らないようにする */
+function assertSpecAllowed(spec: AppSpec): void {
+  if (findPersonalInfoByRules(JSON.stringify(spec.components))) {
+    throw new PromptRejectedError('personal_info');
+  }
+}
+
+export function isValidAppSpec(value: unknown): value is AppSpec {
   if (!value || typeof value !== 'object') return false;
   const candidate = value as Partial<AppSpec>;
-  return Array.isArray(candidate.components) && Array.isArray(candidate.state);
+  if (!Array.isArray(candidate.components) || candidate.components.length > 60) return false;
+  if (!Array.isArray(candidate.state) || candidate.state.length > 40) return false;
+  if (
+    candidate.derived !== undefined &&
+    (!Array.isArray(candidate.derived) ||
+      candidate.derived.length > 20 ||
+      !candidate.derived.every(
+        (d) =>
+          Boolean(d) &&
+          typeof d === 'object' &&
+          typeof d.key === 'string' &&
+          isSafeStateKey(d.key) &&
+          typeof d.expression === 'string',
+      ))
+  ) {
+    return false;
+  }
+  return (
+    candidate.components.every(
+      (c) =>
+        Boolean(c) &&
+        typeof c === 'object' &&
+        typeof c.id === 'string' &&
+        typeof c.type === 'string' &&
+        typeof c.label === 'string' &&
+        Boolean(c.style) &&
+        typeof c.style === 'object' &&
+        Array.isArray(c.actions),
+    ) &&
+    candidate.state.every(
+      (s) =>
+        Boolean(s) &&
+        typeof s === 'object' &&
+        typeof s.key === 'string' &&
+        isSafeStateKey(s.key),
+    )
+  );
 }
 
 class PayloadTooLargeError extends Error {
@@ -186,13 +297,11 @@ function sendJson(
 ): void {
   const body = JSON.stringify(payload);
   res.writeHead(statusCode, {
+    ...COMMON_SECURITY_HEADERS,
     ...extraHeaders,
     'Content-Type': 'application/json; charset=utf-8',
     'Cache-Control': 'no-store',
-    'X-Content-Type-Options': 'nosniff',
     'X-Frame-Options': 'DENY',
-    'X-Robots-Tag': 'noindex, nofollow, noarchive',
-    'Referrer-Policy': 'strict-origin-when-cross-origin',
   });
   res.end(body);
 }
@@ -310,10 +419,11 @@ async function routeApiRequest(
       const userMessage = body.userMessage.slice(0, MAX_TEXT_INPUT_LENGTH);
       const history = sanitizeHistory(body.history);
       // Gemini に送る前に、個人情報やAIへの指示の乗っ取りが含まれていないかを調べる。
-      // 履歴の学習者の発言も調べ、画面を通さずに送られた履歴から乗っ取られないようにする
-      await assertPromptAllowed(learnerTextsForScreening(userMessage, history));
+      // 履歴の発言も調べ、画面を通さずに送られた履歴から乗っ取られないようにする
+      assertSpecAllowed(body.currentSpec);
+      await assertMessageAndHistoryAllowed(userMessage, history);
       const result = await chatWithStudio({
-        ...body,
+        currentSpec: body.currentSpec,
         runId: sanitizeRunId(body.runId),
         cohortId: sanitizeCohortId(body.cohortId),
         turnIndex: sanitizeTurnIndex(body.turnIndex),
@@ -322,8 +432,10 @@ async function routeApiRequest(
         history,
         latestReviews: sanitizeLatestReviews(body.latestReviews),
         targetComponentIds: sanitizeComponentIds(body.targetComponentIds),
+        annotatedImageBase64: sanitizeBase64(body.annotatedImageBase64),
+        mode: body.mode === 'circled' ? 'circled' : undefined,
         recipient: typeof body.recipient === 'string' ? body.recipient.slice(0, 40) : undefined,
-        componentBounds: body.componentBounds,
+        componentBounds: sanitizeComponentBounds(body.componentBounds),
       });
       sendJson(res, 200, result);
       return true;
@@ -341,16 +453,20 @@ async function routeApiRequest(
       }
       const userInstruction = body.userInstruction.slice(0, MAX_TEXT_INPUT_LENGTH);
       const history = sanitizeHistory(body.history);
-      await assertPromptAllowed(learnerTextsForScreening(userInstruction, history));
+      assertSpecAllowed(body.currentSpec);
+      await assertMessageAndHistoryAllowed(userInstruction, history);
       const result = await applyOptionToSpec({
-        ...body,
+        currentSpec: body.currentSpec,
         runId: sanitizeRunId(body.runId),
         cohortId: sanitizeCohortId(body.cohortId),
         turnIndex: sanitizeTurnIndex(body.turnIndex),
         shareForAggregate: body.shareForAggregate === true,
         userInstruction,
+        selectionReason:
+          typeof body.selectionReason === 'string' ? body.selectionReason.slice(0, 200) : undefined,
         history,
         targetComponentIds: sanitizeComponentIds(body.targetComponentIds),
+        annotatedImageBase64: sanitizeBase64(body.annotatedImageBase64),
       });
       sendJson(res, 200, result);
       return true;
@@ -396,9 +512,7 @@ async function routeApiRequest(
           ? body.userMessage.slice(0, MAX_TEXT_INPUT_LENGTH)
           : undefined;
       const history = sanitizeHistory(body.history);
-      if (userMessage || history.some((e) => e.speaker === 'ユーザー')) {
-        await assertPromptAllowed(learnerTextsForScreening(userMessage ?? '', history));
-      }
+      await assertMessageAndHistoryAllowed(userMessage ?? '', history);
       const facts = body.facts
         .filter((f): f is string => typeof f === 'string')
         .slice(0, 12)
@@ -423,11 +537,16 @@ async function routeApiRequest(
         sendJson(res, 400, { error: 'currentSpec が必要です' });
         return true;
       }
+      const history = sanitizeHistory(body.history);
+      assertSpecAllowed(body.currentSpec);
+      await assertMessageAndHistoryAllowed('', history);
       const result = await evaluateAppWithPersonas({
-        ...body,
+        currentSpec: body.currentSpec,
         runId: sanitizeRunId(body.runId),
         cohortId: sanitizeCohortId(body.cohortId),
-        history: sanitizeHistory(body.history),
+        screenshotBase64: sanitizeBase64(body.screenshotBase64),
+        componentBounds: sanitizeComponentBounds(body.componentBounds),
+        history,
       });
       sendJson(res, 200, result);
       return true;
@@ -449,18 +568,23 @@ async function routeApiRequest(
 
     if (req.method === 'POST' && url === '/api/transcribe') {
       const body = await readJsonBody<TranscribeRequest>(req);
-      if (
-        typeof body?.audioBase64 !== 'string' ||
-        !body.audioBase64.trim() ||
-        !isValidAppSpec(body.currentSpec)
-      ) {
+      const audioBase64 = sanitizeBase64(body?.audioBase64);
+      if (!audioBase64 || !isValidAppSpec(body?.currentSpec)) {
         sendJson(res, 400, { error: 'audioBase64 と currentSpec が必要です' });
         return true;
       }
+      assertSpecAllowed(body.currentSpec);
       const result = await transcribeAndRefineUserAudio({
-        ...body,
+        audioBase64,
+        audioMimeType:
+          typeof body.audioMimeType === 'string' ? body.audioMimeType.slice(0, 80) : undefined,
+        currentSpec: body.currentSpec,
         targetComponentIds: sanitizeComponentIds(body.targetComponentIds),
+        annotatedImageBase64: sanitizeBase64(body.annotatedImageBase64),
       });
+      if (result.hasMeaningfulSpeech && result.cleanedText.trim()) {
+        await assertPromptAllowed(result.cleanedText);
+      }
       sendJson(res, 200, result);
       return true;
     }

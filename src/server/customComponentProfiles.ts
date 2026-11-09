@@ -17,7 +17,7 @@ import { getGcpAccessToken } from './store.ts';
 /**
  * 読み取りの決まり（プロンプト・スキーマ・モデル）を変えたら上げる。鍵に含めるので、古い読み取り結果は使われなくなる
  */
-export const CUSTOM_PROFILE_VERSION = 'v1';
+const CUSTOM_PROFILE_VERSION = 'v1';
 
 /** 1つの部品を読み取る関数。Gemini を呼ぶものを gemini.ts から渡す。テストでは決まった値を返すものを渡す */
 export type CustomComponentConverter = (comp: AppComponent) => Promise<CustomComponentProfile>;
@@ -34,7 +34,7 @@ const memoryCache = new Map<string, CustomComponentProfile>();
 /** 同じ部品を同時に読み取らないよう、読み取り中のものを共有する */
 const inFlight = new Map<string, Promise<CustomComponentProfile | null>>();
 
-export function customProfileCacheKey(comp: AppComponent, model: string): string {
+function customProfileCacheKey(comp: AppComponent, model: string): string {
   return createHash('sha256')
     .update(`${CUSTOM_PROFILE_VERSION}\n${model}\n${normalizeCustomComponentForProfile(comp)}`)
     .digest('hex');
@@ -86,7 +86,7 @@ function toFirestoreFields(profile: CustomComponentProfile): Record<string, FsVa
   };
 }
 
-export function fromFirestoreFields(fields: Record<string, FsValue> | undefined): CustomComponentProfile | null {
+function fromFirestoreFields(fields: Record<string, FsValue> | undefined): CustomComponentProfile | null {
   if (!fields) return null;
   const candidate = {
     purpose: fields.purpose?.stringValue,

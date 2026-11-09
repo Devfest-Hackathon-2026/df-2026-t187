@@ -86,8 +86,6 @@ export interface OwnerLines {
 export interface OwnerDefinition {
   name: string;
   icon: string;
-  /** 顧客層が選ばれたあとに話す一言。{cohort} に顧客層の名前が入る */
-  afterCohortLine: string;
   metrics: OwnerMetric[];
   /** AIが店長のせりふを作るときの人物像と話し方 */
   voice: string;
