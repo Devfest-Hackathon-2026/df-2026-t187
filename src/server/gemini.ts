@@ -1036,13 +1036,46 @@ export function normalizeUpdatedSpec(rawSpec: AppSpec, previousSpec: AppSpec): A
   };
 }
 
+/** 学習者が、選択欄を必須にしたいと言っているか */
+const REQUIRED_INTENT_RE =
+  /必須|必ず|強制|義務|外せない|外せなく|選ばないと|入れないと|チェックしないと|しないと(?:注文|買|購入)|しなければ/;
+
+/**
+ * 実装AIが、学習者に頼まれていないのに真偽の選択欄（チェック欄・切り替え）を必須の入力欄にしたときは、任意の欄に戻す。
+ * 「望む人だけが自分で選べるようにしたい」のような指示でも、AIが必須にしてしまうことがあり、
+ * そうなると全員が申し込んだ扱いになり、押せなかった人は注文できなくなる。
+ * 元の画面ですでに必須だった欄と、学習者が必須にしたいと言った場合は、そのまま残す（悪い判断の結果も体験できるようにする）
+ */
+export function relaxUnrequestedRequiredChoices(
+  updatedSpec: AppSpec,
+  previousSpec: AppSpec,
+  userInstruction: string,
+): AppSpec {
+  if (REQUIRED_INTENT_RE.test(userInstruction)) return updatedSpec;
+  const stateTypes = new Map(updatedSpec.state.map((s) => [s.key, s.type]));
+  let changed = false;
+  const components = updatedSpec.components.map((c) => {
+    if (c.role !== 'required_input') return c;
+    const isBooleanChoice =
+      c.type === 'checkbox' || c.type === 'toggle' || (c.stateKey && stateTypes.get(c.stateKey) === 'boolean');
+    if (!isBooleanChoice) return c;
+    const prev = previousSpec.components.find((p) => p.id === c.id);
+    if (prev?.role === 'required_input') return c;
+    changed = true;
+    return { ...c, role: 'info' as const };
+  });
+  return changed ? { ...updatedSpec, components } : updatedSpec;
+}
+
 /**
  * Gemini が返した差分パッチを現在の仕様に適用し、正規化・整合性検証・店長のリアクション生成を行う。
+ * userInstruction を渡すと、学習者が求めていない選択欄の必須化を任意の欄に戻す
  */
 export function applyPatchesToSpecWithValidation(
   currentSpec: AppSpec,
   commitMessage: string,
   rawPatches: SpecPatch[],
+  userInstruction?: string,
 ): Omit<ApplyResponse, 'decisionRecord'> {
   if (!Array.isArray(rawPatches) || rawPatches.length === 0) {
     return {
@@ -1060,7 +1093,11 @@ export function applyPatchesToSpecWithValidation(
   }
 
   const { spec: patchedSpec, touchedComponentIds } = applySpecPatches(currentSpec, rawPatches);
-  const updatedSpec = normalizeUpdatedSpec(patchedSpec, currentSpec);
+  const normalizedSpec = normalizeUpdatedSpec(patchedSpec, currentSpec);
+  const updatedSpec =
+    userInstruction === undefined
+      ? normalizedSpec
+      : relaxUnrequestedRequiredChoices(normalizedSpec, currentSpec, userInstruction);
 
   const prevHadCompletion = currentSpec.components.some(
     (c) => c.type === 'button' && hasCompletionAction(c),
@@ -1199,6 +1236,7 @@ export async function applyOptionToSpec(req: ApplyRequest): Promise<ApplyRespons
         req.currentSpec,
         cleanJapaneseText(parsed.commitMessage, '画面を変えました'),
         parsed.patches,
+        req.userInstruction,
       );
     });
 

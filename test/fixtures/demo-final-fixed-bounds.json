@@ -2,51 +2,51 @@
   {
     "id": "btn-cancel",
     "left": 12,
-    "top": 597,
+    "top": 615,
     "right": 308,
-    "bottom": 624
+    "bottom": 642
   },
   {
     "id": "btn-order",
     "left": 64,
-    "top": 653,
+    "top": 671,
     "right": 307,
-    "bottom": 697
+    "bottom": 715
   },
   {
     "id": "check-subscription",
     "left": 12,
     "top": 205,
     "right": 308,
-    "bottom": 219
+    "bottom": 237
   },
   {
     "id": "choice-address",
     "left": 12,
-    "top": 248,
+    "top": 266,
     "right": 308,
-    "bottom": 355
+    "bottom": 373
   },
   {
     "id": "choice-payment",
     "left": 12,
-    "top": 384,
+    "top": 402,
     "right": 308,
-    "bottom": 525
+    "bottom": 543
   },
   {
     "id": "heading-address",
     "left": 12,
-    "top": 228,
+    "top": 246,
     "right": 308,
-    "bottom": 240
+    "bottom": 258
   },
   {
     "id": "heading-payment",
     "left": 12,
-    "top": 364,
+    "top": 382,
     "right": 308,
-    "bottom": 376
+    "bottom": 394
   },
   {
     "id": "product-card",
@@ -65,15 +65,15 @@
   {
     "id": "summary",
     "left": 12,
-    "top": 533,
+    "top": 551,
     "right": 308,
-    "bottom": 589
+    "bottom": 607
   },
   {
     "id": "total-price",
     "left": 13,
-    "top": 662,
+    "top": 680,
     "right": 54,
-    "bottom": 689
+    "bottom": 707
   }
 ]

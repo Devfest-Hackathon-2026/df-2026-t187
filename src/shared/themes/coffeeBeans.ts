@@ -777,6 +777,7 @@ export const COFFEE_BEANS_THEME: ThemeDefinition = {
     '部品の style.skin（intrusive や native）や style.variant は、人間から「見た目を落ち着かせて」「元のデザインに揃えて」「色を変えて」など見た目を変える指示があったときだけ変更し、動きや文字だけの指示では元の値をそのまま残してください。',
     'ポップアップ（type: popup）の閉じるボタンの位置・大きさ・文字を変える指示には、replace_component で closePosition（top-right / top-left / bottom-right / bottom-left / bottom-bar）、closeSize（xs〜xl）、closeLabel（閉じる 等）を設定してください。ポップアップを画面内のバナーやボタンに変える指示なら type を status_banner や button や custom に変更してよいです。',
     '既存の部品の型で表現できない自由な＋α機能（豆の診断、ルーレット、ギフト設定、独自のレイアウトなど）や細かいデザイン変更を頼まれたときは、type: "custom" または任意の部品の customHtml と customCss を使ってサンドボックス内で動くHTML/CSSを作ってください。customHtml 内では {状態キー} で値を表示でき、ボタン等に data-set-state="key:value"、data-toggle-state="key"、data-increment-state="key"、data-close-popup を付けるとクリックで状態や計算式が連動して動きます。',
+    '利用者が自分で選べるようにしたい、という指示では、定期便などの欄を最初はチェックなしの任意の選択欄として作り、role は required_input にしないでください。学習者が必須にしたいとはっきり言ったときだけ required_input にします。',
     '前回と同じ内容で注文する機能は、お届け先と支払い方法の状態を最初から埋めておくか、set_state で一度に埋めるボタンで作れます。',
     'ポップアップや罠を取り除くよう指示されたら、その部品を components から削除してください。',
     'open_page はお店の外の別ページへ飛ばしてしまう動きです。画面の中の別の欄へ移動させたいときには使わないでください。',

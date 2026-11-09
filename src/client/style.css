@@ -845,6 +845,9 @@ body {
 
 /* チェック欄（定期便などの罠は、元のデザインに溶け込む薄い見た目のまま） */
 .comp-checkbox-row { display: flex; align-items: center; gap: 0.45rem; cursor: pointer; line-height: 1.4; padding: 0 0.25rem; }
+/* チェック欄は説明文まで含めた行全体が押せる。読める大きさの欄は、行の高さを指で押しやすい大きさにする。
+   小さい字の欄（罠として作られた定期便など）は、押せる範囲も小さいままにする */
+.sandbox-comp-item:not(.size-xs) > .comp-checkbox-row { min-height: 2.75rem; }
 .comp-checkbox { width: 1.1em; height: 1.1em; flex: none; accent-color: var(--caramel); }
 
 /* iOS風トグルスイッチ */

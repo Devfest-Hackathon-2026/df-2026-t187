@@ -1,0 +1,79 @@
+[
+  {
+    "id": "btn-cancel",
+    "left": 12,
+    "top": 597,
+    "right": 308,
+    "bottom": 624
+  },
+  {
+    "id": "btn-order",
+    "left": 64,
+    "top": 653,
+    "right": 307,
+    "bottom": 697
+  },
+  {
+    "id": "check-subscription",
+    "left": 12,
+    "top": 511,
+    "right": 308,
+    "bottom": 525
+  },
+  {
+    "id": "choice-address",
+    "left": 12,
+    "top": 225,
+    "right": 308,
+    "bottom": 332
+  },
+  {
+    "id": "choice-payment",
+    "left": 12,
+    "top": 361,
+    "right": 308,
+    "bottom": 502
+  },
+  {
+    "id": "heading-address",
+    "left": 12,
+    "top": 205,
+    "right": 308,
+    "bottom": 217
+  },
+  {
+    "id": "heading-payment",
+    "left": 12,
+    "top": 341,
+    "right": 308,
+    "bottom": 353
+  },
+  {
+    "id": "product-card",
+    "left": 12,
+    "top": 94,
+    "right": 308,
+    "bottom": 197
+  },
+  {
+    "id": "progress",
+    "left": 12,
+    "top": 72,
+    "right": 308,
+    "bottom": 86
+  },
+  {
+    "id": "summary",
+    "left": 12,
+    "top": 533,
+    "right": 308,
+    "bottom": 589
+  },
+  {
+    "id": "total-price",
+    "left": 13,
+    "top": 662,
+    "right": 54,
+    "bottom": 689
+  }
+]

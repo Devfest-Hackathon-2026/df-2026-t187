@@ -89,7 +89,7 @@ import {
 } from '../src/server/store.ts';
 import { buildInitialSpec, buildScenarioSpec, findComponent } from '../src/shared/theme.ts';
 import { readFileSync } from 'node:fs';
-import { simulateReviewers } from '../src/server/gemini.ts';
+import { relaxUnrequestedRequiredChoices, simulateReviewers } from '../src/server/gemini.ts';
 import {
   clearCustomProfileMemoryCache,
   resolveCustomComponentProfiles,
@@ -2339,5 +2339,137 @@ describe('判定の再現性', () => {
         ['achieved', 'achieved', 'achieved'],
       );
     }
+  });
+});
+
+
+describe('任意の選択欄と押しやすいチェック欄', () => {
+  const loadBounds = (name: string) =>
+    JSON.parse(readFileSync(new URL(`./fixtures/${name}`, import.meta.url), 'utf8')) as ComponentBoundsInput[];
+
+  /** デモで定期便を消したあとの画面と、実装AIが定期便の欄を必須で作り直す差分 */
+  function demoAfterRemoval() {
+    const demo = buildScenarioSpec(ACTIVE_THEME, 'demo').spec;
+    const order = findComponent(demo, 'btn-order');
+    let spec = applyPatchesToSpecWithValidation(demo, 'a', [
+      { op: 'replace_component', component: { ...order, actions: [{ type: 'complete_task', message: 'ご購入ありがとうございます' }] } },
+    ]).updatedSpec;
+    const popup = findComponent(spec, 'popup-coupon');
+    spec = applyPatchesToSpecWithValidation(spec, 'b', [
+      {
+        op: 'replace_component',
+        component: {
+          ...popup,
+          closePosition: 'bottom-bar',
+          closeSize: 'lg',
+          closeLabel: '500円引きを使う',
+          actions: [{ type: 'set_state', targetKey: 'couponDiscount', value: 500 }],
+        },
+      },
+    ]).updatedSpec;
+    spec = applyPatchesToSpecWithValidation(spec, 'c', [{ op: 'remove_component', id: 'check-subscription' }]).updatedSpec;
+    const requiredPatches: SpecPatch[] = [
+      { op: 'upsert_state', variable: { key: 'subscription', label: '定期便', type: 'boolean', initialValue: false } },
+      {
+        op: 'insert_component',
+        afterId: 'product-card',
+        component: {
+          id: 'check-subscription',
+          type: 'checkbox',
+          role: 'required_input',
+          label: '毎月届く定期便にする いつでも解約できます',
+          stateKey: 'subscription',
+          style: { size: 'sm', variant: 'default' },
+          actions: [{ type: 'toggle_state', targetKey: 'subscription' }],
+        },
+      },
+    ];
+    return { spec, requiredPatches };
+  }
+
+  it('「自分で選べるようにしたい」という指示で必須になった選択欄は、任意の欄に直される', () => {
+    const { spec, requiredPatches } = demoAfterRemoval();
+    const result = applyPatchesToSpecWithValidation(
+      spec,
+      '定期便を選べるようにしました',
+      requiredPatches,
+      '定期便は、毎月届けてほしい人だけが自分で選べるようにしたい',
+    );
+    assert.equal(result.rolledBack, false);
+    const sub = findComponent(result.updatedSpec, 'check-subscription');
+    assert.equal(sub.role, 'info');
+    // 任意の欄なので、望まない人は申し込まず、望む人は自分で選ぶ
+    const map = simulateReviewers(result.updatedSpec, getReviewersByCohort('thrifty'), {}, loadBounds('demo-final-fixed-bounds.json'));
+    assert.deepEqual([...map.values()].map((r) => r.outcome), ['achieved', 'achieved', 'achieved']);
+    assert.equal(map.get('hina')!.finalState?.subscription, false);
+    assert.equal(map.get('ren')!.finalState?.subscription, true);
+
+    // 元の画面ですでに必須だった欄は、そのまま残す
+    const alreadyRequired = structuredClone(result.updatedSpec);
+    findComponent(alreadyRequired, 'check-subscription').role = 'required_input';
+    const kept = relaxUnrequestedRequiredChoices(alreadyRequired, alreadyRequired, '文字を大きくして');
+    assert.equal(findComponent(kept, 'check-subscription').role, 'required_input');
+    // 文字の入力欄のような、真偽ではない必須の欄には触れない
+    const withText = structuredClone(spec);
+    withText.state.push({ key: 'memo', label: 'メモ', type: 'string', initialValue: '' });
+    withText.components.push({
+      id: 'input-memo', type: 'input', role: 'required_input', label: 'メモ', stateKey: 'memo',
+      style: { size: 'md', variant: 'default' }, actions: [],
+    });
+    assert.equal(
+      findComponent(relaxUnrequestedRequiredChoices(withText, spec, 'メモ欄を足して'), 'input-memo').role,
+      'required_input',
+    );
+  });
+
+  it('「定期便を必須にして」という指示では、必須のまま残る', () => {
+    const { spec, requiredPatches } = demoAfterRemoval();
+    for (const instruction of ['定期便を必須にして', '定期便に必ずチェックしないと注文できないようにして']) {
+      const result = applyPatchesToSpecWithValidation(spec, '定期便を必須にしました', requiredPatches, instruction);
+      assert.equal(findComponent(result.updatedSpec, 'check-subscription').role, 'required_input', instruction);
+    }
+    // 必須にすると、望まない人も申し込んだ扱いになる。悪い判断の結果もそのまま体験できる
+    const forced = applyPatchesToSpecWithValidation(spec, 'x', requiredPatches, '定期便を必須にして').updatedSpec;
+    const map = simulateReviewers(forced, [persona('hina')], {}, loadBounds('demo-final-fixed-bounds.json'));
+    assert.notEqual(map.get('hina')!.finalState?.subscription, false);
+    assert.ok(map.get('hina')!.actionTrace.some((t) => t.includes('定期便') && t.includes('入力した')));
+  });
+
+  it('指のずれが±14pxのお客さんでも、説明文の行まで押せるチェック欄なら押せる', () => {
+    const { spec, requiredPatches } = demoAfterRemoval();
+    // 必須の欄は押して埋める必要がある。学習者が必須を求めた画面で、押しやすさだけを比べる
+    const forced = applyPatchesToSpecWithValidation(spec, 'x', requiredPatches, '定期便を必須にして').updatedSpec;
+    const ren = persona('ren');
+    assert.equal(ren.constraints.jitterPx, 14);
+    // ブラウザで測った、説明文まで含めて押しやすい高さにした行
+    const rowBounds = loadBounds('demo-final-fixed-bounds.json');
+    const row = rowBounds.find((b) => b.id === 'check-subscription')!;
+    assert.ok(row.bottom - row.top >= 28, `行の高さ ${row.bottom - row.top}px`);
+    assert.equal(simulatePersonaComputerUse(forced, ren, rowBounds).outcome, 'achieved');
+    // 文字の行の高さしかない欄（行を広げる前の14px）では、押し損ねて離脱する
+    const textOnly = rowBounds.map((b) => (b.id === 'check-subscription' ? { ...b, bottom: b.top + 14 } : b));
+    const missed = simulatePersonaComputerUse(forced, ren, textOnly);
+    assert.equal(missed.outcome, 'abandoned');
+    assert.ok(missed.actionTrace.some((t) => t.includes('指がズレて外れた')));
+  });
+
+  it('既定の問題の罠の定期便は、小さい字の行のまま罠として判定される', () => {
+    // 最初からチェックが入った小さい字の定期便は、押せる行も小さいまま
+    const salesPush = buildScenarioSpec(ACTIVE_THEME, 'sales_push').spec;
+    assert.equal(findComponent(salesPush, 'check-subscription').style.size, 'xs');
+    const demo = buildScenarioSpec(ACTIVE_THEME, 'demo').spec;
+    const order = findComponent(demo, 'btn-order');
+    const fixed = applyPatchesToSpecWithValidation(demo, 'a', [
+      { op: 'replace_component', component: { ...order, actions: [{ type: 'complete_task', message: 'ご購入ありがとうございます' }] } },
+    ]).updatedSpec;
+    const bounds = loadBounds('demo-step1-fixed-bounds.json');
+    const trapRow = bounds.find((b) => b.id === 'check-subscription')!;
+    assert.ok(trapRow.bottom - trapRow.top < 20, `罠の行の高さ ${trapRow.bottom - trapRow.top}px`);
+    const map = simulateReviewers(fixed, ALL_REVIEWER_PERSONAS, {}, bounds);
+    // 細かい字を読まない人は気づかずに後悔し、読める人は気づいて外すが不満が残る
+    assert.equal(map.get('hina')!.outcome, 'regretted');
+    assert.equal(map.get('misaki')!.outcome, 'regretted');
+    assert.equal(map.get('shota')!.outcome, 'bothered');
+    assert.ok(map.get('shota')!.actionTrace.some((t) => t.includes('定期便') && t.includes('気づいて直した')));
   });
 });
