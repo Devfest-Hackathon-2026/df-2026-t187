@@ -167,6 +167,7 @@ function sanitizeLatestReviews(value: unknown): LatestReviewRecord | undefined {
       name: text(r?.name, 40),
       outcome: r?.outcome,
       actionTrace: Array.isArray(r?.actionTrace) ? r.actionTrace.slice(0, 40).map((t) => text(t, 200)) : [],
+      frictionComponentIds: sanitizeComponentIds(r?.frictionComponentIds),
     })),
     ownerMetrics: Array.isArray(v.ownerMetrics)
       ? v.ownerMetrics.slice(0, 10).map((m) => ({

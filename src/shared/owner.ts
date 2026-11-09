@@ -82,6 +82,7 @@ export function buildOwnerReport(
 export interface OwnerChangeFact {
   fact: string;
   line: string;
+  componentId?: string;
 }
 
 function labelsOf(spec: AppSpec, ids: string[]): string {
@@ -115,11 +116,15 @@ export function describeOwnerChange(
   const prevHadCompletion = prevSpec.components.some(
     (c) => c.type === 'button' && hasCompletionAction(c),
   );
-  const nextHasCompletion = nextSpec.components.some(
+  const nextCompletionBtn = nextSpec.components.find(
     (c) => c.type === 'button' && hasCompletionAction(c),
   );
-  if (!prevHadCompletion && nextHasCompletion) {
-    facts.push({ fact: '押しても反応しなかった購入のボタンが、押せば買えるようになった', line: lines.completionFixed });
+  if (!prevHadCompletion && nextCompletionBtn) {
+    facts.push({
+      fact: '押しても反応しなかった購入のボタンが、押せば買えるようになった',
+      line: lines.completionFixed,
+      componentId: nextCompletionBtn.id,
+    });
   }
 
   // 店長が重視している数字（題材で決めたもの）の変化を調べる
@@ -142,6 +147,7 @@ export function describeOwnerChange(
       facts.push({
         fact: `${m.label}を消さずに残したうえで、最初のチェックを外して文字や条件を正直で分かりやすい形に整えた`,
         line: `おっ、${m.label}を消さずに分かりやすく残してくれたんだな！それでお客さんが選んでくれるなら嬉しいよ`,
+        componentId: nextComp?.id,
       });
     } else if (
       m.countWhen === true &&
@@ -151,11 +157,13 @@ export function describeOwnerChange(
       facts.push({
         fact: `${m.label}に最初から入っていたチェックを外し、申し込みたい人だけが自分で選ぶようにした`,
         line: fill(lines.metricUnchecked, { label: m.label }),
+        componentId: nextComp?.id,
       });
     } else if (prevComp && nextComp && prevComp.style.size === 'xs' && nextComp.style.size !== 'xs') {
       facts.push({
         fact: `小さくて目立たなかった${m.label}の説明を、読める大きさにした`,
         line: fill(lines.metricEnlarged, { label: m.label }),
+        componentId: nextComp.id,
       });
     }
   }
@@ -183,6 +191,7 @@ export function describeOwnerChange(
         facts.push({
           fact: `店長が付けた広告「${renderLabel(prevPopup, createInitialState(prevSpec))}」を消さずに、お客さんが邪魔にならず見やすい形に工夫して残した`,
           line: 'おっ、広告を消さずに押しやすく工夫して残してくれたんだな！それならお店の宣伝もできて助かるよ',
+          componentId: nextPopup.id,
         });
       }
     }
@@ -212,6 +221,7 @@ export function describeOwnerChange(
         facts.push({
           fact: `急かすカウントダウン表示を、正直で安心できる案内「${renderLabel(nextDist, createInitialState(nextSpec))}」に書き換えた`,
           line: 'なるほど、急かすんじゃなくて気持ちよく買ってもらえる案内に変えたんだな！',
+          componentId: nextDist.id,
         });
       }
     }
@@ -222,7 +232,14 @@ export function describeOwnerChange(
     spec.components.some((c) => c.behavior?.effect === 'confirm_dialog') ||
     spec.state.some((s) => s.key === 'step');
   if (!hasConfirm(prevSpec) && hasConfirm(nextSpec)) {
-    facts.push({ fact: '注文を確定する前に、内容を確かめる確認を足した', line: lines.confirmAdded });
+    const confirmComp =
+      nextSpec.components.find((c) => c.behavior?.effect === 'confirm_dialog') ??
+      nextSpec.components.find((c) => c.visibleWhen?.stateKey === 'step' && c.role === 'primary_action');
+    facts.push({
+      fact: '注文を確定する前に、内容を確かめる確認を足した',
+      line: lines.confirmAdded,
+      componentId: confirmComp?.id,
+    });
   }
 
   return facts;

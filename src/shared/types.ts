@@ -288,6 +288,8 @@ export interface ReviewerEvaluation {
   actionTrace?: string[];
   /** 適用された制約変数の要約 */
   appliedConstraintNote?: string;
+  /** 困りごとや後悔の原因になった画面上の部品ID */
+  frictionComponentIds?: string[];
 }
 
 /** 店長が採点のたびに見る、お店の側の結果 */
@@ -395,6 +397,8 @@ export interface ApplyResponse {
   ownerReaction?: string;
   /** 店長が気にする変化の事実。店長のせりふはこれをもとにAIが作る */
   ownerFacts?: string[];
+  /** 店長が言及している部品のID */
+  ownerComponentIds?: string[];
   validation?: SandboxValidationResult;
   rolledBack?: boolean;
   decisionRecord?: HumanDecisionRecord;
@@ -452,7 +456,12 @@ export interface LatestReviewRecord {
   /** どの画面での記録か（最初・改造1など）と、それが今の画面かどうか */
   screenLabel: string;
   isCurrentScreen: boolean;
-  reviews: Array<{ name: string; outcome: ReviewOutcome; actionTrace: string[] }>;
+  reviews: Array<{
+    name: string;
+    outcome: ReviewOutcome;
+    actionTrace: string[];
+    frictionComponentIds?: string[];
+  }>;
   /** そのとき店長が数えた数字（定期便の件数など）。店長に聞かれたときに答えられるようにする */
   ownerMetrics?: Array<{ label: string; count: number; missing: boolean }>;
 }
@@ -484,10 +493,12 @@ export interface ChatResponse {
   reply: string;
   suggestedFollowUps: string[];
   applied?: ApplyResponse;
+  /** 返答の中で画面上の部品を指し示しているときの部品IDリスト */
+  pointedComponentIds?: string[];
   /** intent が customer のときの返答したペルソナID */
   customerPersonaId?: string;
   /** intent が customer で選んだ客層のお客さんたちが順番に返答するときのリスト */
-  customerReplies?: Array<{ personaId: string; text: string }>;
+  customerReplies?: Array<{ personaId: string; text: string; pointedComponentIds?: string[] }>;
   telemetryEvent?: PromptTelemetryEvent;
 }
 

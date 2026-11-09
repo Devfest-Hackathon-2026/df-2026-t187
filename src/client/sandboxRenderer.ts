@@ -122,12 +122,22 @@ function clearPopupTimers(): void {
   popupTimers.clear();
 }
 
-function schedulePopups(spec: AppSpec, liveState: AppState, callbacks: SandboxCallbacks): void {
+function schedulePopups(
+  spec: AppSpec,
+  liveState: AppState,
+  selectedComponentIds: Set<string>,
+  callbacks: SandboxCallbacks,
+): void {
   // 完了ページや移動先ページを見せている間は広告を出さない
   if (liveState[PAGE_KEY]) {
     clearPopupTimers();
     return;
   }
+  // ポップアップ以外の部品を赤ペンで囲んでいる最中は、閉じた広告が勝手に被さらないようにする
+  const hasNonPopupCircled = Array.from(selectedComponentIds).some((id) => {
+    const comp = spec.components.find((c) => c.id === id);
+    return comp && comp.type !== 'popup';
+  });
   const popups = spec.components.filter((c) => c.type === 'popup' && c.stateKey);
   const popupIds = new Set(popups.map((p) => p.id));
   for (const [id, timer] of popupTimers) {
@@ -138,7 +148,7 @@ function schedulePopups(spec: AppSpec, liveState: AppState, callbacks: SandboxCa
   }
   for (const popup of popups) {
     const key = popup.stateKey!;
-    if (liveState[key] !== 'waiting') {
+    if (liveState[key] === 'open' || (liveState[key] === 'closed' && hasNonPopupCircled)) {
       const timer = popupTimers.get(popup.id);
       if (timer !== undefined) {
         window.clearTimeout(timer);
@@ -146,9 +156,15 @@ function schedulePopups(spec: AppSpec, liveState: AppState, callbacks: SandboxCa
       }
       continue;
     }
+    if (liveState[key] !== 'waiting' && liveState[key] !== 'closed') {
+      continue;
+    }
     if (popupTimers.has(popup.id)) continue;
     const range = popup.popupDelayMs ?? { min: 3000, max: 6000 };
-    const delay = range.min + Math.random() * Math.max(0, range.max - range.min);
+    // ×ボタンで閉じた（closed）後も、数秒後にまた自動で出てくるようにする（裏の画面を少し確認できる余裕を持たせる）
+    const minDelay = liveState[key] === 'closed' ? Math.max(3500, range.min) : range.min;
+    const maxDelay = liveState[key] === 'closed' ? Math.max(5500, range.max) : range.max;
+    const delay = minDelay + Math.random() * Math.max(0, maxDelay - minDelay);
     popupTimers.set(
       popup.id,
       window.setTimeout(() => {
@@ -576,7 +592,7 @@ function renderSandboxAppInner(
   }
 
   if (!measureOnly) {
-    schedulePopups(spec, liveState, callbacks);
+    schedulePopups(spec, liveState, selectedComponentIds, callbacks);
     schedulePageTransition(spec, liveState, callbacks);
   }
 

@@ -26,6 +26,8 @@ import {
 } from '../shared/owner.ts';
 import {
   hasCouponFeatureInShop,
+  isCouponComponent,
+  isSubscriptionComponent,
   simulatePersonaComputerUse,
   validateSandboxSpec,
 } from '../shared/sandboxValidator.ts';
@@ -478,7 +480,7 @@ const CUSTOMER_COHORT_REPLY_SCHEMA: Schema = {
  */
 async function voiceCohortCustomers(
   req: ChatRequest,
-): Promise<Array<{ personaId: string; text: string }>> {
+): Promise<Array<{ personaId: string; text: string; pointedComponentIds?: string[] }>> {
   const reviewers = getReviewersByCohort(req.cohortId);
   // お客さんの反応を見たときと同じく、読み取り結果を固定した独自の部品と、決まった条件で測った座標で判定する
   const { profiles } = await resolveProfilesForSpec(req.currentSpec);
@@ -488,19 +490,29 @@ async function voiceCohortCustomers(
     const latestForPersona = req.latestReviews?.reviews.find((r) => r.name === persona.name);
     const trace = latestForPersona?.actionTrace ?? sim.actionTrace;
     const outcome = latestForPersona?.outcome ?? sim.outcome;
+    const frictionIds =
+      latestForPersona?.frictionComponentIds && latestForPersona.frictionComponentIds.length > 0
+        ? latestForPersona.frictionComponentIds
+        : sim.frictionComponentIds;
+    const pointedComponentIds =
+      req.targetComponentIds.length > 0 ? req.targetComponentIds : frictionIds;
+    const frictionLabels = frictionIds
+      .map((id) => req.currentSpec.components.find((c) => c.id === id)?.label)
+      .filter((l): l is string => Boolean(l));
     const fallback = sim.simulatedComment || persona.greeting;
-    return { persona, sim, trace, outcome, fallback };
+    return { persona, sim, trace, outcome, frictionLabels, pointedComponentIds, fallback };
   });
 
-  const fallbackReplies = sims.map(({ persona, fallback }) => ({
+  const fallbackReplies = sims.map(({ persona, fallback, pointedComponentIds }) => ({
     personaId: persona.id,
     text: fallback,
+    pointedComponentIds,
   }));
 
   const aiInfo = createGenAIClient();
   if (!aiInfo) return fallbackReplies;
 
-  const customerProfiles = sims.map(({ persona, trace, outcome, fallback }) => ({
+  const customerProfiles = sims.map(({ persona, trace, outcome, frictionLabels, fallback }) => ({
     personaId: persona.id,
     name: persona.name,
     role: persona.role,
@@ -509,6 +521,7 @@ async function voiceCohortCustomers(
     voiceSample: `${persona.greeting} / ${fallback}`,
     outcome: OUTCOME_LABELS[outcome],
     actionTrace: trace,
+    troubleComponents: frictionLabels,
   }));
 
   const targetComponents = req.currentSpec.components.filter((c) =>
@@ -525,9 +538,10 @@ async function voiceCohortCustomers(
     '【3人のお客さんそれぞれのプロフィールと実際に画面を操作した記録】',
     JSON.stringify(customerProfiles),
     '【絶対ルール】',
-    '1. 3人それぞれ（personaId ごと）が、自分の実際の操作記録と希望だけを根拠に、本人らしい口調で1文ずつ素直に答えてください。',
-    '2. こう直して・ボタンを大きくして・色を揃えて等の改善指示やデザイン用語は絶対に言わず、どこで迷ったか・何が困ったか・何が欲しかったか・どう感じたかだけを話してください。',
-    '3. 各人の text は35文字以内、括弧なし、日本語だけで書いてください。',
+    '1. 3人それぞれ（personaId ごと）が、自分の実際の操作記録（actionTrace と troubleComponents）と希望だけを根拠に、本人らしい口調で1文ずつ素直に答えてください。',
+    '2. どこで困ったか・どこの文字が小さかったか等を聞かれたときは、troubleComponents や actionTrace にある具体的な場所や表示の名前を挙げて答えてください。',
+    '3. こう直して・ボタンを大きくして・色を揃えて等の改善指示やデザイン用語は絶対に言わず、どこで迷ったか・何が困ったか・何が欲しかったか・どう感じたかだけを話してください。',
+    '4. 各人の text は35文字以内、括弧なし、日本語だけで書いてください。',
     `【これまでの会話】\n${formatHistory(req.history)}`,
   ].join('\n');
 
@@ -549,12 +563,13 @@ async function voiceCohortCustomers(
     const parsed = parseJsonResponse<{
       replies?: Array<{ personaId?: string; text?: string }>;
     }>(response.text, 'customer-cohort');
-    return sims.map(({ persona, fallback }) => {
+    return sims.map(({ persona, fallback, pointedComponentIds }) => {
       const found = (parsed.replies ?? []).find((r) => r.personaId === persona.id);
       const cleaned = cleanJapaneseText((found?.text ?? '').trim(), '');
       return {
         personaId: persona.id,
         text: cleaned || fallback,
+        pointedComponentIds,
       };
     });
   } catch (err) {
@@ -576,10 +591,13 @@ function formatLatestReviews(record: LatestReviewRecord | undefined): string {
   const header = record.isCurrentScreen
     ? `今の画面での記録です`
     : `${record.screenLabel}の画面での記録です。今の画面はそのあと変わっています`;
-  const lines = record.reviews.map(
-    (r) =>
-      `${r.name}: ${OUTCOME_LABELS[r.outcome]}\n${r.actionTrace.map((t) => `  ${t}`).join('\n')}`,
-  );
+  const lines = record.reviews.map((r) => {
+    const compNote =
+      r.frictionComponentIds && r.frictionComponentIds.length > 0
+        ? ` [つまずいた部品ID: ${r.frictionComponentIds.join(', ')}]`
+        : '';
+    return `${r.name}: ${OUTCOME_LABELS[r.outcome]}${compNote}\n${r.actionTrace.map((t) => `  ${t}`).join('\n')}`;
+  });
   return [header, ...lines].join('\n');
 }
 
@@ -1124,8 +1142,10 @@ export function applyPatchesToSpecWithValidation(
   }
 
   const ownerReaction = buildOwnerChangeReaction(ACTIVE_THEME.owner, currentSpec, updatedSpec);
-  const ownerFacts = describeOwnerChange(ACTIVE_THEME.owner, currentSpec, updatedSpec).map(
-    (f) => f.fact,
+  const ownerChanges = describeOwnerChange(ACTIVE_THEME.owner, currentSpec, updatedSpec);
+  const ownerFacts = ownerChanges.map((f) => f.fact);
+  const ownerComponentIds = Array.from(
+    new Set(ownerChanges.map((f) => f.componentId).filter((id): id is string => Boolean(id))),
   );
 
   return {
@@ -1135,6 +1155,7 @@ export function applyPatchesToSpecWithValidation(
     workSteps: describeWorkSteps(currentSpec, updatedSpec, rawPatches),
     ownerReaction,
     ownerFacts,
+    ownerComponentIds,
     validation,
     rolledBack: false,
   };
@@ -1175,7 +1196,7 @@ export async function applyOptionToSpec(req: ApplyRequest): Promise<ApplyRespons
   const prompt = [
     'あなたは開発スタジオの実装AI（お助けAI）です。人間が指示した変更に従って、サンドボックス内のアプリを更新する最小限の差分操作（patches）を返してください。',
     '【差分操作（patches）の絶対ルール】',
-    '0. 人間が頼んだ部品と、その変更のために必要な部品・状態・計算式を変えてください。頼まれていない部品を勝手に消したり書き換えたりしないでください。',
+    '0. 【赤ペンで囲まれた話題の部品】に指定された部品と、その変更のために連動して必要な部品・状態・計算式（例：注文ボタンに確認画面を足すときの確認用部品や状態 step、または削除済み部品の復元）だけを変えてください。赤ペンで囲まれていない別の既存部品を勝手に消したり書き換えたりしないでください。',
     '0-2. 指示が対象と目的だけで直し方を言っていないとき（例：定期便を望む人だけが自分で選べるようにしたい）は、その目的をかなえる具体的な変更をあなたが選んでください。変えるのは指示された対象と、目的のために必要な部品だけです。対象の機能は、目的に反しない限り消さずに残してください（定期便やクーポンを望むお客さんもいるため）。',
     '1. 変更しない部品は patches に一切含めないでください。触らない既存の product_card, choice_cards, summary 等の型は維持しつつ、人間から改造を頼まれた部品（例：広告の閉じるボタンの位置・大きさ・文字を closePosition / closeSize / closeLabel で変える、広告を status_banner や button に変える、新しい＋α機能を type: "custom" や customHtml / customCss で追加するなど）は拒絶せず指示どおり自由に実装してください。',
     '2. 使える操作 op は次の6つです：',
@@ -1232,10 +1253,28 @@ export async function applyOptionToSpec(req: ApplyRequest): Promise<ApplyRespons
         response.text,
         'apply',
       );
+      const rawPatches = Array.isArray(parsed.patches) ? parsed.patches : [];
+      const targetSet = new Set(req.targetComponentIds);
+      const isAddingStepFlow =
+        rawPatches.some((p) => p.op === 'upsert_state' && p.variable?.key === 'step') ||
+        req.currentSpec.state.some((s) => s.key === 'step');
+      const scopedPatches =
+        targetSet.size > 0
+          ? rawPatches.filter((p) => {
+              if (p.op === 'remove_component') {
+                return targetSet.has(p.id);
+              }
+              if (p.op === 'replace_component' && p.component?.id) {
+                if (targetSet.has(p.component.id)) return true;
+                return isAddingStepFlow;
+              }
+              return true;
+            })
+          : rawPatches;
       return applyPatchesToSpecWithValidation(
         req.currentSpec,
         cleanJapaneseText(parsed.commitMessage, '画面を変えました'),
-        parsed.patches,
+        scopedPatches,
         req.userInstruction,
       );
     });
@@ -1609,6 +1648,8 @@ export async function evaluateAppWithPersonas(req: EvaluateRequest): Promise<Eva
       actionTrace: sim.actionTrace,
       codeDeterminedOutcome: sim.outcome,
       codeDeterminedFriction: sim.frictionPoint,
+      codeDeterminedFrictionComponents: sim.frictionComponentIds
+        .map((id) => req.currentSpec.components.find((c) => c.id === id)?.label ?? id),
     };
   });
 
@@ -1685,6 +1726,7 @@ export async function evaluateAppWithPersonas(req: EvaluateRequest): Promise<Eva
         cleanJapaneseText(aiComment?.comment || '', sim.simulatedComment) || sim.simulatedComment,
       actionTrace: sim.actionTrace,
       appliedConstraintNote: sim.appliedConstraintNote,
+      frictionComponentIds: sim.frictionComponentIds,
     };
   });
 
@@ -1731,11 +1773,96 @@ const TRIAGE_SCHEMA: Schema = {
       type: Type.ARRAY,
       items: { type: Type.STRING },
       description:
-        '学習者が自分で指した部品のID。赤ペンで囲んだ部品、発言で名前や見た目を挙げた部品、直前に自分で押して画面通知が出た部品だけ。お客さんの発言にだけ出てくる部品は含めない',
+        '返答の中で話題にした部品・お客さんがつまずいた原因の部品・学習者が指した部品のID一覧。お助けAIが「この部品でつまずいています」「この部品が小さい設定です」と画面上の部品を指し示すときも必ずその部品IDを入れる',
     },
   },
   required: ['intent', 'reply', 'pointedComponentIds'],
 };
+
+/**
+ * 画面上にすでに存在する部品の手直し・削除には「赤ペンで囲む」（targetComponentIds の指定）を必須とする。
+ * 例外として、一度削除されて画面上に存在しない部品（定期便やクーポン等）の復活・再追加や、
+ * 既存部品のどれでもない新しい＋α機能の追加指示だけは、囲む対象が画面上にないため赤ペンなしでも受け付ける。
+ */
+export function canApplyWithoutRedPen(spec: AppSpec, userMessage: string): boolean {
+  const msg = userMessage.trim();
+  if (!msg) return false;
+  const hasSubscription = spec.components.some((c) => isSubscriptionComponent(c));
+  const hasCoupon = spec.components.some((c) => isCouponComponent(c));
+  if (!hasSubscription && /定期|サブスク/.test(msg)) return true;
+  if (!hasCoupon && /クーポン|広告|割引|500円/.test(msg)) return true;
+  const mentionsExistingTarget =
+    /注文.*ボタン|確定.*ボタン|今すぐ購入|売り切れ|残り.*時間|カウントダウン|文字.*大き|閉じるボタン|消して|削除|外して|直して/.test(
+      msg,
+    ) && !/戻して|復活|もう一度/.test(msg);
+  if (!mentionsExistingTarget && /追加して|足して|新しく.*作って|機能.*入れて/.test(msg)) {
+    return true;
+  }
+  return false;
+}
+
+function inferMentionedComponentIds(spec: AppSpec, userMessage: string): string[] {
+  const msg = userMessage.trim();
+  if (!msg) return [];
+  const matched: string[] = [];
+  for (const c of spec.components) {
+    if (
+      (/定期|サブスク/.test(msg) && isSubscriptionComponent(c)) ||
+      (/広告|クーポン|ポップアップ|500円|閉じる/.test(msg) && isCouponComponent(c)) ||
+      (/残り|時間|カウントダウン|売り切れ/.test(msg) &&
+        (c.role === 'distraction' || c.id === 'banner-countdown')) ||
+      (/今すぐ購入|黄色いボタン|おとり/.test(msg) &&
+        (c.role === 'decoy' || c.id === 'btn-buy-now')) ||
+      (/注文.*確定|確定.*ボタン|注文ボタン|確認画面/.test(msg) &&
+        (c.role === 'primary_action' || c.id === 'btn-order')) ||
+      (/やめる|キャンセル/.test(msg) && (c.role === 'danger' || c.id === 'btn-cancel'))
+    ) {
+      matched.push(c.id);
+    }
+  }
+  return matched;
+}
+
+async function buildRequireRedPenResponse(
+  req: ChatRequest,
+  extraPointedIds: string[] = [],
+): Promise<ChatResponse> {
+  const existingIds = new Set(req.currentSpec.components.map((c) => c.id));
+  const pointedIds = Array.from(
+    new Set([
+      ...inferMentionedComponentIds(req.currentSpec, req.userMessage),
+      ...extraPointedIds.filter((id) => existingIds.has(id)),
+    ]),
+  );
+  const matchedComps = pointedIds
+    .map((id) => req.currentSpec.components.find((c) => c.id === id))
+    .filter((c): c is AppComponent => Boolean(c));
+  const targetLabel =
+    matchedComps.length > 0 ? `${formatCircledTargetLabel(matchedComps)}を` : '';
+  const reply = cleanJapaneseText(
+    `${targetLabel}手直しするときは、左のスマホ画面で直したい部品を赤ペンで囲んでから指示してくださいね。`,
+    '手直しするときは、左のスマホ画面で直したい部品を赤ペンで囲んでから指示してくださいね。',
+  );
+  const telemetryEvent = req.userMessage
+    ? await recordPromptTelemetryEvent({
+        cohortId: req.cohortId,
+        runId: req.runId,
+        turnIndex: req.turnIndex,
+        shareForAggregate: req.shareForAggregate,
+        promptText: req.userMessage,
+        sessionMode: 'explore',
+        recipient: 'assistant',
+        hasPenAnnotation: false,
+      })
+    : undefined;
+  return {
+    intent: 'clarify',
+    reply,
+    suggestedFollowUps: [],
+    pointedComponentIds: pointedIds,
+    telemetryEvent,
+  };
+}
 
 async function applyFromChat(req: ChatRequest): Promise<ChatResponse> {
   const applied = await applyOptionToSpec({
@@ -1926,10 +2053,37 @@ export async function chatWithStudio(req: ChatRequest): Promise<ChatResponse> {
           effectiveReq.targetComponentIds.length > 0 || Boolean(effectiveReq.annotatedImageBase64),
       }),
     ]);
+    const ownerPointedIds =
+      effectiveReq.targetComponentIds.length > 0
+        ? effectiveReq.targetComponentIds
+        : effectiveReq.currentSpec.components
+            .filter((c) => {
+              const msg = effectiveReq.userMessage;
+              if (/定期/.test(msg) && (c.id === 'check-subscription' || c.stateKey === 'subscription')) return true;
+              if (/広告|クーポン|ポップアップ/.test(msg) && (c.role === 'popup' || c.id.includes('coupon'))) return true;
+              if (/残り|時間|カウントダウン/.test(msg) && c.role === 'distraction') return true;
+              if (/今すぐ|赤/.test(msg) && c.role === 'decoy') return true;
+              if (/注文|ボタン/.test(msg) && c.role === 'primary_action') return true;
+              return false;
+            })
+            .map((c) => c.id);
+    const fallbackOwnerIds =
+      ownerPointedIds.length > 0
+        ? ownerPointedIds
+        : effectiveReq.currentSpec.components
+            .filter(
+              (c) =>
+                c.role === 'trap' ||
+                c.role === 'popup' ||
+                c.role === 'decoy' ||
+                c.role === 'distraction',
+            )
+            .map((c) => c.id);
     return {
       intent: 'owner',
       reply: owner.text || OWNER_REPLY_FALLBACK,
       suggestedFollowUps: [],
+      pointedComponentIds: fallbackOwnerIds,
       telemetryEvent,
     };
   }
@@ -1948,17 +2102,28 @@ export async function chatWithStudio(req: ChatRequest): Promise<ChatResponse> {
           effectiveReq.targetComponentIds.length > 0 || Boolean(effectiveReq.annotatedImageBase64),
       }),
     ]);
+    const allCustomerPointedIds = Array.from(
+      new Set(customerReplies.flatMap((r) => r.pointedComponentIds ?? [])),
+    );
     return {
       intent: 'customer',
       customerPersonaId: customerReplies[0]?.personaId,
       customerReplies,
       reply: customerReplies.map((r) => r.text).join('\n'),
       suggestedFollowUps: [],
+      pointedComponentIds: allCustomerPointedIds,
       telemetryEvent,
     };
   }
 
+  const hasValidTargetForApply =
+    effectiveReq.targetComponentIds.length > 0 ||
+    canApplyWithoutRedPen(effectiveReq.currentSpec, effectiveReq.userMessage);
+
   if (!circledOnly && classifyUserMessageIntent(effectiveReq.userMessage) === 'apply') {
+    if (!hasValidTargetForApply) {
+      return buildRequireRedPenResponse(effectiveReq);
+    }
     return applyFromChat(effectiveReq);
   }
 
@@ -1972,6 +2137,7 @@ export async function chatWithStudio(req: ChatRequest): Promise<ChatResponse> {
       intent: 'explain',
       reply: `${targetName}ですね。気になることを聞くか、どう手直ししたいか教えてください`,
       suggestedFollowUps: [...CIRCLE_INQUIRY_FOLLOW_UPS],
+      pointedComponentIds: targets.map((t) => t.id),
     };
   }
 
@@ -1995,35 +2161,31 @@ export async function chatWithStudio(req: ChatRequest): Promise<ChatResponse> {
   const prompt = [
     `あなたは開発スタジオの進行役・実装担当であるお助けAIです。ユーザーが${ACTIVE_THEME.appName}についてチャットで発言しました。`,
     '【まず発言を次の3つのどれかに分けてください】',
-    '- question: 画面や部品の仕組み・お客さんの反応・このスタジオの使い方について聞いている。「嘘じゃない？」「これ何？」のような、部品に対する問いかけも question です。',
+    '- question: 画面や部品の仕組み・お客さんの反応（なぜ買えなかったか、どこの文字が小さかったか、どこで困ったか等）・このスタジオの使い方について聞いている。「嘘じゃない？」「これ何？」「どこが問題？」のような問いかけも question です。',
     '- change: 何をどう変えるかが決まる手直しや機能追加の指示。例：広告を消して、閉じるボタンを左下に移動して、広告を画面内のクーポン枠に変えて、注文ボタンを動くように直す、豆の診断機能を追加して。',
     '- change には、対象の部品と目的（誰がどうできるようにしたいか）がそろっていれば、具体的な直し方を言っていない指示も含めます。直し方を決めるのはあなたの役目です。例：定期便を望む人だけが自分で選べるようにしたい、広告はクーポンを使いたい人にだけ役立つようにして、この注意書きを目が遠い人でも読めるようにして（赤ペンで囲んでいる）。',
     '- unclear: 感想・不満・あいさつ・相づち、または変え方がまだ決まっていない発言。例：赤いボタンが邪魔、うーん、使いにくい。',
-    '- 対象も目的もない丸投げ（いい感じにして、全部直して）と、対象の部品がない目的だけの発言（高齢の人でも買いやすくして）も unclear です。どこが悪いかを見つけるのは学習者自身なので、あなたが部品を選んではいけません。',
-    '- unclear で目的は言えているときは、目的を短く受け止めてから、どの部品でそう感じたかを尋ねてください。',
+    '- 対象も目的もない丸投げ（いい感じにして、全部直して）と、対象の部品がない目的だけの発言（高齢の人でも買いやすくして）も unclear です。どう直すかを決めるのは学習者自身なので、勝手に手直ししてはいけません。',
+    '- unclear で目的は言えているときは、目的を短く受け止め、お客さんがつまずいている部品があればその部品を指し示しながら（pointedComponentIds に入れて）、どの部品をどう変えたいかを尋ねてください。',
     '【重要：消すだけに誘導せず、自由な工夫や＋α機能の実装を受け入れる】',
     '- ポップアップ広告や定期便、カウントダウン、ボタンなどは、ただ消すだけでなく、閉じるボタンの位置（左下・右下・下部バー等）や大きさを変える、画面内のバナーや割引ボタンに変える、独自の＋α機能（診断や特典など）を足すといったあらゆる手直しが可能です。「できません」と断ったり消すことだけに誘導したりせず、学習者の工夫をそのまま change として実装へ回してください。',
     '【question のときの絶対ルール】',
-    '1. 画面の現在の仕様（componentFacts と state）にある事実だけを根拠に答えてください。',
+    '1. 画面の現在の仕様（componentFacts と state）およびお客さんの操作記録（latestReviews）にある事実を根拠に、該当する部品の名前と現在の設定を具体的に指し示して（pointedComponentIds にも必ずその部品IDを入れて）答えてください。',
     '   - ボタンの actions が空配列 [] の場合は、押しても何も起きない壊れた設定になっていると事実を伝えてください。お支払い方法が未選択だから等の推測や嘘の説明は絶対にしないでください。',
     '   - role が decoy の部品は押しても何も起きないおとり、role が trap の部品は最初からチェック等が入っている仕掛け、role が popup の部品は時間差で出る広告です。',
     '   - role が info や total の部品、actions が設定された primary_action の部品について聞かれたら、正常に動いている部品だと事実を伝えてください。',
-    '   - お客さんの反応についてお助けAIに聞かれたら、お客さんが実際に操作した記録を根拠に、その人が何手目に何をしたかを、何も起きなかった操作も省かずに起きた順に伝え、最後にやめた理由・気づかなかったことを記録の言葉どおりに伝えてください。この場合に限り3文・100文字まで使ってよいです。記録が今の画面より前のものなら、どの画面での記録かも添えてください。',
-    '   - 記録に書かれていないことは推測で足さないでください。どう直せばよいか・どの部品が悪いかの判断や具体的な直し方の提案は言わず、起きたことだけを伝えてください。',
-    '   - まだお客さんの反応を見ていないときは、左下のお客さんの反応を見るで試してもらえると伝えてください。',
+    '   - お客さんの反応（「なぜ買えなかったの？」「どこの文字が小さかったの？」「どこで困ってた？」等）を聞かれたら、赤ペンで囲まれていなくても、お客さんの操作記録（actionTrace とつまずいた部品ID）および componentFacts を照らし合わせ、どの部品（label）がどんな設定（文字サイズ size が xs/sm、actions が空、初期チェック ON 等）だったためにつまずいたのかを具体的に教えてあげてください。この場合に限り3文・100文字まで使ってよいです。',
+    '   - 記録に書かれていないことは推測で足さないでください。どの部品でつまずいたか（事実の診断と画面上の指し示し）は積極的に行い、その部品を「どう直すか」（消すか、大きくするか、位置を変えるか等）の判断だけを学習者に委ねてください。',
+    '   - まだお客さんの反応を見ていないときに「どこが問題？」等と聞かれたら、左下のお客さんの反応を見るで試せることを伝えつつ、学習者が気になっている部品があれば指して聞いてみてと案内してください。',
     '   - 部品の仕様だけでは分からない動き（時間で変わる表示など）は、画面の仕組みの補足にある事実で答えてください。',
     '   - 「嘘じゃない？」のような感想まじりの問いかけには、まず気持ちを短く受け止めてから、事実を答えてください。',
-    '   - 「消した方がいい？」「残すべき？」のように判断を求められたら、自分の意見は言わず、決めるのはあなたで、お客さんの反応や店長の考えを聞けば確かめられると伝えてください。',
-    '2. 画面や部品についての質問なら、最後にどう変えたいかを短く尋ねてください。使い方の質問なら尋ねなくてかまいません。',
+    '   - 「消した方がいい？」「残すべき？」のように方針の判断を求められたら、消すことも工夫して残すこともできると伝えたうえで、お客さんの反応や店長の考えも参考にどうしたいか決めてみてと伝えてください。',
+    '2. 画面や部品についての質問なら、最後にその部品をどう変えたいかを短く尋ねてください。使い方の質問なら尋ねなくてかまいません。',
     '【unclear のときのルール】',
-    '1. 発言を短く受け止め、どこをどう変えたいかを聞き返してください。手直しはまだしません。',
-    '【どこが悪いか・どう直すかを決めるのは学習者自身です。絶対ルール】',
-    '1. 説明は、学習者が自分で指した部品についてだけ出してください。自分で指した部品とは、赤ペンで囲んだ部品、発言で名前や見た目を挙げた部品、直前に自分で押して画面通知が出た部品です。',
-    '2. 学習者が何も指していないときは、どの部品が悪いか・どこを直すべきかを一切言わないでください。左のスマホで実際に買ってみるか、気になるところを赤ペンで囲むよう短く促すだけにしてください。',
-    '3. 画面全体の問題点を挙げたり、まだ話題に出ていない部品を勧めたり、具体的な手直しの答えを先回りして教えたりしないでください。',
+    '1. 発言を短く受け止め、該当する部品があれば pointedComponentIds に入れて指し示しながら、どこをどう変えたいかを聞き返してください。手直しはまだしません。',
     '【共通のルール】',
     '1. 誰が喜ぶか・誰が困るかといったお客さんや店長の気持ちの先回り代弁や、それっぽい一般論は一切言わないでください（反応はお客さんや店長本人が言います）。',
-    '2. 若年層のチャットのように読みやすくするため、1文は35文字以内で短く区切り、合計2文以内（70文字以内）・括弧なしにしてください。',
+    '2. 若年層のチャットのように読みやすくするため、1文は35文字以内で短く区切り、合計2文以内（70文字以内、お客さんの操作記録の診断は100文字以内）・括弧なしにしてください。',
     '3. change のときは reply を空文字にしてください。',
     '',
     `【話題の部品】\n${targets.length > 0 ? JSON.stringify(targets) : '特定の部品は指していません'}`,
@@ -2081,8 +2243,11 @@ export async function chatWithStudio(req: ChatRequest): Promise<ChatResponse> {
     };
   }
 
-  // 囲んだだけのときは、AIが改造と判断しても画面は変えない
+  // 囲んだだけのときは、AIが改造と判断しても画面は変えない。また赤ペンで対象が囲まれていない場合も赤ペン囲みを促す
   if (parsed.intent === 'change' && !circledOnly) {
+    if (!hasValidTargetForApply) {
+      return buildRequireRedPenResponse(effectiveReq, parsed.pointedComponentIds ?? []);
+    }
     return applyFromChat(effectiveReq);
   }
 
@@ -2115,6 +2280,7 @@ export async function chatWithStudio(req: ChatRequest): Promise<ChatResponse> {
     intent: parsed.intent === 'unclear' ? 'clarify' : 'explain',
     reply: cleanJapaneseText(parsed.reply, 'どこをどう変えたいか教えてください'),
     suggestedFollowUps: filteredFollowUps,
+    pointedComponentIds: [...pointedIds],
     telemetryEvent,
   };
 }

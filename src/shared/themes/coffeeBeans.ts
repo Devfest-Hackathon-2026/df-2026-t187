@@ -461,9 +461,9 @@ const PERSONAS: ReviewerPersona[] = [
     age: 78,
     role: '指先が少し震えるおじいちゃん',
     icon: '客',
-    goal: '押し間違えずに、安心できる定期便があれば毎月届くように注文したい',
+    goal: '押し間違えずに安心して注文したい',
     greeting: '指が震えても押し間違えないといいんだが',
-    focusPoint: 'ボタンが十分に大きく隣に危ないボタンがないか、安心できる定期便を選べるか',
+    focusPoint: 'ボタンや選択欄が十分に大きく、隣に危ないボタンがないか',
     constraints: {
       blurPx: 1.2,
       contrast: 0.85,
@@ -475,7 +475,6 @@ const PERSONAS: ReviewerPersona[] = [
       readsFinePrint: true,
       wantsConfirmation: false,
       needsReadableTotal: false,
-      wantsSubscription: true,
     },
   },
   {
@@ -560,9 +559,9 @@ const PERSONAS: ReviewerPersona[] = [
     age: 41,
     role: '通勤電車で操作する会社員',
     icon: '客',
-    goal: '揺れる電車でも押し間違えず、毎回頼む手間が省ける定期便があれば申し込みたい',
+    goal: '揺れる電車でも押し間違えずにさっと注文したい',
     greeting: '電車で揺れても押し間違えないといいな',
-    focusPoint: '押し間違えると困るボタンが近くにないか、納得できる定期便を選べるか',
+    focusPoint: '押し間違えると困るボタンや小さな選択欄がないか',
     constraints: {
       blurPx: 0.9,
       contrast: 0.9,
@@ -574,7 +573,6 @@ const PERSONAS: ReviewerPersona[] = [
       readsFinePrint: true,
       wantsConfirmation: false,
       needsReadableTotal: false,
-      wantsSubscription: true,
     },
   },
   // ==================== 損をしたくない人 ====================
@@ -771,7 +769,7 @@ export const COFFEE_BEANS_THEME: ThemeDefinition = {
   implementerNotes: [
     '注文を確定するボタンには role を primary_action にし、actions に { "type": "complete_task", "message": "ご購入ありがとうございます" } を必ず残してください。',
     '合計金額などの計算は derived に式で書き、表示はラベルに {total} のように状態キーを差し込んでください。割引や特典を足すときは upsert_state と upsert_derived で total の計算式にも反映してください。ただし状態 couponDiscount（クーポン割引、最初は0）があるときは、total の式がすでにそれを引いているので、クーポンを使う部品には { "type": "set_state", "targetKey": "couponDiscount", "value": 500 } のような動きを付けるだけにし、計算式は変えないでください。',
-    '確認画面を作るときは、状態 step を追加し、visibleWhen で入力画面と確認画面を切り替えてください。確認画面へ進むボタンも role は primary_action です。',
+    '確認画面を作るときは、状態 step を追加し、visibleWhen で入力画面と確認画面を切り替えてください。確認画面へ進むボタンも role は primary_action です。確認画面に追加する内容表示（summary や text）やボタンの文字サイズ（style.size）は、目が遠い人でも読めるよう md 以上にしてください。',
     '合計金額と注文を確定するボタンは style.sticky を true にして画面下に固定してください。',
     '部品の style.skin（intrusive や native）や style.variant は、人間から「見た目を落ち着かせて」「元のデザインに揃えて」「色を変えて」など見た目を変える指示があったときだけ変更し、動きや文字だけの指示では元の値をそのまま残してください。',
     'ポップアップ（type: popup）の閉じるボタンの位置・大きさ・文字を変える指示には、replace_component で closePosition（top-right / top-left / bottom-right / bottom-left / bottom-bar）、closeSize（xs〜xl）、closeLabel（閉じる 等）を設定してください。ポップアップを画面内のバナーやボタンに変える指示なら type を status_banner や button や custom に変更してよいです。',

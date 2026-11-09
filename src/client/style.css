@@ -1427,6 +1427,42 @@ body {
   max-width: 90%;
 }
 
+.pointed-comp-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 2px;
+}
+
+.pointed-comp-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-family: inherit;
+  font-size: 0.72rem;
+  font-weight: 800;
+  color: #1e40af;
+  background: #eff6ff;
+  border: 1px solid #bfdbfe;
+  border-radius: 999px;
+  padding: 2px 9px;
+  cursor: pointer;
+  transition:
+    background 0.14s ease,
+    border-color 0.14s ease,
+    transform 0.12s ease;
+}
+
+.pointed-comp-chip:hover {
+  background: #dbeafe;
+  border-color: #93c5fd;
+  transform: translateY(-1px);
+}
+
+.pointed-comp-chip:active {
+  transform: translateY(0);
+}
+
 /* 作戦カードを載せるため、エージェントの吹き出しは広めにとる */
 .chat-bubble-row.is-agent .speaker-body {
   max-width: 92%;

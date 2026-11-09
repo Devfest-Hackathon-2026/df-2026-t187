@@ -246,6 +246,8 @@ export interface ComputerUseSimulationResult {
   simulatedComment: string;
   actionTrace: string[];
   appliedConstraintNote: string;
+  /** つまずき・不満・後悔の原因になった部品のID一覧 */
+  frictionComponentIds: string[];
   /** 完了したときの状態（定期便に入ったままか等、お店の側の集計に使う） */
   finalState?: AppState;
 }
@@ -421,6 +423,7 @@ type FailureReason =
   | 'unreadable_input'
   | 'unreachable'
   | 'hit_danger'
+  | 'tap_target_too_small'
   | 'left_page'
   | 'decoy_only'
   | 'no_response'
@@ -454,6 +457,10 @@ const FAILURE_TEXT: Record<FailureReason, { friction: string; comment: string }>
   hit_danger: {
     friction: '押し間違えて入力が消えた',
     comment: '押し間違えて、入力した内容が全部消えてしまった',
+  },
+  tap_target_too_small: {
+    friction: 'ボタンや選択欄が小さくて押せない',
+    comment: '指がズレてうまく押せなくて、あきらめた',
   },
   left_page: {
     friction: '別のページに飛ばされた',
@@ -587,11 +594,15 @@ export function simulatePersonaComputerUse(
   const appliedInlineCouponIds = new Set<string>();
   let pressureNoticed = false;
   let sawSubscriptionOption = false;
+  let sawHonestSubscriptionOption = false;
+  const seenSubscriptionIds: string[] = [];
   // クーポンは実際に目にしたときだけ「見た」とする（画面内の表示を見たか、クーポン広告が出たとき）
   let sawCouponFeature = false;
+  const seenCouponIds: string[] = [];
   // クーポンを押してみたか、押して実際に合計が下がったか。下がらなければ、使いたかった人は満足しない
   let triedCoupon = false;
   let couponLoweredTotal = false;
+  let lastFailureComponentIds: string[] = [];
   /** クーポンの動きを適用し、合計が下がったかを記録する。合計の計算がない題材では、適用できたことをもって使えたとする */
   const useCoupon = (actions: ComponentAction[]): void => {
     triedCoupon = true;
@@ -603,15 +614,32 @@ export function simulatePersonaComputerUse(
     }
   };
   /** 買えたとしても嫌な思いをしたこと。1つでもあれば「買えたけど不満」になる */
-  const bothers: Array<{ friction: string; comment: string }> = [];
+  const bothers: Array<{ friction: string; comment: string; componentIds: string[] }> = [];
 
-  const fail = (reason: FailureReason): ComputerUseSimulationResult => ({
-    outcome: 'abandoned',
-    frictionPoint: FAILURE_TEXT[reason].friction,
-    simulatedComment: FAILURE_TEXT[reason].comment,
-    actionTrace,
-    appliedConstraintNote,
-  });
+  const fail = (
+    reason: FailureReason,
+    componentIds: string[] = lastFailureComponentIds,
+  ): ComputerUseSimulationResult => {
+    const extraIds =
+      reason === 'too_many_steps' || reason === 'timeout'
+        ? [...Array.from(triedDecoyIds), ...bothers.flatMap((b) => b.componentIds)]
+        : reason === 'no_confirmation'
+          ? [
+              ...Array.from(triedDecoyIds),
+              ...bothers
+                .filter((b) => b.friction === '残り時間で急かされた')
+                .flatMap((b) => b.componentIds),
+            ]
+          : [];
+    return {
+      outcome: 'abandoned',
+      frictionPoint: FAILURE_TEXT[reason].friction,
+      simulatedComment: FAILURE_TEXT[reason].comment,
+      actionTrace,
+      appliedConstraintNote,
+      frictionComponentIds: Array.from(new Set([...extraIds, ...componentIds].filter(Boolean))),
+    };
+  };
 
   const overBudget = (): FailureReason | null => {
     if (steps > c.maxSteps) return 'too_many_steps';
@@ -631,6 +659,7 @@ export function simulatePersonaComputerUse(
     elapsedMs += MS_PER_STEP;
     if (c.environment === 'one_hand' && !box.comp.style.fullWidth && box.centerX > ONE_HAND_REACH_X) {
       actionTrace.push(`${steps}手目: 右端の${box.comp.label}に親指が届かない`);
+      lastFailureComponentIds = [box.comp.id];
       return 'unreachable';
     }
     const { dx, dy } = computeDeterministicJitter(persona.id, steps, c.jitterPx);
@@ -646,6 +675,7 @@ export function simulatePersonaComputerUse(
     );
     if (other?.comp.role === 'danger' && other.comp.type === 'button') {
       actionTrace.push(`${steps}手目: 指がズレて${other.comp.label}を押してしまった`);
+      lastFailureComponentIds = [other.comp.id, box.comp.id];
       return 'danger';
     }
     actionTrace.push(`${steps}手目: ${box.comp.label}を狙ったが指がズレて外れた`);
@@ -671,7 +701,10 @@ export function simulatePersonaComputerUse(
     );
     for (const popup of due) {
       closedPopups.add(popup.id);
-      if (isCouponComponent(popup)) sawCouponFeature = true;
+      if (isCouponComponent(popup)) {
+        sawCouponFeature = true;
+        if (!seenCouponIds.includes(popup.id)) seenCouponIds.push(popup.id);
+      }
       const closePos = popup.closePosition ?? 'top-right';
       const effectiveCloseSize: ComponentSize =
         popup.closeSize ?? (closePos === 'bottom-bar' ? 'lg' : popup.style.size);
@@ -698,6 +731,7 @@ export function simulatePersonaComputerUse(
         steps++;
         elapsedMs += MS_POPUP;
         actionTrace.push(`${steps}手目: ${popup.label}が画面を覆い、閉じるボタンが見えない`);
+        lastFailureComponentIds = [popup.id];
         return 'popup_unclosable';
       }
 
@@ -716,12 +750,14 @@ export function simulatePersonaComputerUse(
         const { dx, dy } = computeDeterministicJitter(persona.id, steps, c.jitterPx);
         if (Math.abs(dx) > closeHalf || Math.abs(dy) > closeHalf) {
           actionTrace.push(`${steps}手目: 広告の小さな閉じるボタンを外し、広告を押してしまった`);
+          lastFailureComponentIds = [popup.id];
           return 'popup_tapped';
         }
         actionTrace.push(`${steps}手目: ${popup.label}を閉じた`);
         bothers.push({
           friction: '途中で広告を閉じさせられた',
           comment: '途中で広告が出てきて、閉じるのが面倒だった',
+          componentIds: [popup.id],
         });
       } else if (hasHelpfulAction) {
         if (isCouponComponent(popup)) {
@@ -742,6 +778,7 @@ export function simulatePersonaComputerUse(
     box: SimulatedBox,
     boxes: SimulatedBox[],
   ): 'hit' | FailureReason => {
+    let missCount = 0;
     for (;;) {
       const popupFailure = closeDuePopups();
       if (popupFailure) return popupFailure;
@@ -749,8 +786,15 @@ export function simulatePersonaComputerUse(
       if (result === 'hit') return 'hit';
       if (result === 'danger') return 'hit_danger';
       if (result === 'unreachable') return 'unreachable';
+      missCount++;
       const budget = overBudget();
-      if (budget) return budget;
+      if (budget) {
+        lastFailureComponentIds = [box.comp.id];
+        if (steps - missCount < c.maxSteps) {
+          return 'tap_target_too_small';
+        }
+        return budget;
+      }
     }
   };
 
@@ -764,10 +808,14 @@ export function simulatePersonaComputerUse(
     if (popupFailure) return fail(popupFailure);
 
     // 2. 関係ない表示が多すぎると迷う
-    const distractions = visible.filter((comp) => comp.role === 'distraction').length;
+    const distractionComps = visible.filter((comp) => comp.role === 'distraction');
+    const distractions = distractionComps.length;
     if (distractions > c.clutterTolerance) {
       actionTrace.push(`画面確認: 関係ない表示が${distractions}個あり、どこを見ればいいか迷って離脱`);
-      return fail('clutter');
+      return fail(
+        'clutter',
+        distractionComps.map((d) => d.id),
+      );
     }
     elapsedMs += distractions * MS_PER_DISTRACTION;
 
@@ -778,15 +826,24 @@ export function simulatePersonaComputerUse(
     if (pressure && c.dislikesPressure && !pressureNoticed) {
       pressureNoticed = true;
       actionTrace.push(`画面確認: ${renderLabel(pressure, state)}で急かされて嫌な気分になった`);
-      bothers.push({ friction: '残り時間で急かされた', comment: '残り時間で急かされて、落ち着いて選べなかった' });
+      bothers.push({
+        friction: '残り時間で急かされた',
+        comment: '残り時間で急かされて、落ち着いて選べなかった',
+        componentIds: [pressure.id],
+      });
     }
 
     // 漢数字の値段は読むのに時間がかかる
-    if (!kanjiPenaltyApplied && visible.some((comp) => comp.style.numberFormat === 'kanji')) {
+    const kanjiComps = visible.filter((comp) => comp.style.numberFormat === 'kanji');
+    if (!kanjiPenaltyApplied && kanjiComps.length > 0) {
       kanjiPenaltyApplied = true;
       elapsedMs += MS_KANJI_READING;
       actionTrace.push('画面確認: 漢数字の値段を読むのに時間がかかった');
-      bothers.push({ friction: '値段が読みにくかった', comment: '値段が漢数字で、いくらなのか読むのに手間取った' });
+      bothers.push({
+        friction: '値段が読みにくかった',
+        comment: '値段が漢数字で、いくらなのか読むのに手間取った',
+        componentIds: kanjiComps.map((k) => k.id),
+      });
     }
 
     // 3a. 必須入力を一括で埋めるショートカット（「前回と同じ設定」等の＋α機能）があれば活用する
@@ -818,7 +875,7 @@ export function simulatePersonaComputerUse(
       if (isInputFilled(comp, state)) continue;
       if (!canRead(comp, persona)) {
         actionTrace.push(`画面確認: ${comp.label}の文字が小さくて読めず離脱`);
-        return fail('unreadable_input');
+        return fail('unreadable_input', [comp.id]);
       }
       const box = boxOf(comp);
       if (!box) continue;
@@ -830,7 +887,7 @@ export function simulatePersonaComputerUse(
       }
       actionTrace.push(`${steps}手目: ${comp.label}を入力した`);
       const budget = overBudget();
-      if (budget) return fail(budget);
+      if (budget) return fail(budget, [comp.id]);
     }
 
     // 4. 罠に気づけば直す（細かい字を読む人が、読める大きさの場合だけ）
@@ -839,8 +896,12 @@ export function simulatePersonaComputerUse(
       if (!c.readsFinePrint || !canRead(comp, persona)) continue;
       noticedTrapIds.add(comp.id);
       if (comp.trapSafeValue === undefined || !comp.stateKey) {
-        actionTrace.push(`画面確認: ${comp.label}に気づいたうえで進む`);
-        bothers.push({ friction: '分かりにくい条件が付いていた', comment: `${comp.label}に気づいたけど、なんだか気分が悪い` });
+        actionTrace.push(`画面確認: ${comp.label}の不親切な条件に気づいたうえで進む`);
+        bothers.push({
+          friction: '分かりにくい条件が付いていた',
+          comment: `${comp.label}に気づいたけど、なんだか気分が悪い`,
+          componentIds: [comp.id],
+        });
         continue;
       }
       const box = boxOf(comp);
@@ -848,20 +909,28 @@ export function simulatePersonaComputerUse(
       const result = tapUntilHit(box, boxes);
       if (result !== 'hit') return fail(result);
       state = { ...state, [comp.stateKey]: comp.trapSafeValue };
-      actionTrace.push(`${steps}手目: ${comp.label}に気づいて直した`);
-      bothers.push({ friction: '勝手に付いていた申し込みを外した', comment: `危うく${comp.label}のまま買うところだった` });
+      actionTrace.push(`${steps}手目: 最初から付いていた${comp.label}に気づいて直した`);
+      bothers.push({
+        friction: '勝手に付いていた申し込みを外した',
+        comment: `危うく${comp.label}のまま買うところだった`,
+        componentIds: [comp.id],
+      });
       const budget = overBudget();
-      if (budget) return fail(budget);
+      if (budget) return fail(budget, [comp.id]);
     }
 
     // 4b. 正直な定期便（最初からOFF・読める文字サイズ・不当な縛り文言なし）なら、定期便を望む人やよく読む人は自分の意思で申し込む
     for (const comp of visible.filter((v) => isSubscriptionComponent(v))) {
       sawSubscriptionOption = true;
+      if (!seenSubscriptionIds.includes(comp.id)) seenSubscriptionIds.push(comp.id);
       const initialSub = spec.state.find((s) => s.key === 'subscription')?.initialValue;
       const isHonest =
         isHonestOptInComponent(comp, initialSub) &&
         state.subscription === false &&
         canRead(comp, persona);
+      if (isHonest) {
+        sawHonestSubscriptionOption = true;
+      }
       if (isHonest && (c.readsFinePrint || c.wantsSubscription) && !noticedTrapIds.has(comp.id)) {
         noticedTrapIds.add(comp.id);
         state = { ...state, subscription: true };
@@ -872,6 +941,7 @@ export function simulatePersonaComputerUse(
     // 4c. 画面内に残されたクーポンバナーや特典ボタンがあれば確認・適用する
     for (const comp of visible.filter((v) => v.type !== 'popup' && isCouponComponent(v))) {
       sawCouponFeature = true;
+      if (!seenCouponIds.includes(comp.id)) seenCouponIds.push(comp.id);
       const actions = couponActionsOf(spec, comp);
       if (
         !appliedInlineCouponIds.has(comp.id) &&
@@ -887,14 +957,21 @@ export function simulatePersonaComputerUse(
     }
 
     // 確認画面（2画面目以降）で内容表示の文字が小さすぎて読めないと不満が残る
+    // （ステップ番号や見出しではなく、注文内容や合計金額などの確認項目を対象にする）
     if (screen > 0) {
       const unreadableConfirmInfo = visible.find(
-        (v) => (v.role === 'info' || v.role === 'total') && !canRead(v, persona),
+        (v) =>
+          (v.role === 'info' || v.role === 'total') &&
+          v.type !== 'progress_steps' &&
+          v.type !== 'heading' &&
+          !canRead(v, persona),
       );
       if (unreadableConfirmInfo) {
+        actionTrace.push(`画面確認: 確認画面の${unreadableConfirmInfo.label}の文字が小さくて確かめづらかった`);
         bothers.push({
           friction: '確認画面の文字が小さかった',
           comment: '確認画面の文字が小さくて、内容を確かめづらかった',
+          componentIds: [unreadableConfirmInfo.id],
         });
       }
     }
@@ -910,7 +987,7 @@ export function simulatePersonaComputerUse(
     const pool = readable.length > 0 ? readable : buttons;
     if (pool.length === 0) {
       actionTrace.push('画面確認: 進むためのボタンが見つからず離脱');
-      return fail('no_target');
+      return fail('no_target', []);
     }
     const preferred =
       c.readsFinePrint && readable.length > 0
@@ -929,24 +1006,29 @@ export function simulatePersonaComputerUse(
       );
       if (!readableTotal) {
         actionTrace.push('画面確認: 合計金額がすぐに読み取れず、買うのをやめた');
-        return fail('total_unreadable');
+        return fail(
+          'total_unreadable',
+          totals.map((t) => t.id),
+        );
       }
     }
     const confirmsOnTap = target.comp.behavior?.effect === 'confirm_dialog';
     if (isCompletion && c.wantsConfirmation && !confirmedOnEarlierScreen && !confirmsOnTap) {
       actionTrace.push(`画面確認: 確認なしで${target.comp.label}を押すのが怖くて離脱`);
-      return fail('no_confirmation');
+      return fail('no_confirmation', [target.comp.id]);
     }
 
     // 6. 押す
     const tapResult = tapUntilHit(target, boxes);
     if (tapResult !== 'hit') {
-      if (tapResult === 'hit_danger' && target.comp.role === 'danger') return fail('hit_danger');
+      if (tapResult === 'hit_danger' && target.comp.role === 'danger') {
+        return fail('hit_danger', [target.comp.id]);
+      }
       return fail(tapResult);
     }
     if (target.comp.role === 'danger') {
       actionTrace.push(`${steps}手目: 一番目立つ${target.comp.label}を押してしまい、入力が消えた`);
-      return fail('hit_danger');
+      return fail('hit_danger', [target.comp.id]);
     }
 
     const effect = target.comp.behavior?.effect ?? 'none';
@@ -965,21 +1047,27 @@ export function simulatePersonaComputerUse(
     }
     const budget = overBudget();
     if (budget) {
-      actionTrace.push(`${steps}手目: ${target.comp.label}を押したが、手順が多すぎて離脱`);
-      return fail(budget);
+      actionTrace.push(
+        `${steps}手目: そこまでの手順が多すぎて、${target.comp.label}で完了する前に離脱`,
+      );
+      return fail(budget, [target.comp.id]);
     }
 
     if (target.comp.actions.length === 0) {
       if (target.comp.role === 'decoy') {
         actionTrace.push(`${steps}手目: 目立つ${target.comp.label}を押したが何も起きない`);
         triedDecoyIds.add(target.comp.id);
-        bothers.push({ friction: '目立つボタンが効かなかった', comment: `${target.comp.label}を押しても何も起きなくて焦った` });
+        bothers.push({
+          friction: '目立つボタンが効かなかった',
+          comment: `${target.comp.label}を押しても何も起きなくて焦った`,
+          componentIds: [target.comp.id],
+        });
         screen--;
-        if (triedDecoyIds.size >= 3) return fail('decoy_only');
+        if (triedDecoyIds.size >= 3) return fail('decoy_only', Array.from(triedDecoyIds));
         continue;
       }
       actionTrace.push(`${steps}手目: ${target.comp.label}を押したが何も起きず離脱`);
-      return fail('no_response');
+      return fail('no_response', [target.comp.id]);
     }
 
     const result = applyActions(spec, state, target.comp.actions);
@@ -987,7 +1075,7 @@ export function simulatePersonaComputerUse(
 
     if (result.openedPage && !result.completed) {
       actionTrace.push(`${steps}手目: ${target.comp.label}を押したら${result.openedPage}のページに飛ばされた`);
-      return fail('left_page');
+      return fail('left_page', [target.comp.id]);
     }
 
     if (result.completed) {
@@ -1009,6 +1097,7 @@ export function simulatePersonaComputerUse(
           simulatedComment: `注文はできたけど、あとで${activeTraps[0].label}になっていたと気づいた`,
           actionTrace,
           appliedConstraintNote,
+          frictionComponentIds: activeTraps.map((t) => t.id),
           finalState: state,
         };
       }
@@ -1021,6 +1110,14 @@ export function simulatePersonaComputerUse(
         bothers.push({
           friction: '定期便の設定がなかった',
           comment: '毎月届けてほしいのに設定がなくて残念',
+          componentIds: [],
+        });
+      } else if (c.wantsSubscription && hadSubscriptionInShop && !sawHonestSubscriptionOption && !state.subscription) {
+        actionTrace.push('画面確認: 定期便の設定はあったが、文字が小さいか条件が不安で選べなかった');
+        bothers.push({
+          friction: '定期便の条件が分かりづらくて選べなかった',
+          comment: '定期便にしたかったけど、字が小さいか条件が不安で選べなかった',
+          componentIds: seenSubscriptionIds,
         });
       }
       const hadCouponInShop = hasCouponFeatureInShop(spec);
@@ -1029,6 +1126,7 @@ export function simulatePersonaComputerUse(
         bothers.push({
           friction: COUPON_FRICTIONS.missing,
           comment: 'クーポンは無くなってしまったのか、使いたかったのに残念',
+          componentIds: [],
         });
       } else if (c.wantsCoupon && hadCouponInShop && !couponLoweredTotal) {
         if (triedCoupon) {
@@ -1036,12 +1134,14 @@ export function simulatePersonaComputerUse(
           bothers.push({
             friction: COUPON_FRICTIONS.noDiscount,
             comment: 'クーポンを使ったのに、合計が安くなっていなかった',
+            componentIds: seenCouponIds,
           });
         } else {
           actionTrace.push('画面確認: クーポンの表示はあったが、この画面で使う方法がなかった');
           bothers.push({
             friction: COUPON_FRICTIONS.unusable,
             comment: 'クーポンがあるのに、ここで使えなくて残念',
+            componentIds: seenCouponIds,
           });
         }
       }
@@ -1052,6 +1152,7 @@ export function simulatePersonaComputerUse(
           simulatedComment: `買えたけど、${bothers[0].comment}`,
           actionTrace,
           appliedConstraintNote,
+          frictionComponentIds: Array.from(new Set(bothers.flatMap((b) => b.componentIds).filter(Boolean))),
           finalState: state,
         };
       }
@@ -1061,6 +1162,7 @@ export function simulatePersonaComputerUse(
         simulatedComment: '迷わずに最後まで注文できた',
         actionTrace,
         appliedConstraintNote,
+        frictionComponentIds: [],
         finalState: state,
       };
     }
@@ -1071,5 +1173,5 @@ export function simulatePersonaComputerUse(
   }
 
   actionTrace.push('画面を行き来するだけで完了にたどり着けず離脱');
-  return fail('too_many_steps');
+  return fail('too_many_steps', []);
 }

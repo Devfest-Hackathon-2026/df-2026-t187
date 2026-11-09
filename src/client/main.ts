@@ -96,6 +96,8 @@ interface TimelineMessage {
   };
   /** この発言が対象にしている、赤ペンで囲んだ部品 */
   targetComponentIds?: string[];
+  /** お客さん・お助けAI・店長が画面上で指し示している部品のID一覧 */
+  pointedComponentIds?: string[];
   /** 改造の作業の過程。システムのメッセージとして1行ずつ進み、完了後もそのまま残す */
   workLog?: {
     steps: Array<{ text: string; done: boolean; componentId?: string }>;
@@ -881,17 +883,36 @@ function findLatestCohortEvaluation(
 /** 今の画面か、それより前で一番新しくお客さんの反応を見た画面の、操作の記録 */
 function buildLatestReviewRecord(): LatestReviewRecord | undefined {
   const found = findLatestCohortEvaluation();
-  if (!found) return undefined;
-  const { checkpoint: cp, index: i, evaluation } = found;
+  if (found) {
+    const { checkpoint: cp, index: i, evaluation } = found;
+    return {
+      screenLabel: formatCheckpointLabel(cp),
+      isCurrentScreen: i === state.activeCheckpointIndex,
+      reviews: evaluation.results.map((r) => ({
+        name: findPersona(r.reviewerId)?.name ?? r.reviewerId,
+        outcome: r.outcome,
+        actionTrace: r.actionTrace ?? [],
+        frictionComponentIds: r.frictionComponentIds ?? [],
+      })),
+      ownerMetrics: evaluation.owner?.metrics,
+    };
+  }
+  if (!state.selectedCohortId) return undefined;
+  const initialCp = state.checkpoints[0];
+  if (!initialCp) return undefined;
+  const reviewers = getReviewersByCohort(state.selectedCohortId);
   return {
-    screenLabel: formatCheckpointLabel(cp),
-    isCurrentScreen: i === state.activeCheckpointIndex,
-    reviews: evaluation.results.map((r) => ({
-      name: findPersona(r.reviewerId)?.name ?? r.reviewerId,
-      outcome: r.outcome,
-      actionTrace: r.actionTrace ?? [],
-    })),
-    ownerMetrics: evaluation.owner?.metrics,
+    screenLabel: formatCheckpointLabel(initialCp),
+    isCurrentScreen: state.activeCheckpointIndex === 0,
+    reviews: reviewers.map((p) => {
+      const sim = simulatePersonaComputerUse(initialCp.spec, p);
+      return {
+        name: p.name,
+        outcome: sim.outcome,
+        actionTrace: sim.actionTrace,
+        frictionComponentIds: sim.frictionComponentIds,
+      };
+    }),
   };
 }
 
@@ -1080,6 +1101,14 @@ function pushMessage(
     ...msg,
   };
   state.messages.push(full);
+  if (
+    full.role !== 'user' &&
+    full.role !== 'system' &&
+    full.pointedComponentIds &&
+    full.pointedComponentIds.length > 0
+  ) {
+    highlightSandboxComponent(full.pointedComponentIds[0]);
+  }
   if (!options?.skipAutoTts) {
     playCloudTtsForMessage(full);
   }
@@ -1663,7 +1692,12 @@ async function playCohortHearing(cohort: (typeof TARGET_COHORTS)[number], curren
       abandonedCount++;
       unhappyNames.push(persona.name);
       hearingQueue.push({
-        message: { role: 'customer', personaId: persona.id, text: sim.simulatedComment },
+        message: {
+          role: 'customer',
+          personaId: persona.id,
+          text: sim.simulatedComment,
+          pointedComponentIds: sim.frictionComponentIds,
+        },
         typingMs: typingDurationFor(sim.simulatedComment),
       });
     }
@@ -1893,11 +1927,36 @@ function startWorkLog(targetIds: string[]): TimelineMessage {
 
 let highlightClearTimer: number | null = null;
 
-/** システムメッセージの作業行をクリックしたとき、スマホ内の該当部品へスクロールして光らせる */
+/** システムメッセージの作業行や指し示しチップをクリックしたとき、スマホ内の該当部品を表示してスクロール・発光させる（赤ペン選択の代わりにはしない） */
 function highlightSandboxComponent(componentId: string): void {
   if (highlightClearTimer !== null) {
     window.clearTimeout(highlightClearTimer);
     highlightClearTimer = null;
+  }
+  const spec = getCurrentSpec();
+  const comp = spec.components.find((c) => c.id === componentId);
+  if (comp) {
+    if (comp.visibleWhen && comp.visibleWhen.operator === 'eq') {
+      state.liveAppState = {
+        ...state.liveAppState,
+        [comp.visibleWhen.stateKey]: comp.visibleWhen.value,
+      };
+    }
+    if (comp.type === 'popup' && comp.stateKey) {
+      state.liveAppState = {
+        ...state.liveAppState,
+        [comp.stateKey]: 'open',
+      };
+    } else if (comp.type !== 'popup') {
+      for (const p of spec.components) {
+        if (p.type === 'popup' && p.stateKey && state.liveAppState[p.stateKey] === 'open') {
+          state.liveAppState = {
+            ...state.liveAppState,
+            [p.stateKey]: 'closed',
+          };
+        }
+      }
+    }
   }
   state.justChangedIds = [componentId];
   renderStudio();
@@ -2282,8 +2341,8 @@ async function handleSendMessage(
   const abortController = new AbortController();
   activeUserSendAbort = abortController;
   state.chatLoading = true;
-  // はっきりした改造の指示（かつ店長やお客さん宛てでないとき）なら、返事を待つ間から作業の過程をシステムメッセージで見せる
-  const canApplyDirectly = recipientSnapshot === 'assistant';
+  // はっきりした改造の指示（かつ赤ペンで部品を囲んでいて、店長やお客さん宛てでないとき）なら、返事を待つ間から作業の過程をシステムメッセージで見せる
+  const canApplyDirectly = recipientSnapshot === 'assistant' && targetIdsSnapshot.length > 0;
   let logMessage: TimelineMessage | undefined =
     canApplyDirectly && text && classifyUserMessageIntent(text) === 'apply'
       ? startWorkLog(targetIdsSnapshot)
@@ -2335,6 +2394,9 @@ async function handleSendMessage(
       // お助けエージェントが判断して改造に進んだときは、ここで作業ログを出す
       logMessage ??= startWorkLog(targetIdsSnapshot);
       if (!applied.rolledBack) {
+        // 手直しが完了したら赤ペンの選択状態を解除し、次の手直しでは再び赤ペンで囲んでもらうようにする
+        state.topicTargetIds = [];
+        state.circledComponentIds = [];
         // 新しい画面にしてから作業を1行ずつ流し、変えた部品を光らせる
         pushNewCheckpoint(applied.commitMessage, applied.updatedSpec);
       }
@@ -2379,6 +2441,7 @@ async function handleSendMessage(
             },
             evalChoiceMsg,
             abortController.signal,
+            applied.ownerComponentIds,
           );
           return;
         }
@@ -2389,10 +2452,22 @@ async function handleSendMessage(
     } else if (data.intent === 'owner') {
       // 店長に話しかけたときは、店長本人が返事をする
       if (logMessage) state.messages = state.messages.filter((m) => m !== logMessage);
+      if (targetIdsSnapshot.length > 0) {
+        state.circledComponentIds = [...targetIdsSnapshot];
+        state.topicTargetIds = [...targetIdsSnapshot];
+      }
+      if (data.pointedComponentIds?.length) {
+        highlightSandboxComponent(data.pointedComponentIds[0]);
+      }
       state.chatLoading = false;
+      const chunks = splitIntoChatChunks(data.reply);
       enqueueMessages(
-        splitIntoChatChunks(data.reply).map((chunk, i) => ({
-          message: { role: 'owner' as const, text: chunk },
+        chunks.map((chunk, i) => ({
+          message: {
+            role: 'owner' as const,
+            text: chunk,
+            pointedComponentIds: i === chunks.length - 1 ? data.pointedComponentIds : undefined,
+          },
           typingMs: i === 0 ? 400 : typingDurationFor(chunk),
         })),
       );
@@ -2400,16 +2475,38 @@ async function handleSendMessage(
     } else if (data.intent === 'customer') {
       // お客さんに話しかけたときは、選んだ客層の3人が順番に一言ずつ返事をする
       if (logMessage) state.messages = state.messages.filter((m) => m !== logMessage);
+      if (targetIdsSnapshot.length > 0) {
+        state.circledComponentIds = [...targetIdsSnapshot];
+        state.topicTargetIds = [...targetIdsSnapshot];
+      }
+      if (data.pointedComponentIds?.length) {
+        highlightSandboxComponent(data.pointedComponentIds[0]);
+      }
       state.chatLoading = false;
       const replies =
         data.customerReplies && data.customerReplies.length > 0
           ? data.customerReplies
-          : [{ personaId: data.customerPersonaId ?? '', text: data.reply }];
+          : [
+              {
+                personaId: data.customerPersonaId ?? '',
+                text: data.reply,
+                pointedComponentIds: data.pointedComponentIds,
+              },
+            ];
       const queued: QueuedMessage[] = [];
       replies.forEach((item, idx) => {
-        for (const [chunkIdx, chunk] of splitIntoChatChunks(item.text).entries()) {
+        const chunks = splitIntoChatChunks(item.text);
+        for (const [chunkIdx, chunk] of chunks.entries()) {
           queued.push({
-            message: { role: 'customer' as const, personaId: item.personaId, text: chunk },
+            message: {
+              role: 'customer' as const,
+              personaId: item.personaId,
+              text: chunk,
+              pointedComponentIds:
+                chunkIdx === chunks.length - 1
+                  ? (item.pointedComponentIds ?? data.pointedComponentIds)
+                  : undefined,
+            },
             typingMs: idx === 0 && chunkIdx === 0 ? 400 : typingDurationFor(chunk),
           });
         }
@@ -2419,12 +2516,20 @@ async function handleSendMessage(
     } else {
       // 改造だと思って作業ログを出したが、質問や聞き返しだったときは消す
       if (logMessage) state.messages = state.messages.filter((m) => m !== logMessage);
+      if (targetIdsSnapshot.length > 0) {
+        state.circledComponentIds = [...targetIdsSnapshot];
+        state.topicTargetIds = [...targetIdsSnapshot];
+      }
+      if (data.pointedComponentIds?.length) {
+        highlightSandboxComponent(data.pointedComponentIds[0]);
+      }
       const replyChunks = splitIntoChatChunks(data.reply);
       const [firstChunk, ...restChunks] = replyChunks;
       pushMessage({
         role: 'assistant',
         text: firstChunk,
         targetComponentIds: targetIdsSnapshot,
+        pointedComponentIds: restChunks.length === 0 ? data.pointedComponentIds : undefined,
       });
       const followUpMsg: Omit<TimelineMessage, 'id'> | undefined =
         data.suggestedFollowUps && data.suggestedFollowUps.length > 0
@@ -2437,11 +2542,13 @@ async function handleSendMessage(
           : undefined;
       if (restChunks.length > 0) {
         state.chatLoading = false;
-        const queued: QueuedMessage[] = restChunks.map((chunk) => ({
+        const queued: QueuedMessage[] = restChunks.map((chunk, idx) => ({
           message: {
             role: 'assistant' as const,
             text: chunk,
             targetComponentIds: targetIdsSnapshot,
+            pointedComponentIds:
+              idx === restChunks.length - 1 ? data.pointedComponentIds : undefined,
           },
           typingMs: typingDurationFor(chunk),
         }));
@@ -2493,6 +2600,7 @@ async function speakOwner(
   req: Omit<OwnerLineRequest, 'history'>,
   afterMessage?: Omit<TimelineMessage, 'id'>,
   signal?: AbortSignal,
+  pointedComponentIds?: string[],
 ): Promise<void> {
   if (signal?.aborted) return;
   state.typingMessage = { role: 'owner' };
@@ -2516,7 +2624,11 @@ async function speakOwner(
   if (state.typingMessage?.role === 'owner') state.typingMessage = undefined;
   const chunks = text ? splitIntoChatChunks(text) : [];
   const queued: QueuedMessage[] = chunks.map((chunk, i) => ({
-    message: { role: 'owner' as const, text: chunk },
+    message: {
+      role: 'owner' as const,
+      text: chunk,
+      pointedComponentIds: i === chunks.length - 1 ? pointedComponentIds : undefined,
+    },
     typingMs: i === 0 ? 300 : typingDurationFor(chunk),
   }));
   if (afterMessage) {
@@ -2620,6 +2732,7 @@ async function handleEvaluate(predictions?: Record<string, ReviewOutcome>): Prom
           role: 'customer',
           personaId: persona.id,
           text: result.comment,
+          pointedComponentIds: result.frictionComponentIds,
           review: {
             outcome: result.outcome,
             predictedOutcome: predictions?.[persona.id],
@@ -3103,6 +3216,37 @@ function createTypingBubble(className: string, label: string): HTMLElement {
 }
 
 /**
+ * 発言が指し示しているスマホ上の部品チップを作る。
+ * クリックするとスマホ画面のその部品を表示・ハイライトする（手直しには赤ペンで囲む必要がある）。
+ */
+function createPointedComponentChips(componentIds: string[] | undefined): HTMLElement | null {
+  if (!componentIds || componentIds.length === 0) return null;
+  const spec = getCurrentSpec();
+  const validComps = Array.from(new Set(componentIds))
+    .map((id) => spec.components.find((c) => c.id === id))
+    .filter((c): c is AppSpec['components'][number] => Boolean(c));
+  if (validComps.length === 0) return null;
+
+  const wrap = document.createElement('div');
+  wrap.className = 'pointed-comp-chips';
+  for (const comp of validComps) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'pointed-comp-chip is-selectable';
+    const rawLabel = comp.label.replace(/\{[^}]+\}/g, '').trim() || comp.id;
+    const shortLabel = rawLabel.length > 18 ? `${rawLabel.slice(0, 18)}…` : rawLabel;
+    btn.textContent = `📍 ${shortLabel}`;
+    btn.title = 'クリックするとスマホ画面のこの部品を表示して光らせます（手直しするときは赤ペンで囲んでください）';
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      highlightSandboxComponent(comp.id);
+    });
+    wrap.appendChild(btn);
+  }
+  return wrap;
+}
+
+/**
  * アイコンと名前つきの発言行（お客さん・お助けエージェント・店長共通）
  * アイコンや名前をクリックすると、その人をメッセージの宛先に選べる
  */
@@ -3264,6 +3408,8 @@ function renderChatPanel(): HTMLElement {
       const outcomeClass = msg.review ? ` is-${msg.review.outcome}` : '';
       const bubble = createBubble(`chat-bubble is-customer${outcomeClass}${enteringClass}`, msg.text);
       const extras: HTMLElement[] = [];
+      const pointedChips = createPointedComponentChips(msg.pointedComponentIds);
+      if (pointedChips) extras.push(pointedChips);
       if (msg.review?.predictedOutcome) {
         const badgeInfo = formatPredictionBadgeText(msg.review.predictedOutcome, msg.review.outcome);
         const badge = document.createElement('div');
@@ -3288,8 +3434,11 @@ function renderChatPanel(): HTMLElement {
     // 店長の発言
     if (msg.role === 'owner') {
       const bubble = createBubble(`chat-bubble is-owner${enteringClass}`, msg.text);
+      const extras: HTMLElement[] = [];
+      const pointedChips = createPointedComponentChips(msg.pointedComponentIds);
+      if (pointedChips) extras.push(pointedChips);
       stream.appendChild(
-        createSpeakerRow('owner', OWNER.icon, OWNER.name, bubble, [], isContinuation, 'owner'),
+        createSpeakerRow('owner', OWNER.icon, OWNER.name, bubble, extras, isContinuation, 'owner'),
       );
       continue;
     }
@@ -3297,8 +3446,11 @@ function renderChatPanel(): HTMLElement {
     // お助けエージェントの発言：進行案内・質問回答・改造完了の報告
     if (msg.role === 'assistant') {
       const bubble = createBubble(`chat-bubble is-agent${enteringClass}`, msg.text);
+      const extras: HTMLElement[] = [];
+      const pointedChips = createPointedComponentChips(msg.pointedComponentIds);
+      if (pointedChips) extras.push(pointedChips);
       stream.appendChild(
-        createSpeakerRow('agent', AGENT_ICON, AGENT_NAME, bubble, [], isContinuation, 'assistant'),
+        createSpeakerRow('agent', AGENT_ICON, AGENT_NAME, bubble, extras, isContinuation, 'assistant'),
       );
       continue;
     }

@@ -5,6 +5,7 @@ import {
   CIRCLE_INQUIRY_FOLLOW_UPS,
   applyOptionToSpec,
   applyPatchesToSpecWithValidation,
+  canApplyWithoutRedPen,
   chatWithStudio,
   classifyUserMessageIntent,
   describeOwnerContext,
@@ -1666,12 +1667,15 @@ describe('core-loop', () => {
     ]);
     assert.equal(deletedAll.rolledBack, false);
 
-    // 定期便を希望していた shigeru / takumi / ren は設定がなくなって bothered になる
-    for (const id of ['shigeru', 'takumi', 'ren']) {
+    // 定期便を希望していた ren（損をしたくない人）は設定がなくなって bothered になり、
+    // 定期便を求めない takumi（さっと買いたい人）と shigeru（確実に買いたい人）は邪魔なものがなくなって満足して買える
+    const renSim = simulatePersonaComputerUse(deletedAll.updatedSpec, persona('ren'));
+    assert.equal(renSim.outcome, 'bothered', 'ren should be bothered when subscription is deleted');
+    assert.match(renSim.frictionPoint, /定期便の設定がなかった/);
+    assert.match(renSim.simulatedComment, /毎月届けてほしいのに設定がなくて残念/);
+    for (const id of ['shigeru', 'takumi']) {
       const sim = simulatePersonaComputerUse(deletedAll.updatedSpec, persona(id));
-      assert.equal(sim.outcome, 'bothered', `${id} should be bothered when subscription is deleted`);
-      assert.match(sim.frictionPoint, /定期便の設定がなかった/);
-      assert.match(sim.simulatedComment, /毎月届けてほしいのに設定がなくて残念/);
+      assert.equal(sim.outcome, 'achieved', `${id} should achieve when dark patterns are removed`);
     }
     // クーポンを希望していた shota / hina はクーポンがなくなって bothered になる
     for (const id of ['shota', 'hina']) {
@@ -2567,5 +2571,143 @@ describe('任意の選択欄と押しやすいチェック欄', () => {
     assert.equal(map.get('misaki')!.outcome, 'regretted');
     assert.equal(map.get('shota')!.outcome, 'bothered');
     assert.ok(map.get('shota')!.actionTrace.some((t) => t.includes('定期便') && t.includes('気づいて直した')));
+  });
+
+  it('つまずき部品ID（frictionComponentIds）の特定と、2画面確認でのステップ表示除外・小さいボタン連打離脱の正確な理由判定', () => {
+    // 1. 広告が閉じられない kazuko は popup-coupon、注文ボタンまで進んで止まる shota は btn-order が frictionComponentIds に入る
+    const demo = buildScenarioSpec(ACTIVE_THEME, 'demo').spec;
+    const kazukoDemo = simulatePersonaComputerUse(demo, persona('kazuko'));
+    assert.equal(kazukoDemo.outcome, 'abandoned');
+    assert.deepEqual(kazukoDemo.frictionComponentIds, ['popup-coupon']);
+    const shotaDemo = simulatePersonaComputerUse(demo, persona('shota'));
+    assert.equal(shotaDemo.outcome, 'abandoned');
+    assert.deepEqual(shotaDemo.frictionComponentIds, ['btn-order']);
+
+    // 2. 2画面の確認ステップにしたとき、progress_steps が size: sm でも確認項目（summary）が md なら kazuko は不満にならず achieved になる
+    const twoScreenSpec: AppSpec = {
+      ...cleanSpec(),
+      state: [
+        ...cleanSpec().state,
+        { key: 'step', label: '画面ステップ', type: 'string', initialValue: 'input' },
+      ],
+      components: [
+        {
+          id: 'progress',
+          type: 'progress_steps',
+          role: 'info',
+          label: 'ご注文手続き',
+          options: ['1. 選択', '2. 確認'],
+          style: { size: 'sm', variant: 'muted' },
+          actions: [],
+        },
+        ...cleanSpec().components.map((c) =>
+          c.id === 'btn-order'
+            ? {
+                ...c,
+                label: '確認画面へ進む',
+                visibleWhen: { stateKey: 'step', operator: 'eq' as const, value: 'input' },
+                actions: [{ type: 'set_state' as const, targetKey: 'step', value: 'confirm' }],
+              }
+            : { ...c, visibleWhen: { stateKey: 'step', operator: 'eq' as const, value: 'input' } },
+        ),
+        {
+          id: 'confirm-detail',
+          type: 'summary',
+          role: 'info',
+          label: 'お届け内容の確認',
+          rows: [{ label: 'お届け先', value: '{deliveryAddress}' }],
+          visibleWhen: { stateKey: 'step', operator: 'eq', value: 'confirm' },
+          style: { size: 'md', variant: 'default', fullWidth: true },
+          actions: [],
+        },
+        {
+          id: 'confirm-summary',
+          type: 'summary',
+          role: 'total',
+          label: 'ご注文内容の確認',
+          rows: [{ label: 'お支払い合計', value: '{total}円' }],
+          visibleWhen: { stateKey: 'step', operator: 'eq', value: 'confirm' },
+          style: { size: 'md', variant: 'default', fullWidth: true },
+          actions: [],
+        },
+        {
+          id: 'btn-final-order',
+          type: 'button',
+          role: 'primary_action',
+          label: '注文を確定する',
+          visibleWhen: { stateKey: 'step', operator: 'eq', value: 'confirm' },
+          style: { size: 'lg', variant: 'primary', fullWidth: true },
+          actions: [{ type: 'complete_task', message: 'ご注文ありがとうございます' }],
+        },
+      ],
+    };
+    const kazukoConfirmOk = simulatePersonaComputerUse(twoScreenSpec, persona('kazuko'));
+    assert.equal(kazukoConfirmOk.outcome, 'achieved');
+    assert.deepEqual(kazukoConfirmOk.frictionComponentIds, []);
+
+    // もし確認画面の案内項目（confirm-detail）自体が size: sm で読めない場合は、frictionComponentIds に confirm-detail が入る
+    const twoScreenTinyDetail: AppSpec = {
+      ...twoScreenSpec,
+      components: twoScreenSpec.components.map((c) =>
+        c.id === 'confirm-detail' ? { ...c, style: { ...c.style, size: 'sm' } } : c,
+      ),
+    };
+    const kazukoConfirmSmall = simulatePersonaComputerUse(twoScreenTinyDetail, persona('kazuko'));
+    assert.equal(kazukoConfirmSmall.outcome, 'bothered');
+    assert.equal(kazukoConfirmSmall.frictionPoint, '確認画面の文字が小さかった');
+    assert.deepEqual(kazukoConfirmSmall.frictionComponentIds, ['confirm-detail']);
+
+    // 3. 小さいボタンを指のズレで外し続けて手数上限を超えたときは「手順が多すぎる」ではなく「ボタンや選択欄が小さくて押せない」になる
+    const tinyOrderBtnSpec: AppSpec = {
+      ...cleanSpec(),
+      components: cleanSpec()
+        .components.filter((c) => c.id !== 'btn-clear')
+        .map((c) =>
+          c.id === 'btn-order'
+            ? {
+                ...c,
+                style: { ...c.style, size: 'sm', fullWidth: false, sticky: false, rotateDeg: 10 },
+              }
+            : c,
+        ),
+    };
+    const takumiMissed = simulatePersonaComputerUse(tinyOrderBtnSpec, persona('takumi'));
+    assert.equal(takumiMissed.outcome, 'abandoned');
+    assert.equal(takumiMissed.frictionPoint, 'ボタンや選択欄が小さくて押せない');
+    assert.deepEqual(takumiMissed.frictionComponentIds, ['btn-order']);
+
+    // 4. おとりボタンで手数を消費して注文ボタン到達時に手数切れになった場合や、確認画面なしで離脱した場合も、途中の原因部品が frictionComponentIds に含まれる
+    const salesPush = buildScenarioSpec(ACTIVE_THEME, 'sales_push').spec;
+    const salesPushFixedOrderAndPopup: AppSpec = {
+      ...salesPush,
+      components: salesPush.components
+        .filter((c) => c.id !== 'popup-coupon')
+        .map((c) =>
+          c.id === 'btn-order'
+            ? { ...c, actions: [{ type: 'complete_task', message: '完了' }] }
+            : c,
+        ),
+    };
+    const kentaAfterPopupFix = simulatePersonaComputerUse(salesPushFixedOrderAndPopup, persona('kenta'));
+    assert.equal(kentaAfterPopupFix.outcome, 'abandoned');
+    assert.ok(kentaAfterPopupFix.frictionComponentIds.includes('btn-buy-now'));
+    assert.ok(kentaAfterPopupFix.frictionComponentIds.includes('btn-order'));
+
+    const harueAfterPopupFix = simulatePersonaComputerUse(salesPushFixedOrderAndPopup, persona('harue'));
+    assert.equal(harueAfterPopupFix.outcome, 'abandoned');
+    assert.ok(harueAfterPopupFix.frictionComponentIds.includes('banner-countdown'));
+    assert.ok(harueAfterPopupFix.frictionComponentIds.includes('btn-buy-now'));
+    assert.ok(harueAfterPopupFix.frictionComponentIds.includes('btn-order'));
+
+    // 5. 画面上に存在する部品の手直し・削除には赤ペン囲みを必須とし、削除済み部品の復活だけ赤ペンなしでも許可する
+    assert.equal(canApplyWithoutRedPen(salesPush, '500円OFFの広告ポップアップを消してください'), false);
+    assert.equal(canApplyWithoutRedPen(salesPush, '注文を確定するボタンを押したら注文完了するようにして'), false);
+    assert.equal(canApplyWithoutRedPen(salesPush, '定期便のチェックを最初は外しておいて'), false);
+    assert.equal(canApplyWithoutRedPen(salesPush, '売り切れカウントダウンの表示を消してください'), false);
+    assert.equal(canApplyWithoutRedPen(salesPush, '今すぐ購入ボタンを消して'), false);
+    assert.equal(
+      canApplyWithoutRedPen(salesPushFixedOrderAndPopup, 'さっき消したクーポンをその場で使えるように戻して'),
+      true,
+    );
   });
 });
