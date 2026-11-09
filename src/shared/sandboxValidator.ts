@@ -56,6 +56,7 @@ export function sanitizeCustomCss(raw: string | undefined): string {
     .replace(/url\s*\([^)]*\)?/gi, 'none')
     .replace(/expression\s*\([^)]*\)?/gi, 'none')
     .replace(/(?:behavior|-moz-binding)\s*:[^;{}]+;?/gi, '')
+    .replace(/position\s*:\s*fixed\b/gi, 'position: relative')
     .replace(/(?:javascript|vbscript|data)\s*:/gi, '')
     .replace(/[<>]/g, '')
     .trim();
@@ -69,17 +70,17 @@ export function sanitizeCustomHtml(raw: string): string {
     .slice(0, 8000)
     .replace(/<!--[\s\S]*?(?:-->|$)/g, '')
     .replace(
-      /<(script|style|iframe|object|embed|applet|meta|link|base|form|noscript|template)\b[\s\S]*?<\/\1>/gi,
+      /<(script|style|iframe|object|embed|applet|meta|link|base|form|noscript|template|foreignObject|animate|set|use|math)\b[\s\S]*?<\/\1>/gi,
       '',
     )
     .replace(
-      /<(script|style|iframe|object|embed|applet|meta|link|base|form|noscript|template)\b[^>]*\/?>/gi,
+      /<(script|style|iframe|object|embed|applet|meta|link|base|form|noscript|template|foreignObject|animate|set|use|math)\b[^>]*\/?>/gi,
       '',
     )
-    .replace(/\son[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '')
-    .replace(/\s(?:srcdoc|ping)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '')
+    .replace(/(?<=[\s/"'])on[a-z0-9_-]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '')
+    .replace(/(?<=[\s/"'])(?:srcdoc|ping)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '')
     .replace(
-      /\s(href|src|srcset|xlink:href|action|formaction|poster|background)\s*=\s*(?:"\s*(?:javascript|vbscript|data)\s*:[^"]*"|'\s*(?:javascript|vbscript|data)\s*:[^']*'|(?:\s*(?:javascript|vbscript|data)\s*:[^\s>]+))/gi,
+      /(?<=[\s/"'])(href|src|srcset|xlink:href|action|formaction|poster|background)\s*=\s*(?:"\s*(?:javascript|vbscript|data)\s*:[^"]*"|'\s*(?:javascript|vbscript|data)\s*:[^']*'|(?:\s*(?:javascript|vbscript|data)\s*:[^\s>]+))/gi,
       '',
     )
     .replace(/\sstyle\s*=\s*"([^"]*)"/gi, (_m, css: string) => {

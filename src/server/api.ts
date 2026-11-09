@@ -238,7 +238,26 @@ export function isValidAppSpec(value: unknown): value is AppSpec {
         typeof c.label === 'string' &&
         Boolean(c.style) &&
         typeof c.style === 'object' &&
-        Array.isArray(c.actions),
+        Array.isArray(c.actions) &&
+        c.actions.every(
+          (a) =>
+            Boolean(a) &&
+            typeof a === 'object' &&
+            (a.targetKey === undefined ||
+              (typeof a.targetKey === 'string' && isSafeStateKey(a.targetKey))),
+        ) &&
+        (c.stateKey === undefined ||
+          (typeof c.stateKey === 'string' && isSafeStateKey(c.stateKey))) &&
+        (c.visibleWhen === undefined ||
+          (Boolean(c.visibleWhen) &&
+            typeof c.visibleWhen === 'object' &&
+            typeof c.visibleWhen.stateKey === 'string' &&
+            isSafeStateKey(c.visibleWhen.stateKey))) &&
+        (c.trapWhen === undefined ||
+          (Boolean(c.trapWhen) &&
+            typeof c.trapWhen === 'object' &&
+            typeof c.trapWhen.stateKey === 'string' &&
+            isSafeStateKey(c.trapWhen.stateKey))),
     ) &&
     candidate.state.every(
       (s) =>

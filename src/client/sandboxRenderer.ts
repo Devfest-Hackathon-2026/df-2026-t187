@@ -45,6 +45,15 @@ export function querySandboxComponentElements(container: HTMLElement): HTMLEleme
   return Array.from(container.querySelectorAll<HTMLElement>('[data-component-id]'));
 }
 
+export function findSandboxComponentElement(
+  container: HTMLElement,
+  componentId: string,
+): HTMLElement | undefined {
+  return querySandboxComponentElements(container).find(
+    (node) => node.dataset.componentId === componentId,
+  );
+}
+
 function syncStylesIntoIframe(iframeDoc: Document): void {
   const parentStyles = document.querySelectorAll('style, link[rel="stylesheet"]');
   iframeDoc.head.querySelectorAll('[data-synced-style]').forEach((n) => n.remove());
@@ -711,24 +720,28 @@ function renderSandboxAppInner(
   };
 
   const setValue = (key: string, raw: string | boolean) => {
+    if (!isSafeStateKey(key)) return;
     const value = typeof raw === 'boolean' ? raw : coerceStateValue(spec, key, raw);
     callbacks.onStateChange(withDerivedValues(spec, { ...liveState, [key]: value }));
   };
 
   /**
    * サンドボックス内でカスタムHTMLを安全に描画し、data-* 属性による状態変更・タスク完了をバインドする。
+   * 不活性な template 要素で構文解析してから属性・タグを無害化することで、解析時のイベント発火を防ぐ。
    */
   const renderCustomContent = (comp: AppComponent, rawHtml: string): HTMLElement => {
     const wrapper = targetDoc.createElement('div');
     wrapper.className = 'comp-custom-sandbox';
     const templated = sanitizeCustomHtml(renderTemplate(rawHtml, liveState, comp.style.numberFormat));
-    wrapper.innerHTML = templated;
-    wrapper
+    const tpl = targetDoc.createElement('template');
+    tpl.innerHTML = templated;
+    const frag = tpl.content;
+    frag
       .querySelectorAll(
-        'script, style, iframe, object, embed, applet, meta, link, base, form, noscript, template',
+        'script, style, iframe, object, embed, applet, meta, link, base, form, noscript, template, foreignObject, animate, set, use, math',
       )
       .forEach((node) => node.remove());
-    wrapper.querySelectorAll('*').forEach((node) => {
+    frag.querySelectorAll('*').forEach((node) => {
       for (const attr of Array.from(node.attributes)) {
         const attrName = attr.name.toLowerCase();
         const attrVal = attr.value.replace(/[\s\u0000-\u001f]+/g, '').toLowerCase();
@@ -762,6 +775,7 @@ function renderSandboxAppInner(
         }
       }
     });
+    wrapper.appendChild(frag);
 
     // 状態変数と双方向バインドされた input / select / textarea
     wrapper.querySelectorAll<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>('[data-state-key]').forEach((el) => {
@@ -1190,9 +1204,7 @@ function renderSandboxAppInner(
           if (missing) {
             const verb = missing.type === 'input' ? '入力' : '選択';
             callbacks.onNotice(`${renderLabel(missing, liveState)}を${verb}してください`, 'warning');
-            const missingEl = Array.from(
-              body.querySelectorAll<HTMLElement>('[data-component-id]'),
-            ).find((el) => el.dataset.componentId === missing.id);
+            const missingEl = findSandboxComponentElement(body, missing.id);
             if (missingEl) {
               missingEl.classList.remove('is-missing');
               void missingEl.offsetWidth;

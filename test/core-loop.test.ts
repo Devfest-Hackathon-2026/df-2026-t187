@@ -2733,5 +2733,35 @@ describe('任意の選択欄と押しやすいチェック欄', () => {
       describeComponentFunctionName(findComponent(salesPush, 'banner-countdown')),
       '売り切れカウントダウンの表示',
     );
+
+    // 7. セキュリティ強化：スラッシュや引用符直後のイベント属性・SVG/MathML危険タグ・position:fixed・プロトタイプ汚染キーを拒否する
+    const sanitizedSlashEvent = sanitizeCustomHtml(
+      '<img/src="x"/onerror="alert(1)"><div title="a"onclick="alert(2)">安全</div><svg><foreignObject><script>alert(3)</script></foreignObject></svg>',
+    );
+    assert.ok(!sanitizedSlashEvent.includes('onerror'));
+    assert.ok(!sanitizedSlashEvent.includes('onclick'));
+    assert.ok(!sanitizedSlashEvent.toLowerCase().includes('foreignobject'));
+
+    const sanitizedFixedCss = sanitizeCustomCss('.box { position: fixed; z-index: 9999; }');
+    assert.ok(!/position\s*:\s*fixed/i.test(sanitizedFixedCss));
+    assert.ok(sanitizedFixedCss.includes('position: relative'));
+
+    const pollutedStateKeySpec = structuredClone(salesPush);
+    pollutedStateKeySpec.components[0].stateKey = '__proto__';
+    assert.equal(isValidAppSpec(pollutedStateKeySpec), false);
+
+    const pollutedVisibleWhenSpec = structuredClone(salesPush);
+    pollutedVisibleWhenSpec.components[0].visibleWhen = {
+      stateKey: 'constructor',
+      operator: 'eq',
+      value: true,
+    };
+    assert.equal(isValidAppSpec(pollutedVisibleWhenSpec), false);
+
+    const pollutedActionTargetSpec = structuredClone(salesPush);
+    pollutedActionTargetSpec.components[0].actions = [
+      { type: 'set_state', targetKey: 'prototype', value: 'x' },
+    ];
+    assert.equal(isValidAppSpec(pollutedActionTargetSpec), false);
   });
 });

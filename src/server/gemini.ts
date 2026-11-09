@@ -1812,9 +1812,9 @@ function inferMentionedComponentIds(spec: AppSpec, userMessage: string): string[
       (/広告|クーポン|ポップアップ|500円|閉じる/.test(msg) && isCouponComponent(c)) ||
       (/残り|時間|カウントダウン|売り切れ/.test(msg) &&
         (c.role === 'distraction' || c.id === 'banner-countdown')) ||
-      (/今すぐ購入|黄色いボタン|おとり/.test(msg) &&
+      (/今すぐ|黄色いボタン|赤.*ボタン|おとり/.test(msg) &&
         (c.role === 'decoy' || c.id === 'btn-buy-now')) ||
-      (/注文.*確定|確定.*ボタン|注文ボタン|確認画面/.test(msg) &&
+      (/注文|確定|確認画面/.test(msg) &&
         (c.role === 'primary_action' || c.id === 'btn-order')) ||
       (/やめる|キャンセル/.test(msg) && (c.role === 'danger' || c.id === 'btn-cancel'))
     ) {
@@ -2057,17 +2057,7 @@ export async function chatWithStudio(req: ChatRequest): Promise<ChatResponse> {
     const ownerPointedIds =
       effectiveReq.targetComponentIds.length > 0
         ? effectiveReq.targetComponentIds
-        : effectiveReq.currentSpec.components
-            .filter((c) => {
-              const msg = effectiveReq.userMessage;
-              if (/定期/.test(msg) && (c.id === 'check-subscription' || c.stateKey === 'subscription')) return true;
-              if (/広告|クーポン|ポップアップ/.test(msg) && (c.role === 'popup' || c.id.includes('coupon'))) return true;
-              if (/残り|時間|カウントダウン/.test(msg) && c.role === 'distraction') return true;
-              if (/今すぐ|赤/.test(msg) && c.role === 'decoy') return true;
-              if (/注文|ボタン/.test(msg) && c.role === 'primary_action') return true;
-              return false;
-            })
-            .map((c) => c.id);
+        : inferMentionedComponentIds(effectiveReq.currentSpec, effectiveReq.userMessage);
     const fallbackOwnerIds =
       ownerPointedIds.length > 0
         ? ownerPointedIds
@@ -2132,7 +2122,14 @@ export async function chatWithStudio(req: ChatRequest): Promise<ChatResponse> {
     effectiveReq.targetComponentIds.includes(c.id),
   );
   // 赤ペンで部品を囲んだだけの段階では、手直しの答えは出さず、調べるための質問ボタンだけを出す
-  if (circledOnly && targets.length > 0) {
+  if (circledOnly) {
+    if (targets.length === 0) {
+      return {
+        intent: 'clarify',
+        reply: '気になる部品を赤ペンで囲んで教えてください',
+        suggestedFollowUps: [],
+      };
+    }
     const targetName = formatCircledTargetLabel(targets);
     return {
       intent: 'explain',
@@ -2196,9 +2193,7 @@ export async function chatWithStudio(req: ChatRequest): Promise<ChatResponse> {
     `【現在の状態初期値】\n${JSON.stringify(effectiveReq.currentSpec.state)}`,
     `【お客さんが実際に操作した記録】\n${formatLatestReviews(effectiveReq.latestReviews)}`,
     `【これまでの会話と画面通知】\n${formatHistory(effectiveReq.history)}`,
-    circledOnly
-      ? '【ユーザーの発言】\nまだ何も言っていません。赤ペンで話題の部品を囲んだところです。question として扱い、囲んだ部品が何かを1文で受け止めてから、どうしたいかを短く尋ねてください。部品の仕組みの説明や直し方の提案は、聞かれるまでしないでください。'
-      : `【ユーザーの発言】\n${effectiveReq.userMessage}`,
+    `【ユーザーの発言】\n${effectiveReq.userMessage}`,
   ].join('\n');
 
   const triageParts: Array<{ text: string } | { inlineData: { mimeType: string; data: string } }> =
@@ -2244,8 +2239,8 @@ export async function chatWithStudio(req: ChatRequest): Promise<ChatResponse> {
     };
   }
 
-  // 囲んだだけのときは、AIが改造と判断しても画面は変えない。また赤ペンで対象が囲まれていない場合も赤ペン囲みを促す
-  if (parsed.intent === 'change' && !circledOnly) {
+  // 赤ペンで対象が囲まれていない場合は赤ペン囲みを促す
+  if (parsed.intent === 'change') {
     if (!hasValidTargetForApply) {
       return buildRequireRedPenResponse(effectiveReq, parsed.pointedComponentIds ?? []);
     }
@@ -2257,30 +2252,26 @@ export async function chatWithStudio(req: ChatRequest): Promise<ChatResponse> {
     ...effectiveReq.targetComponentIds,
     ...(parsed.pointedComponentIds ?? []).filter((id) => existingIds.has(id)),
   ]);
-  // 調査用の質問ボタンは、赤ペンで囲んだ直後だけに出し、通常の質問・相談では手直し案のボタンを出さない
-  const filteredFollowUps =
-    circledOnly && pointedIds.size > 0 ? [...CIRCLE_INQUIRY_FOLLOW_UPS] : [];
 
-  const telemetryEvent =
-    !circledOnly && effectiveReq.userMessage
-      ? await recordPromptTelemetryEvent({
-          cohortId: effectiveReq.cohortId,
-          runId: effectiveReq.runId,
-          turnIndex: effectiveReq.turnIndex,
-          shareForAggregate: effectiveReq.shareForAggregate,
-          promptText: effectiveReq.userMessage,
-          sessionMode: 'explore',
-          recipient: 'assistant',
-          hasPenAnnotation:
-            effectiveReq.targetComponentIds.length > 0 ||
-            Boolean(effectiveReq.annotatedImageBase64),
-        })
-      : undefined;
+  const telemetryEvent = effectiveReq.userMessage
+    ? await recordPromptTelemetryEvent({
+        cohortId: effectiveReq.cohortId,
+        runId: effectiveReq.runId,
+        turnIndex: effectiveReq.turnIndex,
+        shareForAggregate: effectiveReq.shareForAggregate,
+        promptText: effectiveReq.userMessage,
+        sessionMode: 'explore',
+        recipient: 'assistant',
+        hasPenAnnotation:
+          effectiveReq.targetComponentIds.length > 0 ||
+          Boolean(effectiveReq.annotatedImageBase64),
+      })
+    : undefined;
 
   return {
     intent: parsed.intent === 'unclear' ? 'clarify' : 'explain',
     reply: cleanJapaneseText(parsed.reply, 'どこをどう変えたいか教えてください'),
-    suggestedFollowUps: filteredFollowUps,
+    suggestedFollowUps: [],
     pointedComponentIds: [...pointedIds].slice(0, 1),
     telemetryEvent,
   };

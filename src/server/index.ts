@@ -23,6 +23,7 @@ const MIME_TYPES: Record<string, string> = {
 const SECURITY_HEADERS: Record<string, string> = {
   ...COMMON_SECURITY_HEADERS,
   'X-Frame-Options': 'SAMEORIGIN',
+  'Cross-Origin-Opener-Policy': 'same-origin',
   'Content-Security-Policy':
     "default-src 'self'; img-src 'self' data: blob:; media-src 'self' data: blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; connect-src 'self'; frame-ancestors 'self'; object-src 'none'; base-uri 'self'; form-action 'self'",
 };
@@ -49,6 +50,11 @@ const server = createServer(async (req, res) => {
   try {
     urlPath = decodeURIComponent(rawUrlPath);
   } catch {
+    res.writeHead(400, { ...SECURITY_HEADERS, 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('Bad Request');
+    return;
+  }
+  if (urlPath.includes('\0')) {
     res.writeHead(400, { ...SECURITY_HEADERS, 'Content-Type': 'text/plain; charset=utf-8' });
     res.end('Bad Request');
     return;

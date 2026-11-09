@@ -5,7 +5,12 @@ import {
   type Point2D,
   type Rect2D,
 } from '../shared/hitTest.ts';
-import { createInitialState, hasCompletionAction, withDerivedValues } from '../shared/appRuntime.ts';
+import {
+  createInitialState,
+  hasCompletionAction,
+  isSafeStateKey,
+  withDerivedValues,
+} from '../shared/appRuntime.ts';
 import {
   ACTIVE_THEME,
   ALL_REVIEWER_PERSONAS,
@@ -54,6 +59,7 @@ import type {
 } from '../shared/types.ts';
 import { ICONS } from './icons.ts';
 import {
+  findSandboxComponentElement,
   querySandboxComponentElements,
   renderSandboxApp,
   scrollSandboxBy,
@@ -1214,6 +1220,24 @@ function enqueueMessages(items: QueuedMessage[]): void {
   }
 }
 
+async function waitAfterQueuedMessage(
+  runId: number,
+  msg: TimelineMessage,
+  shouldSpeak: boolean,
+): Promise<boolean> {
+  if (shouldSpeak) {
+    // 現在の吹き出しの音声読み上げが終わるのを待ってから、次の発言の書き込みに進む
+    await playTtsAndWait(msg);
+    if (runId !== queueRunId) return false;
+    if (messageQueue.length > 0) {
+      await sleepWithQueueTimer(220);
+    }
+  } else if (messageQueue.length > 0) {
+    await sleepWithQueueTimer(QUEUE_PAUSE_MS);
+  }
+  return runId === queueRunId;
+}
+
 async function runQueueLoop(runId: number): Promise<void> {
   while (runId === queueRunId && messageQueue.length > 0) {
     const next = messageQueue.shift()!;
@@ -1250,16 +1274,7 @@ async function runQueueLoop(runId: number): Promise<void> {
     renderStudio();
     scrollToLatestMessage();
 
-    if (shouldSpeak) {
-      // 現在の吹き出しの音声読み上げが終わるのを待ってから、次の発言の書き込みに進む
-      await playTtsAndWait(full);
-      if (runId !== queueRunId) return;
-      if (messageQueue.length > 0) {
-        await sleepWithQueueTimer(220);
-      }
-    } else if (messageQueue.length > 0) {
-      await sleepWithQueueTimer(QUEUE_PAUSE_MS);
-    }
+    if (!(await waitAfterQueuedMessage(runId, full, shouldSpeak))) return;
   }
 
   if (runId === queueRunId) {
@@ -1294,16 +1309,7 @@ function advanceOneQueuedMessage(): void {
 
   isQueueRunning = true;
   void (async () => {
-    if (shouldSpeak) {
-      await playTtsAndWait(full);
-      if (myRunId !== queueRunId) return;
-      if (messageQueue.length > 0) {
-        await sleepWithQueueTimer(220);
-      }
-    } else if (messageQueue.length > 0) {
-      await sleepWithQueueTimer(QUEUE_PAUSE_MS);
-    }
-    if (myRunId !== queueRunId) return;
+    if (!(await waitAfterQueuedMessage(myRunId, full, shouldSpeak))) return;
     await runQueueLoop(myRunId);
   })();
 }
@@ -1613,9 +1619,7 @@ function resolveSpeakerTargetRect(
       bottom: Math.max(...matched.map((r) => r.bottom)),
     };
   }
-  const el = querySandboxComponentElements(container).find(
-    (node) => node.dataset.componentId === componentId,
-  );
+  const el = findSandboxComponentElement(container, componentId);
   if (!el) return null;
   const containerRect = container.getBoundingClientRect();
   const r = el.getBoundingClientRect();
@@ -1827,6 +1831,17 @@ function preserveUnchangedLiveState(
   return withDerivedValues(nextSpec, base);
 }
 
+function resetPenAndPointingState(): void {
+  clearPenFadeTimers();
+  userPenFinishedAt = null;
+  lastUserPenSnapshotBase64 = undefined;
+  state.penPoints = [];
+  state.circledComponentIds = [];
+  state.topicTargetIds = [];
+  state.justChangedIds = [];
+  state.speakerPointed = null;
+}
+
 function pushNewCheckpoint(commitMessage: string, updatedSpec: AppSpec): void {
   const prevSpec = getCurrentSpec();
   // 過去の画面に戻った状態で新しく手直ししたときは、その画面から分岐して以降の履歴を置き換える
@@ -1845,11 +1860,7 @@ function pushNewCheckpoint(commitMessage: string, updatedSpec: AppSpec): void {
   state.checkpoints.push(newCheckpoint);
   state.activeCheckpointIndex = state.checkpoints.length - 1;
   state.liveAppState = preserveUnchangedLiveState(prevSpec, updatedSpec, state.liveAppState);
-  state.penPoints = [];
-  state.circledComponentIds = [];
-  state.topicTargetIds = [];
-  state.justChangedIds = [];
-  state.speakerPointed = null;
+  resetPenAndPointingState();
   state.interactionMode = 'play';
 }
 
@@ -1900,11 +1911,7 @@ function handleRestartFromScratch(sameCohortId?: TargetCohortId): void {
   ];
   state.activeCheckpointIndex = 0;
   state.liveAppState = createInitialState(INITIAL_SPEC);
-  state.penPoints = [];
-  state.circledComponentIds = [];
-  state.topicTargetIds = [];
-  state.justChangedIds = [];
-  state.speakerPointed = null;
+  resetPenAndPointingState();
   pushMessage({ role: 'system', text: '画面を最初の状態に戻しました' });
   if (sameCohortId) {
     startCohort(sameCohortId);
@@ -2236,20 +2243,29 @@ function highlightSandboxComponent(
   const primaryId = ids[0];
   const comp = spec.components.find((c) => c.id === primaryId);
   if (comp) {
-    if (comp.visibleWhen && comp.visibleWhen.operator === 'eq') {
+    if (
+      comp.visibleWhen &&
+      comp.visibleWhen.operator === 'eq' &&
+      isSafeStateKey(comp.visibleWhen.stateKey)
+    ) {
       state.liveAppState = {
         ...state.liveAppState,
         [comp.visibleWhen.stateKey]: comp.visibleWhen.value,
       };
     }
-    if (comp.type === 'popup' && comp.stateKey) {
+    if (comp.type === 'popup' && comp.stateKey && isSafeStateKey(comp.stateKey)) {
       state.liveAppState = {
         ...state.liveAppState,
         [comp.stateKey]: 'open',
       };
     } else if (comp.type !== 'popup') {
       for (const p of spec.components) {
-        if (p.type === 'popup' && p.stateKey && state.liveAppState[p.stateKey] === 'open') {
+        if (
+          p.type === 'popup' &&
+          p.stateKey &&
+          isSafeStateKey(p.stateKey) &&
+          state.liveAppState[p.stateKey] === 'open'
+        ) {
           state.liveAppState = {
             ...state.liveAppState,
             [p.stateKey]: 'closed',
@@ -2268,9 +2284,7 @@ function highlightSandboxComponent(
     : null;
   renderStudio();
   if (sandboxStageEl) {
-    const el = querySandboxComponentElements(sandboxStageEl).find(
-      (node) => node.dataset.componentId === primaryId,
-    );
+    const el = findSandboxComponentElement(sandboxStageEl, primaryId);
     el?.scrollIntoView({ behavior: 'smooth', block: 'center' });
   }
   const durationMs = role ? SPEAKER_PEN_TOTAL_MS : 1800;
@@ -2307,9 +2321,7 @@ async function playWorkLog(
       state.justChangedIds = step.componentId ? [step.componentId] : [];
       addWorkStep(log, step.text, false, step.componentId);
       if (step.componentId && sandboxStageEl) {
-        const el = querySandboxComponentElements(sandboxStageEl).find(
-          (node) => node.dataset.componentId === step.componentId,
-        );
+        const el = findSandboxComponentElement(sandboxStageEl, step.componentId);
         el?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
       }
       await sleep(WORK_STEP_INTERVAL_MS);
