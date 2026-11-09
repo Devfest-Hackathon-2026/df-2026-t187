@@ -88,6 +88,24 @@ import {
   toFirestoreTelemetryFields,
 } from '../src/server/store.ts';
 import { buildInitialSpec, buildScenarioSpec, findComponent } from '../src/shared/theme.ts';
+import { readFileSync } from 'node:fs';
+import { simulateReviewers } from '../src/server/gemini.ts';
+import {
+  clearCustomProfileMemoryCache,
+  resolveCustomComponentProfiles,
+} from '../src/server/customComponentProfiles.ts';
+import {
+  prepareSimulationInput,
+  type CustomComponentProfile,
+} from '../src/shared/customComponentProfile.ts';
+import {
+  FIXED_LAYOUT_VIEWPORT,
+  canonicalizeMeasuredBounds,
+  fixedLayoutStateVariants,
+  mergeBoundsVariants,
+  type MeasuredComponentRect,
+} from '../src/shared/fixedLayout.ts';
+import type { ComponentBoundsInput } from '../src/shared/types.ts';
 import type { AppComponent, AppSpec, ReviewOutcome, SpecPatch } from '../src/shared/types.ts';
 
 // テストは AI に接続しない前提で実行する（package.json の test スクリプトで接続設定を空にしている）
@@ -2019,5 +2037,307 @@ describe('core-loop', () => {
     const missedBadge = formatPredictionBadgeText('achieved', 'bothered');
     assert.equal(missedBadge.matched, false);
     assert.equal(missedBadge.text, '× 買えたけど不満');
+  });
+});
+
+
+describe('判定の再現性', () => {
+  /** 店にクーポン広告がある画面に、独自の部品で作ったクーポンを置いた画面 */
+  function specWithCustomCoupon(): AppSpec {
+    const spec = withAnnoyance(cleanSpec(), 'coupon_popup');
+    spec.components = spec.components.filter((c) => c.id !== 'popup-coupon');
+    const idx = spec.components.findIndex((c) => c.id === 'summary');
+    spec.components.splice(idx, 0, {
+      id: 'custom-coupon',
+      type: 'custom',
+      role: 'info',
+      label: 'その場で使える割引',
+      style: { size: 'md', variant: 'default' },
+      customHtml:
+        '<div class="coupon"><p>会員登録なしで今すぐ使えます</p><button type="button" data-set-state="couponDiscount:500">500円引きを使う</button></div>',
+      actions: [],
+    });
+    return spec;
+  }
+
+  const COUPON_PROFILE: CustomComponentProfile = {
+    purpose: 'coupon',
+    userChooses: true,
+    enabledByDefault: false,
+    textSize: 'md',
+    tapTargetSize: 'md',
+    hasHiddenCondition: false,
+    hardToClose: false,
+    pressure: false,
+  };
+
+  /** 本文の部品を上から並べ、画面下の固定バーを本文の下に置いた、決まった条件の座標に見立てた値 */
+  function boundsLike(spec: AppSpec, overrides: Record<string, Partial<ComponentBoundsInput>> = {}) {
+    let y = 72;
+    const out: ComponentBoundsInput[] = [];
+    for (const c of spec.components) {
+      if (c.type === 'popup' || c.style.sticky) continue;
+      const h = c.type === 'choice_cards' ? 136 : c.type === 'summary' ? 56 : c.type === 'product_card' ? 104 : 28;
+      out.push({ id: c.id, left: 12, top: y, right: 308, bottom: y + h, ...overrides[c.id] });
+      y += h + 8;
+    }
+    out.push({ id: 'total-price', left: 13, top: y + 16, right: 54, bottom: y + 43, ...overrides['total-price'] });
+    out.push({ id: 'btn-order', left: 64, top: y + 8, right: 307, bottom: y + 52, ...overrides['btn-order'] });
+    return out;
+  }
+
+  it('同じ画面の定義と同じ客層なら、評価を何回呼んでも判定は一致する', () => {
+    const spec = withAnnoyance(withAnnoyance(cleanSpec(), 'subscription_trap'), 'coupon_popup');
+    const bounds = boundsLike(spec);
+    for (const cohort of TARGET_COHORTS) {
+      const reviewers = getReviewersByCohort(cohort.id);
+      const runs = [0, 1, 2].map(() => {
+        // 呼ぶたびに別のオブジェクトにしても、中身が同じなら同じ結果になる
+        const map = simulateReviewers(structuredClone(spec), reviewers, {}, structuredClone(bounds));
+        return reviewers.map((p) => {
+          const r = map.get(p.id)!;
+          return [r.outcome, r.frictionPoint, r.actionTrace.join('|')];
+        });
+      });
+      assert.deepEqual(runs[1], runs[0], cohort.id);
+      assert.deepEqual(runs[2], runs[0], cohort.id);
+    }
+  });
+
+  it('独自の部品は、2回目以降は保存した読み取り結果を使い、判定が一致する', async () => {
+    clearCustomProfileMemoryCache();
+    const spec = specWithCustomCoupon();
+    // 呼ぶたびに違う答えを返す読み取り（temperature で揺れる Gemini に見立てる）
+    let calls = 0;
+    const flaky = async (): Promise<CustomComponentProfile> => {
+      calls++;
+      return calls === 1 ? COUPON_PROFILE : { ...COUPON_PROFILE, purpose: 'ad', textSize: 'xs' };
+    };
+    const thrifty = getReviewersByCohort('thrifty');
+    const outcomesOf = (profiles: Record<string, CustomComponentProfile>) => {
+      const map = simulateReviewers(spec, thrifty, profiles, boundsLike(spec));
+      return thrifty.map((p) => map.get(p.id)!.outcome);
+    };
+
+    const first = await resolveCustomComponentProfiles(spec, flaky, 'test-model');
+    const second = await resolveCustomComponentProfiles(structuredClone(spec), flaky, 'test-model');
+    assert.equal(calls, 1);
+    assert.deepEqual(second.profiles, first.profiles);
+    assert.deepEqual(outcomesOf(second.profiles), outcomesOf(first.profiles));
+
+    // 部品のIDが違っても、中身が同じなら同じ読み取り結果を使う
+    const renamed = structuredClone(spec);
+    findComponent(renamed, 'custom-coupon').id = 'custom-coupon-2';
+    const third = await resolveCustomComponentProfiles(renamed, flaky, 'test-model');
+    assert.equal(calls, 1);
+    assert.deepEqual(third.profiles['custom-coupon-2'], first.profiles['custom-coupon']);
+
+    // 中身が変われば読み取り直す
+    const edited = structuredClone(spec);
+    findComponent(edited, 'custom-coupon').customHtml += '<small>毎月自動で届きます</small>';
+    await resolveCustomComponentProfiles(edited, flaky, 'test-model');
+    assert.equal(calls, 2);
+
+    // 読み取りに失敗したときは保存せず、その回はHTMLに書かれた動きと文字だけで判定し、次は読み取り直す
+    clearCustomProfileMemoryCache();
+    let failing = 0;
+    const timeout = async (): Promise<CustomComponentProfile> => {
+      failing++;
+      throw new Error('timeout');
+    };
+    const failed = await resolveCustomComponentProfiles(spec, timeout, 'test-model');
+    assert.deepEqual(failed.fallbackIds, ['custom-coupon']);
+    assert.deepEqual(failed.profiles, {});
+    await resolveCustomComponentProfiles(spec, timeout, 'test-model');
+    assert.equal(failing, 2);
+    const recovered = await resolveCustomComponentProfiles(spec, async () => COUPON_PROFILE, 'test-model');
+    assert.deepEqual(recovered.fallbackIds, []);
+    clearCustomProfileMemoryCache();
+  });
+
+  it('独自の部品で作った、その場で割引になり自分で選べるクーポンは、既存のクーポン部品と同じく達成になる', () => {
+    const spec = specWithCustomCoupon();
+    const thrifty = getReviewersByCohort('thrifty');
+    const custom = simulateReviewers(spec, thrifty, { 'custom-coupon': COUPON_PROFILE }, boundsLike(spec));
+
+    // 同じ場所に既存の部品で作ったクーポン
+    const native = structuredClone(spec);
+    const idx = native.components.findIndex((c) => c.id === 'custom-coupon');
+    native.components[idx] = {
+      id: 'custom-coupon',
+      type: 'button',
+      role: 'info',
+      label: '500円OFFクーポンを使う',
+      style: { size: 'md', variant: 'default' },
+      actions: [{ type: 'set_state', targetKey: 'couponDiscount', value: 500 }],
+    };
+    const standard = simulateReviewers(native, thrifty, {}, boundsLike(native));
+
+    for (const p of thrifty) {
+      assert.equal(custom.get(p.id)!.outcome, standard.get(p.id)!.outcome, p.id);
+    }
+    const shota = custom.get('shota')!;
+    assert.equal(shota.outcome, 'achieved');
+    assert.ok(shota.actionTrace.some((t) => t.includes('特典を適用した')));
+    assert.equal(shota.finalState?.total, 1980 + 600 - 500);
+
+    // 判定用の部品はコードの規則で組み立てる。同じ読み取り結果なら、同じ部品になる
+    const a = prepareSimulationInput(spec, { 'custom-coupon': COUPON_PROFILE });
+    const b = prepareSimulationInput(structuredClone(spec), { 'custom-coupon': { ...COUPON_PROFILE } });
+    assert.deepEqual(a.spec, b.spec);
+    const proxy = findComponent(a.spec, 'custom-coupon');
+    assert.equal(proxy.customHtml, undefined);
+    assert.deepEqual(proxy.actions, [{ type: 'set_state', targetKey: 'couponDiscount', value: 500 }]);
+
+    // 最初から申し込まれた独自の定期便の欄は、読まない人が気づかずに後悔する罠として扱う
+    const sub = withAnnoyance(cleanSpec(), 'subscription_trap');
+    findComponent(sub, 'check-subscription').type = 'custom';
+    findComponent(sub, 'check-subscription').customHtml =
+      '<label><input type="checkbox" data-state-key="subscription" checked>毎月お届け</label>';
+    const trapMap = simulateReviewers(sub, [persona('hina')], {
+      'check-subscription': { ...COUPON_PROFILE, purpose: 'subscription', userChooses: false, enabledByDefault: true },
+    });
+    assert.equal(trapMap.get('hina')!.outcome, 'regretted');
+  });
+
+  it('ボタンの大きさを変えると、指がずれやすいお客さんの結果が変わる', () => {
+    const spec = cleanSpec();
+    const shigeru = persona('shigeru');
+    const small = boundsLike(spec, { 'btn-order': { bottom: undefined } }).map((b) =>
+      b.id === 'btn-order' ? { ...b, bottom: b.top + 30 } : b,
+    );
+    const large = boundsLike(spec).map((b) => (b.id === 'btn-order' ? { ...b, bottom: b.top + 54 } : b));
+    const r1 = simulatePersonaComputerUse(spec, shigeru, small);
+    const r2 = simulatePersonaComputerUse(spec, shigeru, large);
+    assert.equal(r1.outcome, 'abandoned');
+    assert.ok(r1.actionTrace.some((t) => t.includes('指がズレて外れた')));
+    assert.equal(r2.outcome, 'achieved');
+
+    // 座標のない見積もりでも、部品の大きさの指定が効く
+    const tiny = cleanSpec();
+    findComponent(tiny, 'btn-order').style = { size: 'xs', variant: 'primary', align: 'center' };
+    const big = cleanSpec();
+    findComponent(big, 'btn-order').style = { size: 'lg', variant: 'primary', align: 'center', fullWidth: true };
+    assert.equal(outcomeOf(tiny, 'takumi'), 'abandoned');
+    assert.equal(outcomeOf(big, 'takumi'), 'achieved');
+  });
+
+  it('見えている画面の大きさやスクロール位置が変わっても、判定用の座標と判定は変わらない', () => {
+    const spec = withAnnoyance(withAnnoyance(cleanSpec(), 'subscription_trap'), 'coupon_popup');
+    const base = boundsLike(spec);
+    const stickyIds = new Set(['total-price', 'btn-order']);
+    const bodyTop = 60;
+    const flowBottom = Math.max(...base.filter((b) => !stickyIds.has(b.id)).map((b) => b.bottom));
+    const stickyTop = 520;
+    /** 決まった座標の画面を、倍率 scale・スクロール位置 scrollTop で描画して測ったときの値に戻す */
+    const measuredAt = (scale: number, scrollTop: number) => {
+      const contentHeight = flowBottom + 8 - bodyTop;
+      const barTopInContent = bodyTop + contentHeight + 8;
+      const rects: MeasuredComponentRect[] = base.map((b) => {
+        const sticky = stickyIds.has(b.id);
+        const top = sticky ? stickyTop + (b.top - barTopInContent) : b.top - scrollTop;
+        const bottom = sticky ? stickyTop + (b.bottom - barTopInContent) : b.bottom - scrollTop;
+        return { id: b.id, left: b.left * scale, top: top * scale, right: b.right * scale, bottom: bottom * scale, sticky };
+      });
+      return canonicalizeMeasuredBounds(rects, {
+        viewportWidth: FIXED_LAYOUT_VIEWPORT.width * scale,
+        scrollTop: scrollTop * scale,
+        bodyTop: bodyTop * scale,
+        bodyScrollHeight: contentHeight * scale,
+        stickyBarTop: stickyTop * scale,
+      });
+    };
+    const reference = measuredAt(1, 0);
+    for (const [scale, scrollTop] of [
+      [1, 137],
+      [1.5, 0],
+      [1.5, 211],
+      [0.8, 64],
+    ]) {
+      assert.deepEqual(measuredAt(scale, scrollTop), reference, `scale ${scale} scroll ${scrollTop}`);
+    }
+    // 固定バーの部品は本文の下に並び、本文の部品と重ならない
+    const orderBox = reference.find((b) => b.id === 'btn-order')!;
+    assert.ok(reference.filter((b) => !stickyIds.has(b.id)).every((b) => b.bottom <= orderBox.top));
+    for (const p of ALL_REVIEWER_PERSONAS) {
+      assert.deepEqual(
+        simulatePersonaComputerUse(spec, p, measuredAt(1.5, 211)).outcome,
+        simulatePersonaComputerUse(spec, p, reference).outcome,
+        p.id,
+      );
+    }
+
+    // 確認画面のように表示条件でだけ出る部品も、その画面を描画して測る。広告は出る前の状態で描く
+    const confirm = cleanSpec();
+    confirm.state.push({ key: 'step', label: '画面', type: 'string', initialValue: 'input' });
+    confirm.components.push({
+      id: 'btn-confirm-order',
+      type: 'button',
+      role: 'primary_action',
+      label: 'この内容で注文する',
+      visibleWhen: { stateKey: 'step', operator: 'eq', value: 'confirm' },
+      style: { size: 'lg', variant: 'primary' },
+      actions: [{ type: 'complete_task' }],
+    });
+    const variants = fixedLayoutStateVariants(withAnnoyance(confirm, 'coupon_popup'));
+    assert.equal(variants.length, 2);
+    assert.equal(variants[0].couponPopup, 'waiting');
+    assert.equal(variants[1].step, 'confirm');
+    assert.deepEqual(
+      mergeBoundsVariants([[{ id: 'a', left: 0, top: 0, right: 1, bottom: 1 }], [{ id: 'a', left: 5, top: 5, right: 9, bottom: 9 }, { id: 'b', left: 0, top: 0, right: 2, bottom: 2 }]]),
+      [{ id: 'a', left: 0, top: 0, right: 1, bottom: 1 }, { id: 'b', left: 0, top: 0, right: 2, bottom: 2 }],
+    );
+  });
+
+  it('デモ用の問題で4つの指示を適用した後の画面は、決まった条件で測った座標でも3人全員が達成になる', () => {
+    const demo = buildScenarioSpec(ACTIVE_THEME, 'demo').spec;
+    const step = (spec: AppSpec, patches: SpecPatch[]) => {
+      const result = applyPatchesToSpecWithValidation(spec, '手直ししました', patches);
+      assert.equal(result.rolledBack, false);
+      return result.updatedSpec;
+    };
+    const order = findComponent(demo, 'btn-order');
+    const s1 = step(demo, [
+      { op: 'replace_component', component: { ...order, actions: [{ type: 'complete_task', message: 'ご購入ありがとうございます' }] } },
+    ]);
+    const popup = findComponent(s1, 'popup-coupon');
+    const s2 = step(s1, [
+      {
+        op: 'replace_component',
+        component: {
+          ...popup,
+          closePosition: 'bottom-bar',
+          closeSize: 'lg',
+          closeLabel: '500円引きを使う',
+          actions: [{ type: 'set_state', targetKey: 'couponDiscount', value: 500 }],
+        },
+      },
+    ]);
+    const s3 = step(s2, [{ op: 'remove_component', id: 'check-subscription' }]);
+    const sub = findComponent(demo, 'check-subscription');
+    const s4 = step(s3, [
+      { op: 'upsert_state', variable: { key: 'subscription', label: '定期便', type: 'boolean', initialValue: false } },
+      {
+        op: 'insert_component',
+        afterId: 'product-card',
+        component: { ...sub, label: '定期便にする 毎月お届け いつでも解約OK', style: { size: 'sm', variant: 'default' } },
+      },
+    ]);
+    // ブラウザで、決まった大きさ（320×583）で画面外に描画して測った座標
+    const fixedBounds = JSON.parse(
+      readFileSync(new URL('./fixtures/demo-final-fixed-bounds.json', import.meta.url), 'utf8'),
+    ) as ComponentBoundsInput[];
+    assert.deepEqual(
+      new Set(fixedBounds.map((b) => b.id)),
+      new Set(s4.components.filter((c) => c.type !== 'popup').map((c) => c.id)),
+    );
+    const thrifty = getReviewersByCohort('thrifty');
+    for (let i = 0; i < 3; i++) {
+      const map = simulateReviewers(s4, thrifty, {}, fixedBounds);
+      assert.deepEqual(
+        thrifty.map((p) => map.get(p.id)!.outcome),
+        ['achieved', 'achieved', 'achieved'],
+      );
+    }
   });
 });

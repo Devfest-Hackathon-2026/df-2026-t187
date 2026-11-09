@@ -422,6 +422,11 @@ function startCountdownTicker(doc: Document): void {
 
 /** ラベルを書き込む。{countdown} の部分だけは毎秒書き換えられる要素にする */
 function writeLabel(el: HTMLElement, comp: AppComponent, state: AppState): void {
+  // 判定用に裏で描画するときは、残り時間を最初の値で止め、見えている画面の時計も動かさない
+  if (measuringRender) {
+    el.textContent = renderLabel(comp, state);
+    return;
+  }
   if (!comp.label.includes('{countdown}')) {
     el.textContent = renderLabel(comp, state);
     return;
@@ -495,12 +500,44 @@ function scheduleFit(
   }
 }
 
+/** 判定用に裏で描画している最中か。見えている画面のタイマーや監視を、裏の描画で書き換えないために使う */
+let measuringRender = false;
+
+export interface RenderSandboxOptions {
+  /**
+   * 判定用の座標を測るための、画面外での描画。広告や完了ページのタイマー、残り時間の時計、
+   * スタイルの監視、大きさの測り直しの予約をせず、見えている画面の状態に触れない
+   */
+  measureOnly?: boolean;
+}
+
 export function renderSandboxApp(
   container: HTMLElement,
   spec: AppSpec,
   liveState: AppState,
   selectedComponentIds: Set<string>,
   callbacks: SandboxCallbacks,
+  options: RenderSandboxOptions = {},
+): void {
+  if (options.measureOnly) {
+    measuringRender = true;
+    try {
+      renderSandboxAppInner(container, spec, liveState, selectedComponentIds, callbacks, true);
+    } finally {
+      measuringRender = false;
+    }
+    return;
+  }
+  renderSandboxAppInner(container, spec, liveState, selectedComponentIds, callbacks, false);
+}
+
+function renderSandboxAppInner(
+  container: HTMLElement,
+  spec: AppSpec,
+  liveState: AppState,
+  selectedComponentIds: Set<string>,
+  callbacks: SandboxCallbacks,
+  measureOnly: boolean,
 ): void {
   let previousScrollTop = 0;
   // 単一HTMLとしてiframe内で隔離実行する
@@ -524,7 +561,7 @@ export function renderSandboxApp(
       iframeDoc.write(buildStandaloneSandboxHtml(spec));
       iframeDoc.close();
       syncStylesIntoIframe(iframeDoc);
-      watchParentStyles(iframe);
+      if (!measureOnly) watchParentStyles(iframe);
     }
     const specScript = iframeDoc.getElementById('ponkotsu-spec-data');
     if (specScript) {
@@ -538,8 +575,10 @@ export function renderSandboxApp(
     container.innerHTML = '';
   }
 
-  schedulePopups(spec, liveState, callbacks);
-  schedulePageTransition(spec, liveState, callbacks);
+  if (!measureOnly) {
+    schedulePopups(spec, liveState, callbacks);
+    schedulePageTransition(spec, liveState, callbacks);
+  }
 
   const phoneScreen = targetDoc.createElement('div');
   phoneScreen.className = `phone-app-screen ${spec.theme.chaoticLayout ? 'is-chaotic' : 'is-clean'}`;
@@ -1166,8 +1205,24 @@ export function renderSandboxApp(
   if (stickyBar.childElementCount > 0) phoneScreen.append(stickyBar);
   phoneScreen.append(overlaySlot);
   mountRoot.appendChild(phoneScreen);
+  if (measureOnly) {
+    // 判定用の描画は、決まった大きさに合わせて文字の基準を決め、スクロールは先頭にする
+    fitContentToScreen(targetDoc, body);
+    body.scrollTop = 0;
+    return;
+  }
   body.addEventListener('scroll', () => updateScrollHint(body), { passive: true });
   scheduleFit(iframeDoc ? iframe : null, targetDoc, body, previousScrollTop);
+}
+
+/** 判定用の描画で、文字の基準を測り直す。スタイルや文字の読み込みを待ったあとに呼ぶ */
+export function refitMeasuredSandbox(container: HTMLElement): void {
+  const iframe = container.querySelector<HTMLIFrameElement>('iframe.sandbox-iframe');
+  const doc = iframe?.contentDocument;
+  const body = doc?.querySelector<HTMLElement>('.sandbox-app-body');
+  if (!doc || !body) return;
+  fitContentToScreen(doc, body);
+  body.scrollTop = 0;
 }
 
 /**

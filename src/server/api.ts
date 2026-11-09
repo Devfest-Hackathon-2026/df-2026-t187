@@ -323,6 +323,7 @@ async function routeApiRequest(
         latestReviews: sanitizeLatestReviews(body.latestReviews),
         targetComponentIds: sanitizeComponentIds(body.targetComponentIds),
         recipient: typeof body.recipient === 'string' ? body.recipient.slice(0, 40) : undefined,
+        componentBounds: body.componentBounds,
       });
       sendJson(res, 200, result);
       return true;

@@ -43,6 +43,18 @@ import {
   type ClearFeedbackInput,
 } from '../shared/promptTelemetry.ts';
 import { describeWorkSteps } from '../shared/workSteps.ts';
+import {
+  COMPONENT_SIZES,
+  CUSTOM_COMPONENT_PURPOSES,
+  isCustomComponent,
+  normalizeCustomComponentForProfile,
+  prepareSimulationInput,
+  type CustomComponentProfile,
+} from '../shared/customComponentProfile.ts';
+import {
+  resolveCustomComponentProfiles,
+  type ResolvedCustomProfiles,
+} from './customComponentProfiles.ts';
 
 export { classifyUserMessageIntent, detectExplicitRecipientMention };
 import type {
@@ -52,6 +64,7 @@ import type {
   AppSpec,
   ChatHistoryEntry,
   ChatRequest,
+  ComponentBoundsInput,
   ChatResponse,
   EvaluateRequest,
   EvaluationResponse,
@@ -62,6 +75,7 @@ import type {
   RecordDecisionRequest,
   RecordDecisionResponse,
   ReviewerEvaluation,
+  ReviewerPersona,
   ReviewOutcome,
   SpecPatch,
   TranscribeRequest,
@@ -194,6 +208,8 @@ const TIMEOUTS = {
   review: { timeoutMs: 8_000, retries: 0 },
   /** 店長のせりふ・判断の記録（間に合わなければ決まった形で済ませる） */
   side: { timeoutMs: 8_000, retries: 0 },
+  /** 独自の部品の読み取り（間に合わなければ、その回は部品のHTMLに書かれた動きだけで判定し、結果は保存しない） */
+  convert: { timeoutMs: 10_000, retries: 0 },
 } as const;
 
 export class AiTimeoutError extends Error {
@@ -464,8 +480,11 @@ async function voiceCohortCustomers(
   req: ChatRequest,
 ): Promise<Array<{ personaId: string; text: string }>> {
   const reviewers = getReviewersByCohort(req.cohortId);
+  // お客さんの反応を見たときと同じく、読み取り結果を固定した独自の部品と、決まった条件で測った座標で判定する
+  const { profiles } = await resolveProfilesForSpec(req.currentSpec);
+  const simMap = simulateReviewers(req.currentSpec, reviewers, profiles, req.componentBounds);
   const sims = reviewers.map((persona) => {
-    const sim = simulatePersonaComputerUse(req.currentSpec, persona);
+    const sim = simMap.get(persona.id)!;
     const latestForPersona = req.latestReviews?.reviews.find((r) => r.name === persona.name);
     const trace = latestForPersona?.actionTrace ?? sim.actionTrace;
     const outcome = latestForPersona?.outcome ?? sim.outcome;
@@ -696,12 +715,6 @@ const EVALUATE_COMMENTS_SCHEMA: Schema = {
         type: Type.OBJECT,
         properties: {
           reviewerId: { type: Type.STRING },
-          outcome: {
-            type: Type.STRING,
-            enum: ['achieved', 'bothered', 'abandoned', 'regretted'],
-            description:
-              '画面画像と仕様・操作ログを踏まえたこの顧客の体験結果（achieved:満足して買えた / bothered:買えたが途中で嫌な思いや手間があった / abandoned:途中でやめた / regretted:買えたが余計な契約等で後悔した）',
-          },
           frictionPoint: {
             type: Type.STRING,
             description: 'どこで迷ったか・何が良かったかの短い要点（18文字以内）',
@@ -1355,6 +1368,119 @@ function detectCouponStatusForClearFeedback(
   return 'kept_no_discount';
 }
 
+// ============================================================================
+// 独自の部品の読み取り
+// ============================================================================
+
+const CUSTOM_PROFILE_SCHEMA: Schema = {
+  type: Type.OBJECT,
+  properties: {
+    purpose: {
+      type: Type.STRING,
+      enum: [...CUSTOM_COMPONENT_PURPOSES],
+      description:
+        'この部品が何の代わりになるか。order は注文を確定するボタン、coupon はその場で値引きされるクーポンや割引の欄、subscription は定期便などの申し込み欄、input_shortcut はお届け先や支払い方法をまとめて埋めるボタン、required_input は注文に必要な入力欄、total は合計金額の表示、info は案内や説明の表示、ad は注文と関係ない宣伝、danger は入力を消したり別のページに飛ばしたりするボタン、decoy は押しても何も起きない目立つボタン、other はどれにも当たらない表示',
+    },
+    userChooses: {
+      type: Type.BOOLEAN,
+      description: '利用者が自分で押したり選んだりして初めて効くなら true。何もしなくても効いてしまうなら false',
+    },
+    enabledByDefault: {
+      type: Type.BOOLEAN,
+      description: '最初からチェックが入っている、最初から申し込みや適用が済んでいる状態なら true',
+    },
+    textSize: {
+      type: Type.STRING,
+      enum: [...COMPONENT_SIZES],
+      description:
+        '判断に必要な文字のうち一番小さいものの大きさ。xs は10px前後の注意書き、sm は12px前後、md は14px前後の本文、lg は18px前後、xl は22px以上。指定がなければ md',
+    },
+    tapTargetSize: {
+      type: Type.STRING,
+      enum: [...COMPONENT_SIZES],
+      description:
+        '押す部分の高さ。xs は26px前後、sm は34px前後、md は44px前後、lg は56px前後、xl は68px以上。押す部分がなければ表示全体の高さ',
+    },
+    hasHiddenCondition: {
+      type: Type.BOOLEAN,
+      description:
+        '気づかないと損をする条件（自動で続く契約、解約の制限、追加の料金、会員登録が必要など）が、小さい字や目立たない場所にだけ書かれていれば true',
+    },
+    hardToClose: {
+      type: Type.BOOLEAN,
+      description: '広告などで、閉じる手段が見つけにくい・小さい・押すと別のページに飛ぶなら true',
+    },
+    pressure: {
+      type: Type.BOOLEAN,
+      description: '偽の残り時間や在庫の煽りなど、急かす表示があれば true',
+    },
+  },
+  required: [
+    'purpose',
+    'userChooses',
+    'enabledByDefault',
+    'textSize',
+    'tapTargetSize',
+    'hasHiddenCondition',
+    'hardToClose',
+    'pressure',
+  ],
+};
+
+/**
+ * 独自の部品1つを、操作シミュレーターがほかの部品と同じ基準で判定できる値に読み取る。
+ * 同じ部品からはできるだけ同じ値が返るよう temperature を 0 にし、seed も固定する。
+ * それでも揺れうるため、読み取った値は customComponentProfiles.ts で部品の定義ごとに保存して使い回す
+ */
+export async function convertCustomComponentWithGemini(comp: AppComponent): Promise<CustomComponentProfile> {
+  const aiInfo = requireGenAIClient();
+  const prompt = [
+    'あなたは通販の注文画面に置かれた独自の部品を読み取る係です。部品の定義（HTML・CSS・押したときの動き）だけを根拠に、この部品が何の代わりになるか、文字や押す部分の大きさ、利用者が損をする仕掛けがあるかを答えてください。',
+    'お客さんが満足するかどうかは答えないでください。決まった項目の事実だけを答えます。',
+    'data-set-state="キー:値" は押すと状態を書き換える、data-toggle-state="キー" は押すと切り替える、data-complete-task は押すと注文が確定する、data-close-popup は押すと広告を閉じる、という意味です。{キー} は状態の値の表示です。',
+    'couponDiscount に値を入れる部品は、その場で合計から値引きされるクーポンです。subscription を切り替える部品は定期便の申し込み欄です。',
+    `【部品の定義】\n${normalizeCustomComponentForProfile(comp)}`,
+  ].join('\n');
+  const response = await generateContentWithTimeout(
+    aiInfo,
+    {
+      model: aiInfo.model,
+      contents: prompt,
+      config: {
+        responseMimeType: 'application/json',
+        responseSchema: CUSTOM_PROFILE_SCHEMA,
+        temperature: 0,
+        seed: 0,
+        ...thinkingConfig(),
+      },
+    },
+    TIMEOUTS.convert,
+  );
+  return parseJsonResponse<CustomComponentProfile>(response.text, 'custom_profile');
+}
+
+/** 画面にある独自の部品の読み取り結果をそろえる。AIの接続設定がなければ、どれも読み取れなかったものとして扱う */
+export async function resolveProfilesForSpec(spec: AppSpec): Promise<ResolvedCustomProfiles> {
+  if (!spec.components.some(isCustomComponent)) return { profiles: {}, fallbackIds: [] };
+  const model = createGenAIClient()?.model ?? 'unconfigured';
+  return resolveCustomComponentProfiles(spec, convertCustomComponentWithGemini, model);
+}
+
+/**
+ * 選んだ客層の一人ひとりの判定。同じ画面・同じ読み取り結果・同じ座標なら、必ず同じ結果になる
+ */
+export function simulateReviewers(
+  spec: AppSpec,
+  reviewers: ReviewerPersona[],
+  profiles: Readonly<Record<string, CustomComponentProfile>> | undefined,
+  bounds?: ComponentBoundsInput[],
+): Map<string, ReturnType<typeof simulatePersonaComputerUse>> {
+  const input = prepareSimulationInput(spec, profiles, bounds);
+  return new Map(
+    reviewers.map((persona) => [persona.id, simulatePersonaComputerUse(input.spec, persona, input.bounds)]),
+  );
+}
+
 /**
  * レビューAI:
  * 改修意図も議論も一切知らず、画面と Computer Use 実操作シミュレーション結果（制約変数適用済み）のみを受け取る。
@@ -1364,19 +1490,18 @@ export async function evaluateAppWithPersonas(req: EvaluateRequest): Promise<Eva
   const aiInfo = requireGenAIClient();
   const reviewers = getReviewersByCohort(req.cohortId);
 
-  // 1. まずコード側で、各ペルソナの制約変数（視力ぼかし・指のズレ・手数上限・待てる時間）をかけた
-  //    Computer Use 実操作シミュレーションを実行し、タスク完了イベント発火の有無で達成/離脱を確定する。
-  const simMap = new Map(
-    reviewers.map((persona) => [
-      persona.id,
-      simulatePersonaComputerUse(req.currentSpec, persona, req.componentBounds),
-    ]),
-  );
+  // 1. 独自の部品があれば、部品の定義ごとに固定した読み取り結果で、既存の部品と同じ基準の部品に置き換える
+  const { profiles, fallbackIds } = await resolveProfilesForSpec(req.currentSpec);
+  const simInput = prepareSimulationInput(req.currentSpec, profiles, req.componentBounds);
+
+  // 2. コード側で、各ペルソナの制約変数（視力ぼかし・指のズレ・手数上限・待てる時間）をかけた
+  //    操作シミュレーションを実行し、結果を確定する。Gemini はこの結果を変えない
+  const simMap = simulateReviewers(req.currentSpec, reviewers, profiles, req.componentBounds);
 
   // お店の側の結果（注文数や、題材で決めた数字）はコードで数える
   const owner = buildOwnerReport(
     ACTIVE_THEME.owner,
-    req.currentSpec,
+    simInput.spec,
     reviewers.map((p) => ({
       outcome: simMap.get(p.id)!.outcome,
       finalState: simMap.get(p.id)!.finalState,
@@ -1406,16 +1531,8 @@ export async function evaluateAppWithPersonas(req: EvaluateRequest): Promise<Eva
     const otherPersonas = ALL_REVIEWER_PERSONAS.filter(
       (p) => !reviewers.some((r) => r.id === p.id),
     );
-    const otherImpact = describeOtherCohortImpact(
-      req.currentSpec,
-      otherPersonas,
-      req.componentBounds,
-    );
-    const couponStatus = detectCouponStatusForClearFeedback(
-      req.currentSpec,
-      req.componentBounds,
-      simMap,
-    );
+    const otherImpact = describeOtherCohortImpact(simInput.spec, otherPersonas, simInput.bounds);
+    const couponStatus = detectCouponStatusForClearFeedback(simInput.spec, simInput.bounds, simMap);
     const facts = buildClearFeedbackFacts({
       cohortLabel,
       summary,
@@ -1454,15 +1571,11 @@ export async function evaluateAppWithPersonas(req: EvaluateRequest): Promise<Eva
     };
   });
 
-  const hasCustomComponents = req.currentSpec.components.some(
-    (c) => c.type === 'custom' || Boolean(c.customHtml),
-  );
-
   const prompt = [
     `あなたは${ACTIVE_THEME.appName}で${ACTIVE_THEME.taskLabel}ことを試した3人の顧客です。改修の意図やこれまでの議論は一切知りません。`,
-    '添付された画面のスクリーンショット（視覚情報）・現在のUI部品仕様・各顧客が実際に画面を操作したログ（actionTrace）と基準結果（codeDeterminedOutcome / codeDeterminedFriction）に基づき、本人になりきった感想（comment）、困った点・良かった点（frictionPoint）、および体験結果（outcome）を生成してください。',
+    '添付された画面のスクリーンショット（視覚情報）・現在のUI部品仕様・各顧客が実際に画面を操作したログ（actionTrace）と確定した結果（codeDeterminedOutcome / codeDeterminedFriction）に基づき、本人になりきった感想（comment）と、困った点・良かった点（frictionPoint）を生成してください。',
     '結果は achieved が達成、abandoned が途中でやめた、regretted が完了はできたが余計な契約などにあとで気づいて後悔した、bothered が買えたが途中で嫌な思いをした、です。',
-    'outcome は原則として codeDeterminedOutcome をそのまま使い、comment と frictionPoint も必ずその人の actionTrace と codeDeterminedFriction にある事実だけを本人の口調で言い換えてください（独自の追加部品 customHtml が画面にある場合のみ、その部品による満足・不満を反映してよいです）。',
+    'codeDeterminedOutcome は確定した結果です。結果を変えたり、結果と食い違う気持ちを話したりしないでください。comment と frictionPoint は、必ずその人の actionTrace と codeDeterminedFriction にある事実だけを本人の口調で言い換えてください。',
     'actionTrace に書かれていないこと（例：定期便を申し込んでいない人が定期便を申し込んだと言う、記録にない文字の重なりや画面崩れを指摘する、電話解約でやめたのに満足したことにする等）は絶対に作らないでください。',
     'regretted の人は、あとから気づいたがっかりした気持ちを話してください。bothered の人は、買えたことと途中の嫌だったことの両方が伝わるように話してください。achieved の人は、素直に満足や工夫への好感を話してください。',
     '',
@@ -1491,7 +1604,6 @@ export async function evaluateAppWithPersonas(req: EvaluateRequest): Promise<Eva
   let parsed: {
     comments: Array<{
       reviewerId: string;
-      outcome?: ReviewOutcome;
       frictionPoint: string;
       comment: string;
     }>;
@@ -1522,22 +1634,10 @@ export async function evaluateAppWithPersonas(req: EvaluateRequest): Promise<Eva
   const results: ReviewerEvaluation[] = reviewers.map((p) => {
     const sim = simMap.get(p.id)!;
     const aiComment = parsed.comments.find((c) => c.reviewerId === p.id);
-    // 勝敗はコードのシミュレーター判定（sim.outcome）を厳守する。
-    // 独自の＋α部品（customHtml）が追加されている場合のみ、注文不能・後悔・希望機能欠落でない限りAI判定も反映する
-    const missingDesiredFeature =
-      sim.frictionPoint.includes('定期便の設定がなかった') ||
-      Object.values(COUPON_FRICTIONS).some((f) => sim.frictionPoint.includes(f));
-    const resolvedOutcome: ReviewOutcome =
-      hasCustomComponents &&
-      sim.outcome !== 'abandoned' &&
-      sim.outcome !== 'regretted' &&
-      !missingDesiredFeature &&
-      (aiComment?.outcome === 'achieved' || aiComment?.outcome === 'bothered')
-        ? aiComment.outcome
-        : sim.outcome;
+    // 結果はコードのシミュレーターの判定だけで決める。Gemini の感想は言葉だけに使う
     return {
       reviewerId: p.id,
-      outcome: resolvedOutcome,
+      outcome: sim.outcome,
       frictionPoint:
         cleanJapaneseText(aiComment?.frictionPoint || '', sim.frictionPoint) || sim.frictionPoint,
       comment:
@@ -1561,6 +1661,8 @@ export async function evaluateAppWithPersonas(req: EvaluateRequest): Promise<Eva
     results,
     owner,
     telemetrySummary,
+    customComponentProfiles: profiles,
+    customComponentFallbackIds: fallbackIds,
   };
 }
 

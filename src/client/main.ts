@@ -58,6 +58,8 @@ import {
   scrollSandboxBy,
 } from './sandboxRenderer.ts';
 import { captureSandboxSnapshot } from './snapshot.ts';
+import { measureFixedLayoutBounds } from './fixedLayoutMeasure.ts';
+import { prepareSimulationInput } from '../shared/customComponentProfile.ts';
 
 /**
  * チャットの発言者
@@ -1633,7 +1635,17 @@ function startCohort(cohortId: TargetCohortId): void {
     cohortId: cohort.id,
   });
 
-  const currentSpec = getCurrentSpec();
+  void playCohortHearing(cohort, getCurrentSpec());
+}
+
+/**
+ * 選んだ客層の3人に、今の画面で困ったことを聞く。お客さんの反応を見るときと同じく、
+ * 決まった条件で描画して測った座標で判定する
+ */
+async function playCohortHearing(cohort: (typeof TARGET_COHORTS)[number], currentSpec: AppSpec): Promise<void> {
+  const componentBounds = await measureFixedLayoutBounds(currentSpec);
+  // 測っている間に、やり直しなどで別の挑戦が始まっていたら話さない
+  if (state.selectedCohortId !== cohort.id || getCurrentSpec() !== currentSpec) return;
   const reviewers = getReviewersByCohort(cohort.id);
   const hearingQueue: QueuedMessage[] = [
     {
@@ -1648,7 +1660,7 @@ function startCohort(cohortId: TargetCohortId): void {
   let abandonedCount = 0;
   const unhappyNames: string[] = [];
   for (const persona of reviewers) {
-    const sim = simulatePersonaComputerUse(currentSpec, persona);
+    const sim = simulatePersonaComputerUse(currentSpec, persona, componentBounds);
     hearingQueue.push({
       message: { role: 'customer', personaId: persona.id, text: persona.greeting },
       typingMs: typingDurationFor(persona.greeting),
@@ -2206,7 +2218,10 @@ async function handleSendMessage(
   try {
     // 発言の本文はこのブラウザに残し、サーバーには何番目の発言かだけを伝える
     const turnIndex = state.runTurnTexts.push(text) - 1;
+    // お客さんへの質問の返事も、反応を見るときと同じ条件で測った座標で判定する
+    const componentBounds = await measureFixedLayoutBounds(spec);
     const data = await postJson<ChatResponse>('/api/chat', {
+      componentBounds,
       currentSpec: spec,
       latestReviews: buildLatestReviewRecord(),
       targetComponentIds: targetIdsSnapshot,
@@ -2442,7 +2457,8 @@ async function handleEvaluate(predictions?: Record<string, ReviewOutcome>): Prom
   try {
     const activePersonas = getReviewersByCohort(state.selectedCohortId);
     const currentSpec = getCurrentSpec();
-    const componentBounds = sandboxStageEl ? collectComponentRects(sandboxStageEl) : undefined;
+    // 判定用の座標は、見えている画面ではなく、決まった大きさで画面外に描画した画面から測る
+    const componentBounds = await measureFixedLayoutBounds(currentSpec);
     const screenshotBase64 = sandboxStageEl
       ? captureSandboxSnapshot(currentSpec, state.liveAppState, sandboxStageEl, null)
       : undefined;
@@ -2457,11 +2473,27 @@ async function handleEvaluate(predictions?: Record<string, ReviewOutcome>): Prom
     });
     getCurrentCheckpoint().evaluation = evaluation;
     state.predictionRounds.push(scorePredictionRound(evaluation.results, predictions));
+    // 選ばなかった客層も、サーバーと同じ独自の部品の読み取り結果と座標で判定する
+    const simInput = prepareSimulationInput(
+      currentSpec,
+      evaluation.customComponentProfiles,
+      componentBounds,
+    );
     // 各お客さんの吹き出しの下に予想の答え合わせバッジが出るため、途中の予想確認行はここで片付ける
     clearPredictionStepMessages();
 
     // お客さん3人の反応を書き込み中の表示を挟んで1人ずつ出す（店長は変更直後に反応済みのためここでは話さない）
     const queued: QueuedMessage[] = [];
+    if ((evaluation.customComponentFallbackIds ?? []).length > 0) {
+      queued.push({
+        message: {
+          role: 'system',
+          tone: 'warning',
+          text: '独自の部品を読み取れなかったので、今回は部品の中のボタンの動きと文字だけで判定しました。もう一度反応を見ると読み取り直します',
+        },
+        typingMs: 0,
+      });
+    }
     let achievedCount = 0;
     for (const persona of activePersonas) {
       const result = evaluation.results.find((r) => r.reviewerId === persona.id);
@@ -2490,7 +2522,7 @@ async function handleEvaluate(predictions?: Record<string, ReviewOutcome>): Prom
       queued.push({
         message: {
           role: 'system',
-          text: describeOtherCohortImpact(currentSpec, otherPersonas, componentBounds).line,
+          text: describeOtherCohortImpact(simInput.spec, otherPersonas, simInput.bounds).line,
         },
         typingMs: 0,
       });
@@ -2554,9 +2586,9 @@ async function handleEvaluate(predictions?: Record<string, ReviewOutcome>): Prom
         });
       }
       const report = describeOtherCohortReport(
-        currentSpec,
+        simInput.spec,
         otherPersonas,
-        componentBounds,
+        simInput.bounds,
         TARGET_COHORTS,
       );
       queued.push({

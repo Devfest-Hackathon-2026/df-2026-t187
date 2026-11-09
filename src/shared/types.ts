@@ -2,6 +2,7 @@
 // UI部品ツリーと状態変数は型安全なJSONで管理し、単一HTMLとしてiframe内で隔離実行する。
 
 import type { Rect2D } from './hitTest.ts';
+import type { CustomComponentProfile } from './customComponentProfile.ts';
 import type {
   EmbeddingSignal,
   NaturalLanguageSignal,
@@ -308,6 +309,13 @@ export interface EvaluationResponse {
   owner?: OwnerReport;
   /** クリア時などの行動ベースのプロンプト到達効率サマリー */
   telemetrySummary?: PromptSessionSummary;
+  /**
+   * 判定に使った、独自の部品の読み取り結果（部品のID → 結果）。
+   * 選ばなかった客層の判定も、画面側で同じ読み取り結果を使ってそろえる
+   */
+  customComponentProfiles?: Record<string, CustomComponentProfile>;
+  /** 読み取れず、部品のHTMLに書かれた動きと文字だけで判定した独自の部品のID */
+  customComponentFallbackIds?: string[];
 }
 
 // 人間の判断記録 (Own the Why / Function Calling で構造化記録)
@@ -465,6 +473,8 @@ export interface ChatRequest {
   mode?: 'circled';
   /** 誰に向けて送った発言か（auto / assistant / owner / ペルソナID） */
   recipient?: string;
+  /** 決まった条件で描画して測った部品の座標。お客さんへの質問の返事を、反応を見たときと同じ条件で判定するために使う */
+  componentBounds?: ComponentBoundsInput[];
 }
 
 export interface ChatResponse {
