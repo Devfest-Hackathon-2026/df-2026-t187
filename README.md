@@ -14,6 +14,8 @@
   - https://yukid.hinata.works/?scenario=demo
   - 罠を3つに絞った問題で、約3分で主な機能をひととおり確かめられます
 
+![客層を選んだ直後の画面。左が手直しする購入画面、右が店長・お助けAI・お客さんとのチャット](docs/images/screen.jpg)
+
 ## コンセプト・背景
 
 - **ダークパターンを生む板挟みと、生成AI時代の新しい壁**
@@ -202,6 +204,8 @@ AIに任せないことも、はっきり分けています。お客さんが買
 - [`src/server/api.ts`](src/server/api.ts)：APIの入口。受け付ける値の形と長さの確認、送る前の検査、回数の上限
 
 ## 技術構成
+
+![システムアーキテクチャ図。学習者のブラウザから Cloud Run を通して、Model Armor、Gemini、Text Embeddings API、Cloud Natural Language API、Cloud Text-to-Speech API、Cloud Firestore と BigQuery を呼び出す](docs/images/architecture.png)
 
 - **フロントエンド**：TypeScript / Vite / HTML5 Canvas / Sandbox `iframe`
 - **生成AI・音声**：`@google/genai` で Gemini Enterprise Agent Platform の Gemini を呼ぶ。赤ペンで囲んだ画像と画面のスクリーンショットのマルチモーダル入力、Structured Outputs、Function Calling の `record_human_decision` / Google Cloud Text-to-Speech API で11人分の声を合成し、決まったセリフの音声は同梱
