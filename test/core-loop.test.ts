@@ -985,14 +985,15 @@ describe('core-loop', () => {
           avg_execute_turns_on_clear: 3.75,
         },
         cohortStats: [
-          { cohort_id: 'thrifty', run_count: 4, cleared_count: 3, avg_execute_turns_on_clear: 3.666 },
-          { cohort_id: 'careful', run_count: 2, cleared_count: 1, avg_execute_turns_on_clear: 4.0 },
+          { cohort_id: 'thrifty', run_count: 6, execute_run_count: 4, cleared_count: 3, avg_execute_turns_on_clear: 3.666 },
+          { cohort_id: 'careful', run_count: 4, execute_run_count: 2, cleared_count: 1, avg_execute_turns_on_clear: 4.0 },
         ],
         promptTotals: {
           total_prompts: 20,
           execute_prompts: 15,
           rework_prompts: 3,
           removed_needed_prompts: 2,
+          execute_run_count: 5,
         },
         archetypeStats: [
           { archetype: 'goal_directed', cnt: 6 },
@@ -1019,7 +1020,8 @@ describe('core-loop', () => {
     const thriftyCohort = enough.cohorts.find((c) => c.cohortId === 'thrifty');
     const carefulCohort = enough.cohorts.find((c) => c.cohortId === 'careful');
     assert.equal(thriftyCohort?.suppressed, false);
-    assert.equal(thriftyCohort?.runCount, 4);
+    assert.equal(thriftyCohort?.runCount, 6);
+    assert.equal(thriftyCohort?.executeRunCount, 4);
     assert.equal(thriftyCohort?.clearRatePercent, 75);
     assert.equal(thriftyCohort?.avgExecuteTurnsOnClear, 3.7);
     assert.equal(carefulCohort?.suppressed, true);

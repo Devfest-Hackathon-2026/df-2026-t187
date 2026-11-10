@@ -27,8 +27,8 @@ import {
   transcribeAndRefineUserAudio,
   voiceOwnerLine,
 } from './gemini.ts';
+import { getPublicAggregateTips } from './aggregateTips.ts';
 import {
-  getPublicAggregateStats,
   synthesizeStudioSpeech,
   recordRunEvent,
   type RunEventInput,
@@ -400,8 +400,8 @@ async function routeApiRequest(
       return true;
     }
 
-    if (req.method === 'GET' && url === '/api/aggregate-stats') {
-      sendJson(res, 200, await getPublicAggregateStats());
+    if (req.method === 'GET' && url === '/api/aggregate-tips') {
+      sendJson(res, 200, await getPublicAggregateTips());
       return true;
     }
 

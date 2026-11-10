@@ -37,7 +37,14 @@ import {
   scorePredictionRound,
   type PredictionRound,
 } from '../shared/prediction.ts';
-import { ARCHETYPE_PUBLIC_LABELS, fillTurnRefs } from '../shared/promptTelemetry.ts';
+import {
+  AGGREGATE_TIP_BOX_CAPTIONS,
+  AGGREGATE_TIP_BOX_IDS,
+  type AggregateTipBox,
+  type AggregateTipBoxId,
+  type PublicAggregateTips,
+} from '../shared/aggregateTips.ts';
+import { fillTurnRefs } from '../shared/promptTelemetry.ts';
 import { buildInitialSpec, buildScenarioSpec, type DifficultyLevel } from '../shared/theme.ts';
 import { describeComponentFunctionName } from '../shared/workSteps.ts';
 import type {
@@ -50,7 +57,6 @@ import type {
   LatestReviewRecord,
   OwnerLineRequest,
   OwnerLineResponse,
-  PublicAggregateStats,
   RecordDecisionRequest,
   RecordDecisionResponse,
   ReviewerPersona,
@@ -400,249 +406,115 @@ function toggleAggregateConsent(): void {
   scrollToLatestMessage();
 }
 
-const STATS_STAGGER_MS = 45;
+const TIP_STAGGER_MS = 70;
+const TIP_BOX_MARKS: Record<AggregateTipBoxId, string> = {
+  phrasing: '①',
+  stumbling: '②',
+  blindspot: '③',
+};
 
-function applyStaggerEnter(el: HTMLElement, step: number): void {
-  el.classList.add('stats-value-enter');
-  el.style.animationDelay = `${step * STATS_STAGGER_MS}ms`;
+/** 集計した時刻を、11月10日14時 のような短い言葉にする */
+function formatTipsTime(iso: string): string | null {
+  const t = new Date(iso);
+  if (Number.isNaN(t.getTime())) return null;
+  return `${t.getMonth() + 1}月${t.getDate()}日${t.getHours()}時`;
 }
 
-function appendAggregateStatsBody(
+function tipPendingText(box: AggregateTipBox, tips: PublicAggregateTips | null): string {
+  if (!tips || box.status === 'unavailable') {
+    return '今は集計を読み込めません。時間をおいて開き直してください';
+  }
+  return box.runsNeeded !== undefined
+    ? `集計中です。あと${box.runsNeeded}件の挑戦で表示されます`
+    : '集計中です。もう少し挑戦が集まると表示されます';
+}
+
+/**
+ * みんなの集計の中身を描く。コツを3つ縦に並べ、それぞれに見出し・本文・根拠のタグを入れる。
+ * tips が null なら読み込み中として、枠だけを出す
+ */
+function renderAggregateTips(
   container: HTMLElement,
-  stats: PublicAggregateStats,
+  tips: PublicAggregateTips | null,
   options: { loading?: boolean } = {},
 ): void {
   container.innerHTML = '';
   const isLoading = options.loading === true;
   container.classList.toggle('is-loading', isLoading);
 
-  const isInsufficient =
-    isLoading ||
-    !stats.available ||
-    stats.suppressed ||
-    (stats.totalRuns ?? 0) < stats.minRunsForDisplay;
+  const list = document.createElement('div');
+  list.className = 'tips-list';
+  AGGREGATE_TIP_BOX_IDS.forEach((id, index) => {
+    const box: AggregateTipBox = tips?.boxes.find((b) => b.id === id) ?? {
+      id,
+      status: 'unavailable',
+      tags: [],
+    };
+    const card = document.createElement('section');
+    card.className = `tip-card is-${isLoading ? 'loading' : box.status}`;
+    card.setAttribute('aria-labelledby', `tip-caption-${id}`);
 
-  let staggerStep = 0;
+    const caption = document.createElement('div');
+    caption.className = 'tip-caption';
+    caption.id = `tip-caption-${id}`;
+    caption.textContent = `${TIP_BOX_MARKS[id]} ${AGGREGATE_TIP_BOX_CAPTIONS[id]}`;
+    card.appendChild(caption);
 
-  // 1. 全体の数値カード
-  const kpiGrid = document.createElement('div');
-  kpiGrid.className = 'stats-kpi-grid';
-  const kpiItems: Array<{ label: string; value: string }> = isLoading
-    ? [
-        { label: '協力された挑戦', value: '…' },
-        { label: 'クリア率', value: '…' },
-        { label: '平均手直し', value: '…' },
-        { label: '記録された発言', value: '…' },
-      ]
-    : isInsufficient
-      ? [
-          { label: '協力された挑戦', value: '— 件' },
-          { label: 'クリア率', value: '— %' },
-          { label: '平均手直し', value: '— 回' },
-          { label: '記録された発言', value: '— 件' },
-        ]
-      : [
-          { label: '協力された挑戦', value: `${stats.totalRuns ?? 0}件` },
-          { label: 'クリア率', value: `${stats.clearRatePercent ?? 0}%` },
-          {
-            label: '平均手直し',
-            value:
-              stats.avgExecuteTurnsOnClear !== null && stats.avgExecuteTurnsOnClear !== undefined
-                ? `${stats.avgExecuteTurnsOnClear}回`
-                : '— 回',
-          },
-          {
-            label: '記録された発言',
-            value: stats.totalPrompts !== undefined ? `${stats.totalPrompts}件` : '— 件',
-          },
-        ];
-  for (const item of kpiItems) {
-    const card = document.createElement('div');
-    card.className = `stats-kpi-card${isInsufficient ? ' is-placeholder' : ''}`;
-    const lbl = document.createElement('div');
-    lbl.className = 'stats-kpi-label';
-    lbl.textContent = item.label;
-    const val = document.createElement('div');
-    val.className = 'stats-kpi-value';
-    val.textContent = item.value;
-    if (!isLoading) applyStaggerEnter(val, staggerStep++);
-    card.append(lbl, val);
-    kpiGrid.appendChild(card);
-  }
-  container.appendChild(kpiGrid);
-
-  // 2. 指示の型の割合
-  const archSection = document.createElement('div');
-  archSection.className = 'stats-section';
-  const h = document.createElement('h3');
-  h.className = 'terms-heading';
-  h.textContent = '指示や質問の型の内訳';
-  archSection.appendChild(h);
-
-  const barList = document.createElement('div');
-  barList.className = 'stats-bar-list';
-  const archRows =
-    !isInsufficient && stats.archetypeBreakdown && stats.archetypeBreakdown.length > 0
-      ? stats.archetypeBreakdown
-      : ARCHETYPE_PUBLIC_LABELS.map((item) => ({
-          label: item.label,
-          count: null as number | null,
-          percent: null as number | null,
-        }));
-  for (const row of archRows) {
-    const step = staggerStep++;
-    const r = document.createElement('div');
-    r.className = 'stats-bar-row';
-    const labelEl = document.createElement('span');
-    labelEl.className = 'stats-bar-label';
-    labelEl.textContent = row.label;
-    const track = document.createElement('div');
-    track.className = 'stats-bar-track';
-    const fill = document.createElement('div');
-    fill.className = 'stats-bar-fill';
-    fill.style.width = '0%';
-    if (!isLoading && row.percent !== null) {
-      fill.style.transitionDelay = `${step * STATS_STAGGER_MS}ms`;
-      const targetWidth = `${Math.max(0, Math.min(100, row.percent))}%`;
-      window.requestAnimationFrame(() => {
-        fill.style.width = targetWidth;
-      });
+    if (isLoading) {
+      for (const cls of ['tip-skeleton is-heading', 'tip-skeleton', 'tip-skeleton is-short']) {
+        const line = document.createElement('div');
+        line.className = cls;
+        card.appendChild(line);
+      }
+    } else if (box.status === 'ready' && box.heading && box.body) {
+      const heading = document.createElement('h3');
+      heading.className = 'tip-heading';
+      heading.textContent = box.heading;
+      const body = document.createElement('p');
+      body.className = 'tip-body';
+      body.textContent = box.body;
+      card.append(heading, body);
+      if (box.tags.length > 0) {
+        const tagList = document.createElement('div');
+        tagList.className = 'tip-tags';
+        for (const tag of box.tags) {
+          const tagEl = document.createElement('span');
+          tagEl.className = 'tip-tag';
+          tagEl.textContent = tag.text;
+          tagEl.title = tag.title;
+          tagList.appendChild(tagEl);
+        }
+        card.appendChild(tagList);
+      }
+    } else {
+      const pending = document.createElement('p');
+      pending.className = 'tip-pending';
+      pending.textContent = tipPendingText(box, tips);
+      card.appendChild(pending);
     }
-    track.appendChild(fill);
-    const numEl = document.createElement('span');
-    numEl.className = 'stats-bar-num';
-    numEl.textContent = isLoading
-      ? '…'
-      : row.percent !== null && row.count !== null
-        ? `${row.percent}% · ${row.count}件`
-        : '— % · — 件';
-    if (!isLoading) applyStaggerEnter(numEl, step);
-    r.append(labelEl, track, numEl);
-    barList.appendChild(r);
-  }
-  archSection.appendChild(barList);
 
-  const subGrid = document.createElement('div');
-  subGrid.className = 'stats-sub-grid';
-  const reworkText = isLoading
-    ? '…'
-    : !isInsufficient && stats.reworkRatePercent !== undefined
-      ? `${stats.reworkRatePercent}%`
-      : '— %';
-  const removedText = isLoading
-    ? '…'
-    : !isInsufficient && stats.removedNeededFeatureRatePercent !== undefined
-      ? `${stats.removedNeededFeatureRatePercent}%`
-      : '— %';
-  for (const [label, value] of [
-    ['同じ部品を直し直した割合', reworkText],
-    ['必要な機能を単純に消した割合', removedText],
-  ] as const) {
-    const item = document.createElement('div');
-    item.className = 'stats-sub-item';
-    const k = document.createElement('span');
-    k.textContent = label;
-    const v = document.createElement('strong');
-    v.textContent = value;
-    if (!isLoading) applyStaggerEnter(v, staggerStep++);
-    item.append(k, v);
-    subGrid.appendChild(item);
-  }
-  archSection.appendChild(subGrid);
-  container.appendChild(archSection);
-
-  // 3. 客層ごとの集計（3件未満の客層は非表示）
-  const cohortSection = document.createElement('div');
-  cohortSection.className = 'stats-section';
-  const cohortHeading = document.createElement('h3');
-  cohortHeading.className = 'terms-heading';
-  cohortHeading.textContent = '客層ごとの結果';
-  cohortSection.appendChild(cohortHeading);
-
-  const cohortList = document.createElement('div');
-  cohortList.className = 'stats-cohort-list';
-  for (const c of stats.cohorts) {
-    const step = staggerStep++;
-    const card = document.createElement('div');
-    card.className = 'stats-cohort-card';
-    const title = document.createElement('div');
-    title.className = 'stats-cohort-title';
-    title.textContent = c.label;
-
-    const rowsEl = document.createElement('dl');
-    rowsEl.className = 'stats-cohort-rows';
-    const hideCohort = isInsufficient || c.suppressed;
-    const cohortMetrics: Array<[string, string]> = isLoading
-      ? [
-          ['挑戦', '…'],
-          ['クリア率', '…'],
-          ['平均手直し', '…'],
-        ]
-      : [
-          ['挑戦', hideCohort ? '— 件' : `${c.runCount}件`],
-          ['クリア率', hideCohort ? '— %' : `${c.clearRatePercent}%`],
-          [
-            '平均手直し',
-            hideCohort || c.avgExecuteTurnsOnClear === null || c.avgExecuteTurnsOnClear === undefined
-              ? '— 回'
-              : `${c.avgExecuteTurnsOnClear}回`,
-          ],
-        ];
-    for (const [kText, vText] of cohortMetrics) {
-      const row = document.createElement('div');
-      row.className = 'stats-cohort-row';
-      const dt = document.createElement('dt');
-      dt.textContent = kText;
-      const dd = document.createElement('dd');
-      dd.textContent = vText;
-      if (!isLoading) applyStaggerEnter(dd, step);
-      row.append(dt, dd);
-      rowsEl.appendChild(row);
+    if (!isLoading) {
+      card.classList.add('tip-enter');
+      card.style.animationDelay = `${index * TIP_STAGGER_MS}ms`;
     }
-    card.append(title, rowsEl);
-    cohortList.appendChild(card);
-  }
-  cohortSection.appendChild(cohortList);
-  container.appendChild(cohortSection);
+    list.appendChild(card);
+  });
+  container.appendChild(list);
 
-  // 4. よく話題になった語彙（3回以上出た題材語彙のみ）
-  const entSection = document.createElement('div');
-  entSection.className = 'stats-section';
-  const entHeading = document.createElement('h3');
-  entHeading.className = 'terms-heading';
-  entHeading.textContent = 'よく話題になった部品・言葉';
-  entSection.appendChild(entHeading);
-
-  const tagList = document.createElement('div');
-  tagList.className = 'stats-tag-list';
-  if (!isInsufficient && stats.topEntities && stats.topEntities.length > 0) {
-    for (const ent of stats.topEntities) {
-      const tag = document.createElement('span');
-      tag.className = 'stats-tag';
-      tag.textContent = `${ent.term} ${ent.count}回`;
-      if (!isLoading) applyStaggerEnter(tag, staggerStep++);
-      tagList.appendChild(tag);
-    }
-  } else {
-    for (const label of [
-      isLoading ? '定期便 …' : '定期便 — 回',
-      isLoading ? 'クーポン …' : 'クーポン — 回',
-      isLoading ? '注文を確定する …' : '注文を確定する — 回',
-    ]) {
-      const tag = document.createElement('span');
-      tag.className = 'stats-tag is-placeholder';
-      tag.textContent = label;
-      if (!isLoading) applyStaggerEnter(tag, staggerStep++);
-      tagList.appendChild(tag);
-    }
-  }
-  entSection.appendChild(tagList);
-  container.appendChild(entSection);
+  const source = document.createElement('p');
+  source.className = 'tips-source';
+  const time = tips?.available ? formatTipsTime(tips.generatedAt) : null;
+  source.textContent = isLoading
+    ? 'BigQuery の集計を読み込んでいます'
+    : time
+      ? `BigQuery の集計から・${time}`
+      : 'BigQuery の集計につながっていません';
+  container.appendChild(source);
 }
 
 /**
  * みんなの集計のウィンドウを出す。
- * BigQuery の run_events・prompt_events から集計された統計値だけを表示する
+ * BigQuery の集計からサーバーが1時間ごとに作ったコツを表示する。開くたびに Gemini は呼ばない
  */
 function openAggregateStatsDialog(): void {
   if (document.querySelector('.stats-overlay')) return;
@@ -663,18 +535,12 @@ function openAggregateStatsDialog(): void {
   const summary = document.createElement('p');
   summary.className = 'terms-summary';
   summary.textContent =
-    '集計への協力にチェックを入れた挑戦だけを、BigQuery で集計した全体の傾向です。指示の文章や個人を特定できる情報は含まれず、個人の挑戦が推測されないよう3件未満の区分は数値を表示しません。';
+    '集計への協力にチェックを入れた挑戦から、みんなの進め方の傾向をコツにまとめました。指示の文章や個人を特定できる情報は使わず、挑戦が3件未満の区分は表示しません。';
 
   const bodyBox = document.createElement('div');
-  bodyBox.className = 'stats-data-box';
-  const placeholderStats: PublicAggregateStats = {
-    available: false,
-    generatedAt: '',
-    minRunsForDisplay: 3,
-    suppressed: true,
-    cohorts: TARGET_COHORTS.map((c) => ({ cohortId: c.id, label: c.label, suppressed: true })),
-  };
-  appendAggregateStatsBody(bodyBox, placeholderStats, { loading: true });
+  bodyBox.className = 'tips-box';
+  bodyBox.setAttribute('aria-live', 'polite');
+  renderAggregateTips(bodyBox, null, { loading: true });
 
   const closeBtn = document.createElement('button');
   closeBtn.type = 'button';
@@ -702,17 +568,17 @@ function openAggregateStatsDialog(): void {
 
   const minWait = sleep(160);
   void Promise.all([
-    fetch('/api/aggregate-stats').then(async (res) => {
+    fetch('/api/aggregate-tips').then(async (res) => {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      return (await res.json()) as PublicAggregateStats;
+      return (await res.json()) as PublicAggregateTips;
     }),
     minWait,
   ])
-    .then(([stats]) => {
-      appendAggregateStatsBody(bodyBox, stats);
+    .then(([tips]) => {
+      renderAggregateTips(bodyBox, Array.isArray(tips?.boxes) ? tips : null);
     })
     .catch(() => {
-      appendAggregateStatsBody(bodyBox, placeholderStats);
+      renderAggregateTips(bodyBox, null);
     });
 }
 

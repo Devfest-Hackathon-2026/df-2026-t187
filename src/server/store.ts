@@ -1,6 +1,7 @@
 import { GoogleAuth } from 'google-auth-library';
 import { existsSync, readFileSync } from 'node:fs';
-import { TARGET_COHORTS } from '../shared/initialTheme.ts';
+import { ACTIVE_THEME, TARGET_COHORTS } from '../shared/initialTheme.ts';
+import { buildPublicComponentLabels } from '../shared/aggregateTips.ts';
 import {
   classifyDeterministicArchetype,
   cosineSimilarity,
@@ -770,6 +771,14 @@ export function clearPromptTelemetryEvents(): void {
 const AGGREGATE_CACHE_TTL_MS = 5 * 60 * 1000;
 let cachedAggregateStats: { expiresAt: number; value: PublicAggregateStats } | null = null;
 
+let componentLabelsCache: Map<string, string> | null = null;
+
+/** 集計で名前を出してよい、題材の画面の部品 */
+function publicComponentLabels(): Map<string, string> {
+  componentLabelsCache ??= buildPublicComponentLabels(ACTIVE_THEME);
+  return componentLabelsCache;
+}
+
 function isSafeBqIdentifier(name: string): boolean {
   return /^[A-Za-z0-9_]{1,64}$/.test(name);
 }
@@ -831,7 +840,9 @@ export async function getPublicAggregateStats(): Promise<PublicAggregateStats> {
       '    ANY_VALUE(is_rework_on_same_component) AS is_rework,',
       '    ANY_VALUE(removed_needed_feature) AS removed_needed,',
       '    ANY_VALUE(closest_archetype) AS closest_archetype,',
-      '    ANY_VALUE(entities) AS entities',
+      '    ANY_VALUE(entities) AS entities,',
+      '    ANY_VALUE(turn_index) AS turn_index,',
+      '    ANY_VALUE(changed_component_ids) AS changed_component_ids',
       `  FROM ${promptTableRef}`,
       "  WHERE id IS NOT NULL AND id != ''",
       '  GROUP BY id',
@@ -867,6 +878,7 @@ export async function getPublicAggregateStats(): Promise<PublicAggregateStats> {
       '  SELECT',
       '    cohort_id,',
       '    COUNT(*) AS run_count,',
+      '    COUNTIF(IFNULL(execute_turns, 0) > 0) AS execute_run_count,',
       "    COUNTIF(end_reason = 'cleared') AS cleared_count,",
       "    AVG(IF(end_reason = 'cleared', execute_turns, NULL)) AS avg_execute_turns_on_clear",
       '  FROM merged_runs',
@@ -878,8 +890,59 @@ export async function getPublicAggregateStats(): Promise<PublicAggregateStats> {
       '    COUNT(*) AS total_prompts,',
       "    COUNTIF(session_mode = 'execute') AS execute_prompts,",
       "    COUNTIF(session_mode = 'execute' AND is_rework IS TRUE) AS rework_prompts,",
-      "    COUNTIF(session_mode = 'execute' AND removed_needed IS TRUE) AS removed_needed_prompts",
+      "    COUNTIF(session_mode = 'execute' AND removed_needed IS TRUE) AS removed_needed_prompts,",
+      "    COUNT(DISTINCT IF(session_mode = 'execute', run_id, NULL)) AS execute_run_count",
       '  FROM prompts_by_id',
+      '),',
+      // 手直しの指示と、それぞれが直した部品。部品のIDはカンマ区切りで入っている
+      'execute_prompts AS (',
+      '  SELECT',
+      '    id,',
+      '    run_id,',
+      '    turn_index,',
+      "    IFNULL(NULLIF(closest_archetype, ''), 'unknown') AS archetype,",
+      '    changed_component_ids',
+      '  FROM prompts_by_id',
+      "  WHERE session_mode = 'execute' AND run_id IS NOT NULL",
+      '),',
+      'prompt_components AS (',
+      '  SELECT DISTINCT e.id, e.run_id, e.turn_index, TRIM(c) AS component_id',
+      '  FROM execute_prompts e,',
+      "  UNNEST(SPLIT(IFNULL(e.changed_component_ids, ''), ',')) AS c",
+      "  WHERE TRIM(c) != '' AND e.turn_index IS NOT NULL AND e.turn_index >= 0",
+      '),',
+      // 直した部品を、同じ挑戦の中であとからもう一度直した指示
+      'redone_prompts AS (',
+      '  SELECT DISTINCT a.id',
+      '  FROM prompt_components a',
+      '  JOIN prompt_components b',
+      '  ON a.run_id = b.run_id AND a.component_id = b.component_id AND b.turn_index > a.turn_index',
+      '),',
+      'archetype_outcomes AS (',
+      '  SELECT',
+      '    e.archetype,',
+      '    COUNT(*) AS execute_count,',
+      '    COUNT(DISTINCT e.run_id) AS run_count,',
+      '    COUNTIF(r.id IS NOT NULL) AS redone_count',
+      '  FROM execute_prompts e',
+      '  LEFT JOIN redone_prompts r ON e.id = r.id',
+      '  GROUP BY e.archetype',
+      '),',
+      // 部品ごとに、直した挑戦の数と、同じ挑戦の中で2回以上直した挑戦の数
+      'component_runs AS (',
+      '  SELECT component_id, run_id, COUNT(DISTINCT id) AS touches',
+      '  FROM prompt_components',
+      '  GROUP BY component_id, run_id',
+      '),',
+      'component_stats AS (',
+      '  SELECT',
+      '    component_id,',
+      '    COUNT(*) AS run_count,',
+      '    COUNTIF(touches >= 2) AS struggle_runs',
+      '  FROM component_runs',
+      '  GROUP BY component_id',
+      '  ORDER BY run_count DESC, component_id ASC',
+      '  LIMIT 40',
       '),',
       'archetype_stats AS (',
       '  SELECT',
@@ -906,7 +969,9 @@ export async function getPublicAggregateStats(): Promise<PublicAggregateStats> {
       '  ARRAY(SELECT AS STRUCT * FROM cohort_stats) AS cohortStats,',
       '  (SELECT AS STRUCT * FROM prompt_totals) AS promptTotals,',
       '  ARRAY(SELECT AS STRUCT * FROM archetype_stats) AS archetypeStats,',
-      '  ARRAY(SELECT AS STRUCT * FROM entity_stats) AS entityStats',
+      '  ARRAY(SELECT AS STRUCT * FROM entity_stats) AS entityStats,',
+      '  ARRAY(SELECT AS STRUCT * FROM archetype_outcomes) AS archetypeOutcomes,',
+      '  ARRAY(SELECT AS STRUCT * FROM component_stats) AS componentStats',
       ')) AS payload',
     ].join('\n');
 
@@ -938,7 +1003,10 @@ export async function getPublicAggregateStats(): Promise<PublicAggregateStats> {
     }
 
     const rawPayload = JSON.parse(jsonRaw) as RawBigQueryAggregatePayload;
-    const formatted = formatPublicAggregateStats(rawPayload, TARGET_COHORTS, { available: true });
+    const formatted = formatPublicAggregateStats(rawPayload, TARGET_COHORTS, {
+      available: true,
+      componentLabels: publicComponentLabels(),
+    });
     cachedAggregateStats = {
       expiresAt: Date.now() + AGGREGATE_CACHE_TTL_MS,
       value: formatted,

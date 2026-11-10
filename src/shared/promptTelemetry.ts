@@ -842,12 +842,46 @@ export const ARCHETYPE_PUBLIC_LABELS: ReadonlyArray<{
 export interface PublicAggregateCohortStat {
   cohortId: TargetCohortId;
   label: string;
-  /** この客層の挑戦が minRunsForDisplay 未満なら true（内訳の数字は伏せる） */
+  /** この客層で手直しをした挑戦が minRunsForDisplay 未満なら true（内訳の数字は伏せる） */
   suppressed: boolean;
+  /** 伏せているとき、表示できるまでにあと何件の挑戦が要るか */
+  runsNeeded?: number;
   runCount?: number;
+  /** この客層で手直しを1回以上した挑戦の数 */
+  executeRunCount?: number;
   clearedCount?: number;
   clearRatePercent?: number;
   avgExecuteTurnsOnClear?: number | null;
+}
+
+/**
+ * 指示の型ごとの、手直しの指示のその後。
+ * やり直しは、その指示で直した部品を、同じ挑戦の中であとからもう一度直したこと
+ */
+export interface PublicAggregateArchetypeOutcome {
+  archetype: PromptArchetype;
+  label: string;
+  /** この型の指示を出した挑戦が minRunsForDisplay 未満なら true（数字は伏せる） */
+  suppressed: boolean;
+  runsNeeded?: number;
+  runCount?: number;
+  executeCount?: number;
+  redoneCount?: number;
+  redoneRatePercent?: number;
+}
+
+/**
+ * 部品ごとの手こずり具合。題材の画面にある部品だけを、役割の名前で出す。
+ * やり直しは、その部品を同じ挑戦の中で2回以上直したこと
+ */
+export interface PublicAggregateComponentStat {
+  label: string;
+  /** この部品を直した挑戦が minRunsForDisplay 未満なら true（数字は伏せる） */
+  suppressed: boolean;
+  runsNeeded?: number;
+  runCount?: number;
+  struggleRunCount?: number;
+  struggleRatePercent?: number;
 }
 
 export interface PublicAggregateStats {
@@ -859,6 +893,8 @@ export interface PublicAggregateStats {
   minRunsForDisplay: number;
   /** 全体の挑戦が minRunsForDisplay 未満なら true（全体の内訳も伏せる） */
   suppressed: boolean;
+  /** 全体を伏せているとき、表示できるまでにあと何件の挑戦が要るか */
+  runsNeeded?: number;
   totalRuns?: number;
   clearedRuns?: number;
   resetRuns?: number;
@@ -866,6 +902,8 @@ export interface PublicAggregateStats {
   clearRatePercent?: number;
   avgExecuteTurnsOnClear?: number | null;
   totalPrompts?: number;
+  executePrompts?: number;
+  executeRunCount?: number;
   reworkRatePercent?: number;
   removedNeededFeatureRatePercent?: number;
   archetypeBreakdown?: Array<{
@@ -875,6 +913,10 @@ export interface PublicAggregateStats {
     percent: number;
   }>;
   topEntities?: Array<{ term: string; count: number }>;
+  /** 手直しの指示のうち、あとで同じ部品を直し直した割合 */
+  redoneRatePercent?: number;
+  archetypeOutcomes?: PublicAggregateArchetypeOutcome[];
+  componentStats?: PublicAggregateComponentStat[];
   cohorts: PublicAggregateCohortStat[];
 }
 
@@ -889,6 +931,7 @@ export interface RawBigQueryAggregatePayload {
   cohortStats?: Array<{
     cohort_id?: string | null;
     run_count?: number | string | null;
+    execute_run_count?: number | string | null;
     cleared_count?: number | string | null;
     avg_execute_turns_on_clear?: number | string | null;
   }> | null;
@@ -897,6 +940,8 @@ export interface RawBigQueryAggregatePayload {
     execute_prompts?: number | string | null;
     rework_prompts?: number | string | null;
     removed_needed_prompts?: number | string | null;
+    /** 手直しの指示を出した挑戦の数 */
+    execute_run_count?: number | string | null;
   } | null;
   archetypeStats?: Array<{
     archetype?: string | null;
@@ -905,6 +950,19 @@ export interface RawBigQueryAggregatePayload {
   entityStats?: Array<{
     term?: string | null;
     cnt?: number | string | null;
+  }> | null;
+  /** 手直しの指示の型ごとの、その後のやり直し */
+  archetypeOutcomes?: Array<{
+    archetype?: string | null;
+    execute_count?: number | string | null;
+    run_count?: number | string | null;
+    redone_count?: number | string | null;
+  }> | null;
+  /** 部品のIDごとの、直した挑戦の数と、2回以上直した挑戦の数 */
+  componentStats?: Array<{
+    component_id?: string | null;
+    run_count?: number | string | null;
+    struggle_runs?: number | string | null;
   }> | null;
 }
 
@@ -919,9 +977,15 @@ function toSafeAvg(v: unknown): number | null {
   return Number.isFinite(n) && n >= 0 ? Number(n.toFixed(1)) : null;
 }
 
+/** 伏せた区分が表示できるまでにあと何件の挑戦が要るか */
+function runsNeededFor(runCount: number, minRunsForDisplay: number): number {
+  return Math.max(1, minRunsForDisplay - runCount);
+}
+
 /**
  * BigQuery の集計結果から、公開用の集計データを組み立てる。
- * 挑戦数が minRunsForDisplay（既定3件）に満たない全体または客層区分は suppressed: true にし、数値を出さない
+ * 挑戦数が minRunsForDisplay（既定3件）に満たない全体・客層・指示の型・部品の区分は suppressed: true にし、数値を出さない。
+ * 部品は componentLabels にある題材の部品だけを、役割の名前で出す。学習者が作った部品のIDは出さない
  */
 export function formatPublicAggregateStats(
   raw: RawBigQueryAggregatePayload | null | undefined,
@@ -930,6 +994,8 @@ export function formatPublicAggregateStats(
     available?: boolean;
     minRunsForDisplay?: number;
     generatedAt?: string;
+    /** 部品のID → 画面での役割の名前 */
+    componentLabels?: ReadonlyMap<string, string>;
   } = {},
 ): PublicAggregateStats {
   const available = options.available ?? Boolean(raw);
@@ -957,6 +1023,7 @@ export function formatPublicAggregateStats(
       generatedAt,
       minRunsForDisplay,
       suppressed: true,
+      runsNeeded: runsNeededFor(totalRuns, minRunsForDisplay),
       cohorts: cohorts.map((c) => ({
         cohortId: c.id,
         label: c.label,
@@ -978,15 +1045,16 @@ export function formatPublicAggregateStats(
   const executePrompts = toSafeInt(raw.promptTotals?.execute_prompts);
   const reworkPrompts = toSafeInt(raw.promptTotals?.rework_prompts);
   const removedNeededPrompts = toSafeInt(raw.promptTotals?.removed_needed_prompts);
+  const executeRunCount = toSafeInt(raw.promptTotals?.execute_run_count);
+  // 手直しの指示の割合は、指示の数と、指示を出した挑戦の数の両方がそろったときだけ出す
+  const executeShown = executePrompts >= minRunsForDisplay && executeRunCount >= minRunsForDisplay;
 
-  const reworkRatePercent =
-    executePrompts >= minRunsForDisplay
-      ? Math.round((reworkPrompts / executePrompts) * 100)
-      : undefined;
-  const removedNeededFeatureRatePercent =
-    executePrompts >= minRunsForDisplay
-      ? Math.round((removedNeededPrompts / executePrompts) * 100)
-      : undefined;
+  const reworkRatePercent = executeShown
+    ? Math.round((reworkPrompts / executePrompts) * 100)
+    : undefined;
+  const removedNeededFeatureRatePercent = executeShown
+    ? Math.round((removedNeededPrompts / executePrompts) * 100)
+    : undefined;
 
   const archetypeCountMap = new Map<PromptArchetype, number>();
   for (const row of raw.archetypeStats ?? []) {
@@ -1007,6 +1075,79 @@ export function formatPublicAggregateStats(
           };
         })
       : undefined;
+
+  // 指示の型ごとの、その後のやり直し。全体の割合は、型が分からない指示も含めて数える
+  const outcomeRows = new Map<string, { executeCount: number; runCount: number; redoneCount: number }>();
+  let outcomeExecuteTotal = 0;
+  let outcomeRedoneTotal = 0;
+  for (const row of raw.archetypeOutcomes ?? []) {
+    const executeCount = toSafeInt(row?.execute_count);
+    const redoneCount = Math.min(executeCount, toSafeInt(row?.redone_count));
+    outcomeExecuteTotal += executeCount;
+    outcomeRedoneTotal += redoneCount;
+    if (row?.archetype) {
+      outcomeRows.set(row.archetype, {
+        executeCount,
+        runCount: toSafeInt(row?.run_count),
+        redoneCount,
+      });
+    }
+  }
+  const archetypeOutcomes: PublicAggregateArchetypeOutcome[] | undefined = raw.archetypeOutcomes
+    ? ARCHETYPE_PUBLIC_LABELS.map(({ archetype, label }) => {
+        const row = outcomeRows.get(archetype);
+        const runCount = row?.runCount ?? 0;
+        if (!row || runCount < minRunsForDisplay || row.executeCount < minRunsForDisplay) {
+          return {
+            archetype,
+            label,
+            suppressed: true,
+            runsNeeded: runsNeededFor(runCount, minRunsForDisplay),
+          };
+        }
+        return {
+          archetype,
+          label,
+          suppressed: false,
+          runCount,
+          executeCount: row.executeCount,
+          redoneCount: row.redoneCount,
+          redoneRatePercent: Math.round((row.redoneCount / row.executeCount) * 100),
+        };
+      })
+    : undefined;
+  const redoneRatePercent =
+    executeShown && outcomeExecuteTotal >= minRunsForDisplay
+      ? Math.round((outcomeRedoneTotal / outcomeExecuteTotal) * 100)
+      : undefined;
+
+  // 部品ごとの手こずり具合。題材の部品だけを役割の名前でまとめ、それ以外のIDは捨てる
+  const componentLabels = options.componentLabels ?? new Map<string, string>();
+  const componentRows = new Map<string, { runCount: number; struggleRunCount: number }>();
+  for (const row of raw.componentStats ?? []) {
+    const label = row?.component_id ? componentLabels.get(row.component_id) : undefined;
+    if (!label) continue;
+    const runCount = toSafeInt(row?.run_count);
+    const struggleRunCount = Math.min(runCount, toSafeInt(row?.struggle_runs));
+    const prev = componentRows.get(label);
+    componentRows.set(label, {
+      runCount: (prev?.runCount ?? 0) + runCount,
+      struggleRunCount: (prev?.struggleRunCount ?? 0) + struggleRunCount,
+    });
+  }
+  const componentStats: PublicAggregateComponentStat[] | undefined = raw.componentStats
+    ? [...componentRows.entries()].map(([label, row]) =>
+        row.runCount < minRunsForDisplay
+          ? { label, suppressed: true, runsNeeded: runsNeededFor(row.runCount, minRunsForDisplay) }
+          : {
+              label,
+              suppressed: false,
+              runCount: row.runCount,
+              struggleRunCount: row.struggleRunCount,
+              struggleRatePercent: Math.round((row.struggleRunCount / row.runCount) * 100),
+            },
+      )
+    : undefined;
 
   const topEntities: Array<{ term: string; count: number }> = [];
   for (const row of raw.entityStats ?? []) {
@@ -1030,21 +1171,25 @@ export function formatPublicAggregateStats(
   const cohortResults: PublicAggregateCohortStat[] = cohorts.map((c) => {
     const row = cohortMap.get(c.id);
     const runCount = toSafeInt(row?.run_count);
-    if (runCount < minRunsForDisplay) {
+    const hasExecuteRunCount = row?.execute_run_count !== undefined && row?.execute_run_count !== null;
+    const cohortExecuteRuns = hasExecuteRunCount ? toSafeInt(row?.execute_run_count) : runCount;
+    if (runCount < minRunsForDisplay || cohortExecuteRuns < minRunsForDisplay) {
       return {
         cohortId: c.id,
         label: c.label,
         suppressed: true,
+        runsNeeded: runsNeededFor(Math.min(runCount, cohortExecuteRuns), minRunsForDisplay),
       };
     }
-    const clearedCount = toSafeInt(row?.cleared_count);
+    const clearedCount = Math.min(cohortExecuteRuns, toSafeInt(row?.cleared_count));
     return {
       cohortId: c.id,
       label: c.label,
       suppressed: false,
       runCount,
+      executeRunCount: cohortExecuteRuns,
       clearedCount,
-      clearRatePercent: Math.round((clearedCount / runCount) * 100),
+      clearRatePercent: Math.round((clearedCount / cohortExecuteRuns) * 100),
       avgExecuteTurnsOnClear:
         clearedCount >= minRunsForDisplay ? toSafeAvg(row?.avg_execute_turns_on_clear) : null,
     };
@@ -1062,10 +1207,15 @@ export function formatPublicAggregateStats(
     clearRatePercent,
     avgExecuteTurnsOnClear,
     totalPrompts: totalPrompts >= minRunsForDisplay ? totalPrompts : undefined,
+    executePrompts: executeShown ? executePrompts : undefined,
+    executeRunCount: executeShown ? executeRunCount : undefined,
     reworkRatePercent,
     removedNeededFeatureRatePercent,
     archetypeBreakdown,
     topEntities,
+    redoneRatePercent,
+    archetypeOutcomes,
+    componentStats,
     cohorts: cohortResults,
   };
 }

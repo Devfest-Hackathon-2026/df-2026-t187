@@ -46,6 +46,11 @@ import {
 } from '../shared/promptTelemetry.ts';
 import { describeWorkSteps } from '../shared/workSteps.ts';
 import {
+  buildAggregateTipsPrompt,
+  type AggregateTipDraftRequest,
+  type AggregateTipDrafts,
+} from '../shared/aggregateTips.ts';
+import {
   COMPONENT_SIZES,
   CUSTOM_COMPONENT_PURPOSES,
   isCustomComponent,
@@ -212,6 +217,8 @@ const TIMEOUTS = {
   side: { timeoutMs: 8_000, retries: 0 },
   /** 独自の部品の読み取り（間に合わなければ、その回は部品のHTMLに書かれた動きだけで判定し、結果は保存しない） */
   convert: { timeoutMs: 10_000, retries: 0 },
+  /** みんなの集計のコツ（間に合わなければテンプレートの文を使う。1時間に1回しか呼ばない） */
+  tips: { timeoutMs: 12_000, retries: 0 },
 } as const;
 
 export class AiTimeoutError extends Error {
@@ -2282,4 +2289,68 @@ export async function chatWithStudio(req: ChatRequest): Promise<ChatResponse> {
     pointedComponentIds: [...pointedIds].slice(0, 1),
     telemetryEvent,
   };
+}
+
+const TIP_TEXT_SCHEMA: Schema = {
+  type: Type.OBJECT,
+  properties: {
+    heading: { type: Type.STRING, description: '見出し。15文字以内の短い一言、句点なし、括弧なし' },
+    body: { type: Type.STRING, description: '本文。2文以内、80文字程度、括弧なし、根拠のタグ以外の数字なし' },
+  },
+  required: ['heading', 'body'],
+};
+
+/**
+ * みんなの集計のコツの見出しと本文の案を Gemini に作らせる。
+ * 根拠はコードで決めたタグと説明だけを渡す。決まりに合っているかは呼び出し側の composeAggregateTips が確かめる。
+ * 接続設定がないときや失敗したときは null を返し、テンプレートの文にしてもらう
+ */
+export async function draftAggregateTipsWithGemini(
+  request: AggregateTipDraftRequest,
+): Promise<AggregateTipDrafts | null> {
+  const aiInfo = createGenAIClient();
+  if (!aiInfo || request.boxes.length === 0) return null;
+  const ids = request.boxes.map((b) => b.id);
+  const schema: Schema = {
+    type: Type.OBJECT,
+    properties: Object.fromEntries(ids.map((id) => [id, TIP_TEXT_SCHEMA])),
+    required: ids,
+  };
+  try {
+    const response = await generateContentWithTimeout(
+      aiInfo,
+      {
+        model: aiInfo.model,
+        contents: buildAggregateTipsPrompt(request),
+        config: {
+          responseMimeType: 'application/json',
+          responseSchema: schema,
+          temperature: 0.5,
+          ...thinkingConfig(),
+        },
+      },
+      TIMEOUTS.tips,
+    );
+    const parsed = parseJsonResponse<Record<string, { heading?: unknown; body?: unknown }>>(
+      response.text,
+      'aggregate_tips',
+    );
+    const drafts: AggregateTipDrafts = {};
+    for (const id of ids) {
+      const item = parsed?.[id];
+      if (!item) continue;
+      // 簡体字が混ざった文は取り除く。取り除いて空になれば、決まりの確認で作り直しになる
+      drafts[id] = {
+        heading: typeof item.heading === 'string' ? cleanJapaneseText(item.heading.trim(), '') : '',
+        body: typeof item.body === 'string' ? cleanJapaneseText(item.body.trim(), '') : '',
+      };
+    }
+    return drafts;
+  } catch (err) {
+    console.warn(
+      '[gemini:aggregate_tips] 集計のコツの生成に失敗したためテンプレートの文を使います:',
+      describeErrorForLog(err),
+    );
+    return null;
+  }
 }
