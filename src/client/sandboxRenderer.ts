@@ -3,6 +3,7 @@ import {
   createInitialState,
   hasCompletionAction,
   isComponentVisible,
+  matchesCondition,
   isInputFilled,
   coerceStateValue,
   isSafeStateKey,
@@ -62,6 +63,17 @@ function syncStylesIntoIframe(iframeDoc: Document): void {
     clone.setAttribute('data-synced-style', '1');
     iframeDoc.head.appendChild(clone);
   }
+}
+
+/**
+ * 文字の読み込みが終わると、本文の高さが変わる。読み込み後の文字で測り直す。
+ * 本文の枠の大きさの変化は scheduleFit で見張っている
+ */
+function refitWhenFontsLoad(iframeDoc: Document): void {
+  const fonts = iframeDoc.fonts;
+  if (!fonts) return;
+  fonts.addEventListener('loadingdone', () => refitVisibleSandbox(iframeDoc));
+  void fonts.ready.then(() => refitVisibleSandbox(iframeDoc));
 }
 
 /**
@@ -503,10 +515,36 @@ function fitContentToScreen(doc: Document, scroller: HTMLElement): void {
 
 /**
  * 描画した直後はレイアウトが確定しておらず正しく測れないことがあるため、
- * 次のフレームと、スマホの大きさが変わったときにも測り直す。
+ * 次のフレームと、スマホの大きさや本文の枠の大きさが変わったときにも測り直す。
  */
 let fitTarget: { doc: Document; scroller: HTMLElement } | null = null;
 let fitObserver: ResizeObserver | null = null;
+/**
+ * 本文の枠を見張る。スタイルが iframe に当たる前は、枠が中身の高さまで伸びていて「収まっている」と測ってしまう。
+ * Firefox ではそのまま文字が大きく残り、広告が出て描き直したときに急に小さくなっていた。
+ * スタイルが当たって枠が縮んだところで測り直す。iframe の中の要素なので、iframe 側の ResizeObserver を使う
+ */
+let scrollerObserver: { doc: Document; observer: ResizeObserver } | null = null;
+
+function observeScroller(doc: Document, scroller: HTMLElement): void {
+  const IframeResizeObserver = doc.defaultView?.ResizeObserver;
+  if (!IframeResizeObserver) return;
+  if (scrollerObserver?.doc !== doc) {
+    scrollerObserver?.observer.disconnect();
+    scrollerObserver = {
+      doc,
+      observer: new IframeResizeObserver(() => refitVisibleSandbox(doc)),
+    };
+  } else {
+    scrollerObserver.observer.disconnect();
+  }
+  scrollerObserver.observer.observe(scroller);
+}
+
+/** 見えているスマホ画面を測り直す。判定用に裏で描画した画面は対象にしない */
+function refitVisibleSandbox(doc: Document): void {
+  if (fitTarget?.doc === doc) fitContentToScreen(fitTarget.doc, fitTarget.scroller);
+}
 
 function scheduleFit(
   iframe: HTMLIFrameElement | null,
@@ -529,6 +567,7 @@ function scheduleFit(
     });
     fitObserver.observe(iframe);
   }
+  if (iframe) observeScroller(doc, scroller);
 }
 
 /** 判定用に裏で描画している最中か。見えている画面のタイマーや監視を、裏の描画で書き換えないために使う */
@@ -592,7 +631,10 @@ function renderSandboxAppInner(
       iframeDoc.write(buildStandaloneSandboxHtml(spec));
       iframeDoc.close();
       syncStylesIntoIframe(iframeDoc);
-      if (!measureOnly) watchParentStyles(iframe);
+      if (!measureOnly) {
+        watchParentStyles(iframe);
+        refitWhenFontsLoad(iframeDoc);
+      }
     }
     const specScript = iframeDoc.getElementById('ponkotsu-spec-data');
     if (specScript) {
@@ -1029,6 +1071,7 @@ function renderSandboxAppInner(
       const list = targetDoc.createElement('div');
       list.className = 'comp-summary';
       for (const row of comp.rows ?? []) {
+        if (row.visibleWhen && !matchesCondition(row.visibleWhen, liveState)) continue;
         const line = targetDoc.createElement('div');
         line.className = 'comp-summary-row';
         const k = targetDoc.createElement('span');

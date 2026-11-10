@@ -21,6 +21,7 @@ import type {
   ComponentAction,
   ComponentBoundsInput,
   ComponentSize,
+  ReviewerEvaluation,
   ReviewerPersona,
   ReviewOutcome,
   SandboxValidationResult,
@@ -210,6 +211,11 @@ export function validateSandboxSpec(
       }
       if (comp.visibleWhen?.stateKey && !knownKeys.has(comp.visibleWhen.stateKey)) {
         errors.push(`部品 ${comp.id} の表示条件キー ${comp.visibleWhen.stateKey} が定義されていません`);
+      }
+      for (const row of comp.rows ?? []) {
+        if (row.visibleWhen?.stateKey && !knownKeys.has(row.visibleWhen.stateKey)) {
+          errors.push(`部品 ${comp.id} の内訳の行の表示条件キー ${row.visibleWhen.stateKey} が定義されていません`);
+        }
       }
     }
   }
@@ -1175,4 +1181,51 @@ export function simulatePersonaComputerUse(
 
   actionTrace.push('画面を行き来するだけで完了にたどり着けず離脱');
   return fail('too_many_steps', []);
+}
+
+/**
+ * 手直し後にお客さんの満足人数が増えなかったとき、
+ * 「隠れていた次の困りごとが見えてきます」と案内を出すべきか判定する。
+ * 前回の反応確認があり、満足人数が減っておらず、前回も今回も未達成のお客さんの誰かで
+ * 気にしている部品（frictionComponentIds）が別の部品に変わったときだけ true を返す
+ */
+export function shouldShowNextFrictionNotice(params: {
+  changedSinceLastReview: boolean;
+  previousResults?: ReadonlyArray<Pick<ReviewerEvaluation, 'reviewerId' | 'outcome' | 'frictionComponentIds'>>;
+  currentResults: ReadonlyArray<Pick<ReviewerEvaluation, 'reviewerId' | 'outcome' | 'frictionComponentIds'>>;
+  activeReviewerIds: ReadonlyArray<string>;
+}): boolean {
+  const { changedSinceLastReview, previousResults, currentResults, activeReviewerIds } = params;
+  if (!changedSinceLastReview || !previousResults || activeReviewerIds.length === 0) {
+    return false;
+  }
+  const countAchieved = (
+    list: ReadonlyArray<Pick<ReviewerEvaluation, 'reviewerId' | 'outcome'>>,
+  ) =>
+    activeReviewerIds.filter(
+      (id) => list.find((r) => r.reviewerId === id)?.outcome === 'achieved',
+    ).length;
+
+  const previousAchieved = countAchieved(previousResults);
+  const currentAchieved = countAchieved(currentResults);
+  if (currentAchieved >= activeReviewerIds.length || currentAchieved !== previousAchieved) {
+    return false;
+  }
+
+  const normalizeIds = (ids: ReadonlyArray<string> | undefined): string[] =>
+    [...new Set((ids ?? []).filter(Boolean))].sort();
+
+  for (const reviewerId of activeReviewerIds) {
+    const prev = previousResults.find((r) => r.reviewerId === reviewerId);
+    const curr = currentResults.find((r) => r.reviewerId === reviewerId);
+    if (!prev || !curr) continue;
+    if (prev.outcome === 'achieved' || curr.outcome === 'achieved') continue;
+    const prevIds = normalizeIds(prev.frictionComponentIds);
+    const currIds = normalizeIds(curr.frictionComponentIds);
+    if (prevIds.length === 0 || currIds.length === 0) continue;
+    if (currIds.length !== prevIds.length || currIds.some((id, i) => id !== prevIds[i])) {
+      return true;
+    }
+  }
+  return false;
 }

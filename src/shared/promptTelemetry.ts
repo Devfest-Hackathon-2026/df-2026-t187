@@ -34,6 +34,11 @@ export interface NaturalLanguageSignal {
   entities: string[];
   /** 条件指定（どう変えるか・どういう状態にするか）が含まれているか */
   hasConditionConstraint: boolean;
+  /**
+   * 誰が、どうできるようにしたいかを言っているか。本文は残さないので、記録するときに文の形で判定しておく。
+   * この項目がない古い記録は、言っていないものとして扱う
+   */
+  hasGoalStatement?: boolean;
   /** 感情極性スコア (-1.0 〜 1.0) */
   sentimentScore: number;
   /** 解析経路 */
@@ -83,8 +88,10 @@ export interface PromptSessionSummary {
   exploreTurns: number;
   /** 実行型（手直し指示）の回数 */
   executeTurns: number;
-  /** 同じ部品への手戻り・やり直し回数 */
+  /** 同じ部品への手戻り・やり直し回数。必要な機能を消した指示は含めない */
   reworkTurns: number;
+  /** 店長やお客さんに必要な機能（定期便・クーポンなど）を消した手直し指示の回数 */
+  removedNeededTurns: number;
   /** 誰がどうできるようにしたいかという目的を言葉にした手直し指示の回数 */
   goalDirectedTurns: number;
   /** 初回成功率（0〜100: 手戻りや機能喪失にならず意図通り機能した実行指示の割合） */
@@ -199,6 +206,8 @@ export function extractDeterministicNlSignal(promptText: string): NaturalLanguag
     CONDITION_DESIGN_RE.test(text) ||
     (entities.length >= 2 && /(?:を|の).*?(?:に|へ|よう)/.test(text) && !SIMPLE_DELETE_RE.test(text));
 
+  const hasGoalStatement = GOAL_DIRECTED_RE.test(text);
+
   let sentiment = 0;
   for (const neg of NEGATIVE_SENTIMENT_TERMS) {
     if (text.includes(neg)) sentiment -= 0.35;
@@ -211,6 +220,7 @@ export function extractDeterministicNlSignal(promptText: string): NaturalLanguag
   return {
     entities,
     hasConditionConstraint,
+    hasGoalStatement,
     sentimentScore,
     analyzedVia: 'local_deterministic',
   };
@@ -352,9 +362,34 @@ export function limitEntitiesToVocabulary(entities: string[]): string[] {
   return kept;
 }
 
+/** 振り返りで引用する指示の長さ。文の中に収まり、折り返さない長さにする */
+const QUOTE_MAX_LENGTH = 22;
+/** 引用をここより短くは切らない。短すぎると何の指示か分からなくなる */
+const QUOTE_MIN_LENGTH = 8;
+
+/**
+ * 振り返りで引用する指示を短くする。長いときは、句読点か助詞の切れ目で切り、言葉の途中では切らない
+ */
 function cleanPromptForBadge(text: string): string {
   const cleaned = text.replace(/`/g, '').replace(/\s+/g, ' ').trim();
-  return cleaned.length > 60 ? `${cleaned.slice(0, 59)}…` : cleaned;
+  if (cleaned.length <= QUOTE_MAX_LENGTH) return cleaned;
+  const head = cleaned.slice(0, QUOTE_MAX_LENGTH);
+  let cut = -1;
+  for (let i = head.length - 1; i >= QUOTE_MIN_LENGTH; i--) {
+    const ch = head[i];
+    if ('、。，．,.！？!? '.includes(ch)) {
+      // 句読点の手前で切る
+      cut = i;
+      break;
+    }
+    if ('をにはがでとのもへや'.includes(ch)) {
+      // 助詞は残して、その後ろで切る
+      cut = i + 1;
+      break;
+    }
+  }
+  const kept = cut > 0 ? head.slice(0, cut) : head.slice(0, QUOTE_MAX_LENGTH - 1);
+  return `${kept}…`;
 }
 
 const GENERIC_MODIFIER_ENTITIES = new Set([
@@ -421,6 +456,14 @@ function sharesTurningPointTarget(
 }
 
 /**
+ * 目的を伝えた指示か。文の分類で一番近い型が目的型か、文に誰がどうできるようにしたいかが入っていれば数える。
+ * 分類だけだと、目的を書いていても別の型に近いと判定されて数えそこなうため、文の形でも確かめる
+ */
+function isGoalStatementEvent(e: PromptTelemetryEvent): boolean {
+  return e.embeddingSignal.closestArchetype === 'goal_directed' || e.nlSignal.hasGoalStatement === true;
+}
+
+/**
  * 記録されたテレメトリイベント列から、行動ベースの指標とシステムメッセージ行を生成する。
  * 括弧を使わず、固有名詞・数値・実プロンプト引用をすべてバッククォートで囲んで出力する。
  */
@@ -438,25 +481,27 @@ export function summarizePromptTelemetry(
 
   const exploreTurns = exploreEvents.length;
   const executeTurns = executeEvents.length;
-  // 同じ部品を後からやり直した回数（isReworkOnSameComponent）を手戻り回数として数える。
-  // やり直しが起きなかったが最後の状態で機能喪失（removedNeededFeature）のまま終わった指示があれば加算する。
+  // 同じ所を直し直した回数は、同じ部品を後からやり直した指示（isReworkOnSameComponent）だけを数える
+  const reworkTurns = executeEvents.filter((e) => e.isReworkOnSameComponent).length;
+  // 必要な機能を消した回数は、直し直しとは別に数える
+  const removedNeededTurns = executeEvents.filter((e) => e.removedNeededFeature).length;
+  // 1回で思いどおりに直った割合では、必要な機能を消したまま直し直さなかった指示も、思いどおりでなかったとして数える
   const reworkedComponentIds = new Set(
     executeEvents
       .filter((e) => e.isReworkOnSameComponent)
       .flatMap((e) => e.changedComponentIds),
   );
-  const reworkTurns = executeEvents.filter(
+  const missedTurns = executeEvents.filter(
     (e) =>
       e.isReworkOnSameComponent ||
       (e.removedNeededFeature &&
         !e.changedComponentIds.some((id) => reworkedComponentIds.has(id))),
   ).length;
 
-  const goalDirectedTurns = executeEvents.filter(
-    (e) => e.embeddingSignal.closestArchetype === 'goal_directed',
-  ).length;
+  const goalDirectedEvents = executeEvents.filter(isGoalStatementEvent);
+  const goalDirectedTurns = goalDirectedEvents.length;
 
-  const successfulExecutes = Math.max(0, executeTurns - reworkTurns);
+  const successfulExecutes = Math.max(0, executeTurns - missedTurns);
   const firstShotSuccessRate =
     executeTurns > 0 ? Math.round((successfulExecutes / executeTurns) * 100) : 100;
 
@@ -478,12 +523,12 @@ export function summarizePromptTelemetry(
         next.embeddingSignal.closestArchetype !== 'simple_delete' &&
         sharesTurningPointTarget(prev, next) &&
         (next.embeddingSignal.closestArchetype === 'condition_design' ||
-          next.embeddingSignal.closestArchetype === 'goal_directed' ||
+          isGoalStatementEvent(next) ||
           next.nlSignal.hasConditionConstraint ||
           next.isReworkOnSameComponent)
       ) {
         turningPoint = { beforeTurn: prev.turnIndex, afterTurn: next.turnIndex };
-        turningPointByGoal = next.embeddingSignal.closestArchetype === 'goal_directed';
+        turningPointByGoal = isGoalStatementEvent(next);
       }
     }
   }
@@ -495,7 +540,7 @@ export function summarizePromptTelemetry(
       .find(
         (e) =>
           !e.removedNeededFeature &&
-          (e.embeddingSignal.closestArchetype === 'goal_directed' ||
+          (isGoalStatementEvent(e) ||
             e.embeddingSignal.closestArchetype === 'condition_design' ||
             e.nlSignal.hasConditionConstraint),
       ) ?? [...executeEvents].reverse().find((e) => !e.removedNeededFeature);
@@ -508,13 +553,19 @@ export function summarizePromptTelemetry(
     // 学び始めたばかりの人が読むので、専門用語を使わずに言う（質問＝探索型、直してと頼んだ＝実行型、
     // 同じ所を直し直した＝手戻り、1回で思いどおりに直った割合＝初回成功率）
     systemLogLines.push(
-      `今回の記録 質問した \`${exploreTurns}回\` 直してと頼んだ \`${executeTurns}回\`${goalDirectedTurns > 0 ? ` うち目的を伝えた \`${goalDirectedTurns}回\`` : ''} 同じ所を直し直した \`${reworkTurns}回\` 1回で思いどおりに直った割合 \`${firstShotSuccessRate}%\``,
+      `今回の記録 質問した \`${exploreTurns}回\` 直してと頼んだ \`${executeTurns}回\` うち目的を伝えた \`${goalDirectedTurns}回\` 同じ所を直し直した \`${reworkTurns}回\` 必要な機能を消した \`${removedNeededTurns}回\` 1回で思いどおりに直った割合 \`${firstShotSuccessRate}%\``,
+    );
+    // 目的を伝えたと数えた指示と、数える決まりを示す。理由を書いただけでは数えないことが分かるようにする
+    systemLogLines.push(
+      goalDirectedTurns > 0
+        ? `目的を伝えた指示 ${goalDirectedEvents.map((e) => `\`${turnRef(e.turnIndex)}\``).join(' ')} 誰が、どうできるようにしたいかを伝えた指示を数えています`
+        : '目的を伝えた指示はありませんでした 誰が、どうできるようにしたいかを伝えると数えます',
     );
     if (turningPoint) {
       systemLogLines.push(
         `指示の改善 \`${turnRef(turningPoint.beforeTurn)}\` から${turningPointByGoal ? '目的を伝えた' : '条件を具体化した'} \`${turnRef(turningPoint.afterTurn)}\` へ変えたことで客の満足と店長の納得が両立しました`,
       );
-    } else if (effectivePrompt && bestExecute?.embeddingSignal.closestArchetype === 'goal_directed') {
+    } else if (effectivePrompt && bestExecute && isGoalStatementEvent(bestExecute)) {
       systemLogLines.push(
         `決め手になった指示 \`${effectivePrompt}\` は誰がどうできるようにしたいかを伝えていたため、直し方を任せても狙い通りに整いました`,
       );
@@ -537,6 +588,7 @@ export function summarizePromptTelemetry(
     exploreTurns,
     executeTurns,
     reworkTurns,
+    removedNeededTurns,
     goalDirectedTurns,
     firstShotSuccessRate,
     turningPoint,
@@ -609,27 +661,27 @@ export function buildClearFeedbackFacts(input: ClearFeedbackInput): ClearFeedbac
     }
   }
 
+  // 事実の文には、最後の画面と記録で確かめられることだけを書く。
+  // 途中で一度消したか、質問が手直しの前だったかは記録から分からないので、消さずに、手直しの前に、とは言わない
   if (subMetric && !subMetric.missing && subMetric.count > 0) {
     goodPointFacts.push(
-      `${subMetric.label}をただ消すのではなく、望む人が安心して選べる形で残して店長の売上とお客さんの満足を両立できたこと`,
+      `最後の画面に${subMetric.label}が、望む人が安心して選べる形で残っていて、店長の売上とお客さんの満足を両立できたこと`,
     );
     goodClauses.push(
-      `${subMetric.label}を消さずに正直な形で残してお客さんの安心と店長の売上を両立できた点`,
+      `${subMetric.label}を正直な形で画面に残してお客さんの安心と店長の売上を両立できた点`,
     );
   }
   if (couponStatus === 'usable_discount') {
-    goodPointFacts.push(
-      'クーポン広告をただ消すのではなく、画面内でその場で割引が効く使いやすい形に整えて残せたこと',
-    );
-    goodClauses.push('クーポンもその場で割引が使える形に整えて残せた点');
+    goodPointFacts.push('最後の画面に、その場で割引が効く使いやすい形でクーポンが残っていること');
+    goodClauses.push('クーポンをその場で割引が使える形で画面に残せた点');
   }
   if (summary.exploreTurns > 0) {
     goodPointFacts.push(
-      `手直しする前にお客さんや店長へ \`${summary.exploreTurns}回\` 質問して、困りごとや事情を確かめてから判断できたこと`,
+      `お客さんや店長へ \`${summary.exploreTurns}回\` 質問して、困りごとや事情を確かめたこと`,
     );
-    goodClauses.push('事前に質問して事情を確かめてから手直しできた点');
+    goodClauses.push('質問して事情を確かめながら手直しできた点');
   }
-  if (summary.reworkTurns === 0 && summary.executeTurns > 0) {
+  if (summary.reworkTurns === 0 && summary.removedNeededTurns === 0 && summary.executeTurns > 0) {
     goodPointFacts.push('同じ部品の直し直しが0回で、1回で狙いどおりに画面を整えられたこと');
     goodClauses.push('同じ箇所を直し直すことなく1回で狙いどおりに進められた点');
   }
@@ -731,6 +783,13 @@ export function buildClearFeedbackFacts(input: ClearFeedbackInput): ClearFeedbac
     );
     improvementClauses.push(
       '次は部品の細かい直し方だけでなく、誰がどうできるようにしたいかという目的で伝えてみると、お助けAIがまとめて形にできますよ',
+    );
+  } else if (summary.removedNeededTurns > 0) {
+    improvementFacts.push(
+      `必要な機能を \`${summary.removedNeededTurns}回\` 消したため、消す前に店長やお客さんの希望を確かめて条件を伝えると1回で決まりやすくなること`,
+    );
+    improvementClauses.push(
+      '消す前に店長やお客さんの希望を確かめてから条件を伝えると、必要な機能を残したまま1回で決めやすくなりますよ',
     );
   } else if (summary.reworkTurns > 0) {
     improvementFacts.push(

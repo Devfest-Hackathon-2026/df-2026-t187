@@ -158,8 +158,11 @@ export interface AppComponent {
   priceLabel?: string;
   /** choice_cards の各選択肢の補足（options と同じ順番） */
   optionDetails?: string[];
-  /** summary の行。label と value に {状態キー} を差し込める */
-  rows?: Array<{ label: string; value: string }>;
+  /**
+   * summary の行。label と value に {状態キー} を差し込める。
+   * visibleWhen があれば、条件を満たすときだけ出す（手数料や割引が0円のときに行を隠すなど）
+   */
+  rows?: Array<{ label: string; value: string; visibleWhen?: VisibilityCondition }>;
   placeholder?: string;
   options?: string[];
   stateKey?: string;

@@ -106,6 +106,12 @@ const BASE_SPEC: AppSpec = {
       rows: [
         { label: '小計', value: '¥{subtotal}' },
         { label: '送料', value: '¥{shipping}' },
+        // 代引きを選んだときだけ、合計に入る手数料を内訳に出す
+        {
+          label: '代引き手数料',
+          value: '¥{codFee}',
+          visibleWhen: { stateKey: 'codFee', operator: 'gt', value: 0 },
+        },
       ],
       style: { size: 'md', variant: 'default', fullWidth: true },
       actions: [],

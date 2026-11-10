@@ -179,6 +179,7 @@ async function analyzePromptWithCloudNaturalLanguage(
     return {
       entities: mergedEntities.slice(0, 8),
       hasConditionConstraint: base.hasConditionConstraint,
+      hasGoalStatement: base.hasGoalStatement,
       sentimentScore,
       analyzedVia: 'cloud_natural_language_api',
     };
@@ -341,6 +342,7 @@ export function toFirestoreTelemetryFields(
     similarityScore: { doubleValue: event.embeddingSignal.similarityScore },
     embeddingVia: { stringValue: event.embeddingSignal.analyzedVia },
     hasConditionConstraint: { booleanValue: event.nlSignal.hasConditionConstraint },
+    hasGoalStatement: { booleanValue: event.nlSignal.hasGoalStatement === true },
     entities: { stringValue: event.nlSignal.entities.join(',') },
     sentimentScore: { doubleValue: event.nlSignal.sentimentScore },
     nlVia: { stringValue: event.nlSignal.analyzedVia },
@@ -415,6 +417,7 @@ export function parseFirestoreTelemetryDoc(
     nlSignal: {
       entities,
       hasConditionConstraint: Boolean(fields.hasConditionConstraint?.booleanValue),
+      hasGoalStatement: Boolean(fields.hasGoalStatement?.booleanValue),
       sentimentScore: readFirestoreNumber(fields.sentimentScore, 0),
       analyzedVia:
         fields.nlVia?.stringValue === 'cloud_natural_language_api'
@@ -972,6 +975,22 @@ const SPEAKER_VOICE_MAP: Record<
 const MAX_TTS_TEXT_LENGTH = 500;
 
 /**
+ * 読み上げで読み間違える言葉を、合成に渡す文だけかなに置き換える。画面の文と音声のキャッシュの鍵は元の文のまま。
+ * 「気に入らない」のように別の読みになる言い方を巻き込まないよう、前後の言葉ごと置き換える
+ */
+const TTS_READING_FIXES: ReadonlyArray<readonly [string, string]> = [
+  ['注文が全然入らなく', '注文が全然はいらなく'],
+];
+
+function toSpeechText(text: string): string {
+  let speech = text;
+  for (const [written, reading] of TTS_READING_FIXES) {
+    speech = speech.replaceAll(written, reading);
+  }
+  return speech;
+}
+
+/**
  * Google Cloud Text-to-Speech API を使って、店長・お助けAI・客A〜Cそれぞれの声色で音声合成する。
  */
 export async function synthesizeStudioSpeech(req: TtsRequest): Promise<TtsResponse> {
@@ -1016,7 +1035,7 @@ export async function synthesizeStudioSpeech(req: TtsRequest): Promise<TtsRespon
         'x-goog-user-project': project,
       },
       body: JSON.stringify({
-        input: { text },
+        input: { text: toSpeechText(text) },
         voice: {
           languageCode: 'ja-JP',
           name: profile.name,

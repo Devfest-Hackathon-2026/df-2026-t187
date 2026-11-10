@@ -21,6 +21,7 @@ import {
   applyActions,
   createInitialState,
   evaluateExpression,
+  matchesCondition,
   renderLabel,
   renderTemplate,
   toKanjiNumber,
@@ -58,6 +59,7 @@ import {
   sanitizeCustomCss,
   sanitizeCustomHtml,
   COUPON_FRICTIONS,
+  shouldShowNextFrictionNotice,
   simulatePersonaComputerUse,
   validateSandboxSpec,
 } from '../src/shared/sandboxValidator.ts';
@@ -368,10 +370,15 @@ describe('core-loop', () => {
     const kanjiTotal = findComponent(kanjiSpec, 'total-price');
     assert.equal(renderLabel(kanjiTotal, state), '二千五百八十円');
     const kanjiSummary = findComponent(kanjiSpec, 'summary');
-    assert.deepEqual(
-      kanjiSummary.rows?.map((r) => renderTemplate(r.value, state, kanjiSummary.style.numberFormat)),
-      ['千九百八十円', '六百円'],
-    );
+    const visibleRows = (s: typeof state) =>
+      (kanjiSummary.rows ?? [])
+        .filter((r) => !r.visibleWhen || matchesCondition(r.visibleWhen, s))
+        .map((r) => renderTemplate(r.value, s, kanjiSummary.style.numberFormat));
+    assert.deepEqual(visibleRows(state), ['千九百八十円', '六百円']);
+    // 代引きを選ぶと、合計に入る手数料の行が内訳に出る
+    const codState = withDerivedValues(spec, { ...state, paymentMethod: '代金引換' });
+    assert.equal(codState.total, 2910);
+    assert.deepEqual(visibleRows(codState), ['千九百八十円', '六百円', '三百三十円']);
     // 偽のカウントダウンは、画面の外では最初の値で表す
     const countdown = findComponent(withAnnoyance(cleanSpec(), 'countdown_pressure'), 'banner-countdown');
     assert.equal(renderLabel(countdown, state), '⏰ 残り 2:59 で売り切れ！！');
@@ -1881,29 +1888,64 @@ describe('core-loop', () => {
     assert.equal(summary.exploreTurns, 2);
     assert.equal(summary.executeTurns, 2);
     assert.equal(summary.reworkTurns, 1);
+    // 必要な機能を消した指示は、直し直しとは別に数える。1回で思いどおりに直った割合では、これまでどおり差し引く
+    assert.equal(summary.removedNeededTurns, 1);
     assert.equal(summary.firstShotSuccessRate, 50);
     assert.ok(summary.turningPoint);
     assert.deepEqual(summary.turningPoint, { beforeTurn: 2, afterTurn: 3 });
-    assert.equal(summary.systemLogLines.length, 2);
+    assert.equal(summary.systemLogLines.length, 3);
     assert.match(
       summary.systemLogLines[0],
-      /質問した `2回` 直してと頼んだ `2回` 同じ所を直し直した `1回` 1回で思いどおりに直った割合 `50%`/,
+      /質問した `2回` 直してと頼んだ `2回` うち目的を伝えた `0回` 同じ所を直し直した `1回` 必要な機能を消した `1回` 1回で思いどおりに直った割合 `50%`/,
     );
+    // 目的を伝えた指示がないときも、数える決まりを示す
+    assert.match(summary.systemLogLines[1], /目的を伝えた指示はありませんでした 誰が、どうできるようにしたいかを伝えると数えます/);
     // サーバーの振り返り文には本文がなく、何番目の発言かの目印だけが入る
-    assert.match(summary.systemLogLines[1], /`\{\{turn:2\}\}` から条件を具体化した `\{\{turn:3\}\}`/);
+    assert.match(summary.systemLogLines[2], /`\{\{turn:2\}\}` から条件を具体化した `\{\{turn:3\}\}`/);
     // ブラウザが手元の本文に置き換える
     const turnTexts = ['店長、定期便ってどうして付けてるの？', '客B、どこで困ったの？', '定期便を消して', '定期便の初期チェックを外して解約条件を明記して'];
     assert.match(
-      fillTurnRefs(summary.systemLogLines[1], turnTexts),
-      /`定期便を消して` から条件を具体化した `定期便の初期チェックを外して解約条件を明記して`/,
+      fillTurnRefs(summary.systemLogLines[2], turnTexts),
+      /`定期便を消して` から条件を具体化した `定期便の初期チェックを外して解約条件を…`/,
     );
+    // 長い指示は、文の中で折り返さない長さに縮め、句読点か助詞の切れ目で切る
+    assert.equal(
+      fillTurnRefs('{{turn:0}}', ['このクーポン広告のポップアップは表示しないでください。最初に開いたときも出さないで']),
+      'このクーポン広告のポップアップは表示しないで…',
+    );
+    assert.equal(fillTurnRefs('{{turn:0}}', ['このボタンは押しても先に進まず迷わせるだけなので、画面から消してください']), 'このボタンは押しても先に…');
     // 本文が手元にないとき（画面を開き直したなど）は、その指示、と書く
-    assert.match(fillTurnRefs(summary.systemLogLines[1], []), /`その指示` から条件を具体化した `その指示`/);
+    assert.match(fillTurnRefs(summary.systemLogLines[2], []), /`その指示` から条件を具体化した `その指示`/);
     // Natural Language API が取り出した語でも、題材の語彙にないもの（人名など）は残さない
     assert.deepEqual(limitEntitiesToVocabulary(['山田太郎', '定期便のチェック', '090-1234-5678', '定期便']), ['定期便']);
     for (const line of summary.systemLogLines) {
       assert.doesNotMatch(line, /[()（）「」『』]/);
     }
+
+    // 必要な機能を消したまま直し直さなかったときは、直し直した回数には入れず、割合からは差し引く
+    const removedOnlySummary = summarizePromptTelemetry([
+      { ...secondExecEvent, turnIndex: 0, isReworkOnSameComponent: false, removedNeededFeature: true },
+    ]);
+    assert.equal(removedOnlySummary.reworkTurns, 0);
+    assert.equal(removedOnlySummary.removedNeededTurns, 1);
+    assert.equal(removedOnlySummary.firstShotSuccessRate, 0);
+    assert.match(removedOnlySummary.systemLogLines[0], /同じ所を直し直した `0回` 必要な機能を消した `1回`/);
+
+    // 理由を書いただけの指示は目的に数えず、誰がどうできるようにしたいかを書いた指示は数える
+    assert.equal(extractDeterministicNlSignal('押しても先に進まず迷わせるだけなので、画面から消してください').hasGoalStatement, false);
+    assert.equal(extractDeterministicNlSignal('自分で選んだ人だけ定期便になるようにしてください').hasGoalStatement, true);
+    const goalByShapeSummary = summarizePromptTelemetry([
+      {
+        ...secondExecEvent,
+        turnIndex: 4,
+        isReworkOnSameComponent: false,
+        removedNeededFeature: false,
+        embeddingSignal: { ...secondExecEvent.embeddingSignal, closestArchetype: 'condition_design' },
+        nlSignal: { ...secondExecEvent.nlSignal, hasGoalStatement: true },
+      },
+    ]);
+    assert.equal(goalByShapeSummary.goalDirectedTurns, 1);
+    assert.match(goalByShapeSummary.systemLogLines[1], /目的を伝えた指示 `\{\{turn:4\}\}` 誰が、どうできるようにしたいかを伝えた指示を数えています/);
 
     // 6. 手戻りなしで一発到達したケースの初回成功率100%確認
     const oneShotSummary = summarizePromptTelemetry([
@@ -1915,8 +1957,9 @@ describe('core-loop', () => {
     ]);
     assert.equal(oneShotSummary.firstShotSuccessRate, 100);
     assert.match(oneShotSummary.systemLogLines[0], /1回で思いどおりに直った割合 `100%`/);
-    // 目的を伝えた指示がないときは、その回数を今回の記録に出さない
-    assert.doesNotMatch(oneShotSummary.systemLogLines[0], /うち目的を伝えた/);
+    // 目的を伝えた指示がないときも、0回と出して、数える決まりを次の行で示す
+    assert.match(oneShotSummary.systemLogLines[0], /うち目的を伝えた `0回`/);
+    assert.match(oneShotSummary.systemLogLines[1], /目的を伝えた指示はありませんでした/);
 
     // 目的だけを伝えると、AIが部品を書き換えるときに label や style を省くことがある。元の部品から補い、描画が落ちない
     const couponComp = findComponent(initial, 'popup-coupon');
@@ -1950,6 +1993,10 @@ describe('core-loop', () => {
     assert.match(goalSummary.systemLogLines[0], /うち目的を伝えた `1回`/);
     assert.match(
       fillTurnRefs(goalSummary.systemLogLines[1], ['定期便を消して', goalPrompt]),
+      /目的を伝えた指示 `定期便を望む人だけが自分で選べるようにして`/,
+    );
+    assert.match(
+      fillTurnRefs(goalSummary.systemLogLines[2], ['定期便を消して', goalPrompt]),
       /`定期便を消して` から目的を伝えた `定期便を望む人だけが自分で選べるようにして`/,
     );
     for (const line of goalSummary.systemLogLines) {
@@ -2763,5 +2810,100 @@ describe('任意の選択欄と押しやすいチェック欄', () => {
       { type: 'set_state', targetKey: 'prototype', value: 'x' },
     ];
     assert.equal(isValidAppSpec(pollutedActionTargetSpec), false);
+  });
+
+  it('満足が増えなかったときの一言は、未達成のお客さんが気にする部品が前と変わったときだけ出す', () => {
+    const activeReviewerIds = ['r1', 'r2', 'r3'];
+    const basePrev = [
+      { reviewerId: 'r1', outcome: 'achieved' as const, frictionComponentIds: [] },
+      { reviewerId: 'r2', outcome: 'abandoned' as const, frictionComponentIds: ['popup-coupon'] },
+      { reviewerId: 'r3', outcome: 'bothered' as const, frictionComponentIds: ['popup-coupon'] },
+    ];
+
+    // 1回目の反応確認（前回がない）では出さない
+    assert.equal(
+      shouldShowNextFrictionNotice({
+        changedSinceLastReview: true,
+        previousResults: undefined,
+        currentResults: basePrev,
+        activeReviewerIds,
+      }),
+      false,
+    );
+
+    // 広告を直して、隠れていた定期便の罠に変わったときは出す
+    assert.equal(
+      shouldShowNextFrictionNotice({
+        changedSinceLastReview: true,
+        previousResults: basePrev,
+        currentResults: [
+          { reviewerId: 'r1', outcome: 'achieved', frictionComponentIds: [] },
+          { reviewerId: 'r2', outcome: 'regretted', frictionComponentIds: ['check-subscription'] },
+          { reviewerId: 'r3', outcome: 'bothered', frictionComponentIds: ['check-subscription'] },
+        ],
+        activeReviewerIds,
+      }),
+      true,
+    );
+
+    // 同じ部品でまだつまずいているときは出さない
+    assert.equal(
+      shouldShowNextFrictionNotice({
+        changedSinceLastReview: true,
+        previousResults: basePrev,
+        currentResults: [
+          { reviewerId: 'r1', outcome: 'achieved', frictionComponentIds: [] },
+          { reviewerId: 'r2', outcome: 'abandoned', frictionComponentIds: ['popup-coupon'] },
+          { reviewerId: 'r3', outcome: 'bothered', frictionComponentIds: ['popup-coupon'] },
+        ],
+        activeReviewerIds,
+      }),
+      false,
+    );
+
+    // 必要な部品を消して指摘部品が空になったときは出さない
+    assert.equal(
+      shouldShowNextFrictionNotice({
+        changedSinceLastReview: true,
+        previousResults: basePrev,
+        currentResults: [
+          { reviewerId: 'r1', outcome: 'achieved', frictionComponentIds: [] },
+          { reviewerId: 'r2', outcome: 'bothered', frictionComponentIds: [] },
+          { reviewerId: 'r3', outcome: 'bothered', frictionComponentIds: [] },
+        ],
+        activeReviewerIds,
+      }),
+      false,
+    );
+
+    // 満足が減った改悪のときは出さない
+    assert.equal(
+      shouldShowNextFrictionNotice({
+        changedSinceLastReview: true,
+        previousResults: basePrev,
+        currentResults: [
+          { reviewerId: 'r1', outcome: 'bothered', frictionComponentIds: ['btn-order'] },
+          { reviewerId: 'r2', outcome: 'regretted', frictionComponentIds: ['check-subscription'] },
+          { reviewerId: 'r3', outcome: 'bothered', frictionComponentIds: ['check-subscription'] },
+        ],
+        activeReviewerIds,
+      }),
+      false,
+    );
+
+    // 前の反応確認から手直ししていないときは出さない
+    assert.equal(
+      shouldShowNextFrictionNotice({
+        changedSinceLastReview: false,
+        previousResults: basePrev,
+        currentResults: [
+          { reviewerId: 'r1', outcome: 'achieved', frictionComponentIds: [] },
+          { reviewerId: 'r2', outcome: 'regretted', frictionComponentIds: ['check-subscription'] },
+          { reviewerId: 'r3', outcome: 'bothered', frictionComponentIds: ['check-subscription'] },
+        ],
+        activeReviewerIds,
+      }),
+      false,
+    );
   });
 });

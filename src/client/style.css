@@ -169,11 +169,17 @@ body {
   border-color: var(--ink-40);
 }
 
+/* ミュート中は、彩度を抑えたマットな赤で塗り、スピーカーの絵を白くする。白との明暗差は 4.5:1 以上 */
 .header-voice-toggle.is-off {
-  background: rgba(254, 242, 242, 0.55);
-  border-color: rgba(220, 38, 38, 0.38);
-  color: rgba(220, 38, 38, 0.78);
-  box-shadow: 0 1px 4px rgba(220, 38, 38, 0.08);
+  background: #b4534b;
+  border-color: #b4534b;
+  color: #fff;
+  box-shadow: 0 1px 4px rgba(120, 45, 38, 0.18);
+}
+
+.header-voice-toggle.is-off:hover {
+  background: #a5483f;
+  border-color: #a5483f;
 }
 
 .goal-badge-prefix {
@@ -211,24 +217,30 @@ body {
 .goal-progress-dots {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
+  gap: 2px;
 }
 
+/* 満足した人はサムズアップ。まだの人は同じ絵文字を灰色で薄く出し、空いている枠にする */
 .goal-dot {
-  width: 9px;
-  height: 9px;
-  border-radius: 50%;
-  background: var(--ink-15);
-  border: 1.5px solid var(--ink-40);
-  transition: all 160ms ease;
+  display: inline-block;
+  font-size: 1.15em;
+  line-height: 1;
+  filter: grayscale(1);
+  opacity: 0.3;
+  transition: filter 160ms ease, opacity 160ms ease, transform 160ms ease;
 }
 
 .goal-dot.is-achieved {
-  background: var(--accent-green);
-  border-color: var(--accent-green);
+  filter: none;
+  opacity: 1;
 }
 
+/* 手直し後でまだ確かめていない間は、前の結果を少し薄く出す */
 .goal-dot.is-pending {
+  opacity: 0.2;
+}
+
+.goal-dot.is-achieved.is-pending {
   opacity: 0.55;
 }
 
@@ -1633,13 +1645,13 @@ body {
   50% { box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.28); border-color: var(--accent-blue); }
 }
 
+/* 横幅に余裕があれば1行に並べ、入りきらないときだけ折り返す */
 .cohort-pill-row {
   display: flex;
   flex-wrap: wrap;
   justify-content: center;
   gap: 6px;
   width: 100%;
-  max-width: 540px;
 }
 
 .cohort-pill-btn {
@@ -1755,7 +1767,7 @@ body {
   font-size: 0.72rem;
   font-weight: 800;
   color: var(--ink-60);
-  margin-right: 2px;
+  margin-left: 2px;
 }
 
 .composer-recipient-pill {
@@ -1948,16 +1960,6 @@ body {
   cursor: pointer;
   flex: none;
   transition: background-color 140ms ease, color 140ms ease, border-color 140ms ease;
-}
-
-.btn-composer-send.is-cancel {
-  background: #fef2f2;
-  color: var(--accent-red);
-  border-color: #fecaca;
-}
-
-.btn-composer-send.is-cancel:hover {
-  background: #fee2e2;
 }
 
 .btn-composer-send:disabled {

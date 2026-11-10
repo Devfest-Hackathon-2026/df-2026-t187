@@ -817,6 +817,7 @@ const COMPONENT_SCHEMA: Schema = {
         properties: {
           label: { type: Type.STRING },
           value: { type: Type.STRING },
+          visibleWhen: CONDITION_SCHEMA,
         },
         required: ['label', 'value'],
       },
@@ -1039,6 +1040,13 @@ export function normalizeUpdatedSpec(rawSpec: AppSpec, previousSpec: AppSpec): A
     };
     if (visibleWhen) normalized.visibleWhen = visibleWhen;
     else delete normalized.visibleWhen;
+    if (Array.isArray(c.rows)) {
+      normalized.rows = c.rows.map((row) => {
+        const rowVisibleWhen = coerceCondition(row.visibleWhen);
+        const { visibleWhen: _ignored, ...rest } = row;
+        return rowVisibleWhen ? { ...rest, visibleWhen: rowVisibleWhen } : rest;
+      });
+    }
     if (trapWhen) normalized.trapWhen = trapWhen;
     else delete normalized.trapWhen;
     if (c.trapSafeValue !== undefined) {
@@ -1209,8 +1217,9 @@ export async function applyOptionToSpec(req: ApplyRequest): Promise<ApplyRespons
     '   - upsert_derived: 計算式を追加または変更する（key と expression を指定）',
     '3. 画面の見た目だけでなく、裏側の処理（actions, behavior, state, visibleWhen）も整合するように更新してください。',
     '4. 押しても何も起きない本物のボタン（role が primary_action で actions が空）を動くように直すときは、replace_component でその部品の actions に complete_task を設定してください。style.sticky など元の見た目の設定はそのまま残してください。',
-    ...ACTIVE_THEME.implementerNotes.map((note, i) => `${i + 5}. ${note}`),
-    `${ACTIVE_THEME.implementerNotes.length + 5}. commitMessage は何を変えたかを「〜しました」で終わる1文、30文字以内で書いてください。括弧・記号・英語は使わないでください。`,
+    '5. 割引や手数料を計算式で合計に足し引きしたときは、合計の内訳を表示する summary の rows にもその行を足してください。value は計算値を差し込んだ金額にし、0円のときは visibleWhen に operator gt と value 0 を指定して行を隠してください。既存の行は消さないでください。',
+    ...ACTIVE_THEME.implementerNotes.map((note, i) => `${i + 6}. ${note}`),
+    `${ACTIVE_THEME.implementerNotes.length + 6}. commitMessage は何を変えたかを「〜しました」で終わる1文、30文字以内で書いてください。括弧・記号・英語は使わないでください。`,
     '',
     `【現在のアプリ仕様】\n${JSON.stringify(req.currentSpec)}`,
     removedInitialComponents.length > 0
@@ -1370,7 +1379,7 @@ async function voiceAssistantClearReport(
     ...facts.improvementFacts.map((f) => `- ${f}`),
     '',
     '【絶対ルール】',
-    '1. 上の事実に書かれていないことは絶対に作らないでください。回数や人数の数字も事実のとおりにしてください。',
+    '1. 上の事実に書かれていないことは絶対に作らないでください。回数や人数の数字も事実のとおりにしてください。消さずに、手直しの前に、最初から、のような、事実にない経緯や順番も言い足さないでください。',
     '2. 事実の中に `{{turn:数字}}` という目印がある場合は、ブラウザ側で学習者の実際の発言に置き換える記号なので、1文字も変えずにバッククォート付きの `{{turn:数字}}` のまま goodPoints の文中に必ず残してください。',
     '3. 丸括弧やかぎ括弧は一切使わないでください。強調したい語や数字はバッククォート `...` で囲んでよいです。',
     '4. それぞれの吹き出しは80〜110文字程度の自然な話し言葉1〜2文にまとめてください。',
@@ -1802,26 +1811,42 @@ export function canApplyWithoutRedPen(spec: AppSpec, userMessage: string): boole
   return false;
 }
 
+/** 発言の言葉と、その言葉が指す部品の見分け方 */
+const MENTION_RULES: ReadonlyArray<{ words: RegExp; matches: (c: AppComponent) => boolean }> = [
+  { words: /定期|サブスク/, matches: (c) => isSubscriptionComponent(c) },
+  { words: /広告|クーポン|ポップアップ|500円|閉じる/, matches: (c) => isCouponComponent(c) },
+  {
+    words: /残り|時間|カウントダウン|売り切れ/,
+    matches: (c) => c.role === 'distraction' || c.id === 'banner-countdown',
+  },
+  {
+    words: /今すぐ|黄色いボタン|赤.*ボタン|おとり/,
+    matches: (c) => c.role === 'decoy' || c.id === 'btn-buy-now',
+  },
+  {
+    words: /注文|確定|確認画面/,
+    matches: (c) => c.role === 'primary_action' || c.id === 'btn-order',
+  },
+  { words: /やめる|キャンセル/, matches: (c) => c.role === 'danger' || c.id === 'btn-cancel' },
+];
+
+/**
+ * 発言の中で名前が出た部品を、発言の中で先に出た順に返す。
+ * 「今すぐ購入ボタンは注文確定ボタンと紛らわしいので消して」なら、頼んでいる今すぐ購入ボタンが先になる
+ */
 function inferMentionedComponentIds(spec: AppSpec, userMessage: string): string[] {
   const msg = userMessage.trim();
   if (!msg) return [];
-  const matched: string[] = [];
+  const found: Array<{ id: string; at: number }> = [];
   for (const c of spec.components) {
-    if (
-      (/定期|サブスク/.test(msg) && isSubscriptionComponent(c)) ||
-      (/広告|クーポン|ポップアップ|500円|閉じる/.test(msg) && isCouponComponent(c)) ||
-      (/残り|時間|カウントダウン|売り切れ/.test(msg) &&
-        (c.role === 'distraction' || c.id === 'banner-countdown')) ||
-      (/今すぐ|黄色いボタン|赤.*ボタン|おとり/.test(msg) &&
-        (c.role === 'decoy' || c.id === 'btn-buy-now')) ||
-      (/注文|確定|確認画面/.test(msg) &&
-        (c.role === 'primary_action' || c.id === 'btn-order')) ||
-      (/やめる|キャンセル/.test(msg) && (c.role === 'danger' || c.id === 'btn-cancel'))
-    ) {
-      matched.push(c.id);
+    let at = Infinity;
+    for (const rule of MENTION_RULES) {
+      const m = rule.words.exec(msg);
+      if (m && rule.matches(c)) at = Math.min(at, m.index);
     }
+    if (at !== Infinity) found.push({ id: c.id, at });
   }
-  return matched;
+  return found.sort((a, b) => a.at - b.at).map((f) => f.id);
 }
 
 async function buildRequireRedPenResponse(
@@ -1835,33 +1860,15 @@ async function buildRequireRedPenResponse(
       ...extraPointedIds.filter((id) => existingIds.has(id)),
     ]),
   );
-  const matchedComps = pointedIds
-    .map((id) => req.currentSpec.components.find((c) => c.id === id))
-    .filter((c): c is AppComponent => Boolean(c));
-  const targetLabel =
-    matchedComps.length > 0 ? `${formatCircledTargetLabel(matchedComps)}を` : '';
-  const reply = cleanJapaneseText(
-    `${targetLabel}手直しするときは、左のスマホ画面で直したい部品を赤ペンで囲んでから指示してくださいね。`,
-    '手直しするときは、左のスマホ画面で直したい部品を赤ペンで囲んでから指示してくださいね。',
-  );
-  const telemetryEvent = req.userMessage
-    ? await recordPromptTelemetryEvent({
-        cohortId: req.cohortId,
-        runId: req.runId,
-        turnIndex: req.turnIndex,
-        shareForAggregate: req.shareForAggregate,
-        promptText: req.userMessage,
-        sessionMode: 'explore',
-        recipient: 'assistant',
-        hasPenAnnotation: false,
-      })
-    : undefined;
+  // 部品の名前は返事に入れない。画面の文字をそのまま読み上げないよう、指し示した部品は画面の側でシステム行に出す
+  const reply = '手直しするときは、左のスマホ画面で直したい部品を赤ペンで囲んでから指示してくださいね。';
+  // 囲まずに頼んで断った発言は、操作のつまずきで、質問でも手直しでもない。
+  // 講評の質問の回数や、みんなの集計に入らないよう、記録しない
   return {
     intent: 'clarify',
     reply,
     suggestedFollowUps: [],
     pointedComponentIds: pointedIds.slice(0, 1),
-    telemetryEvent,
   };
 }
 
@@ -2130,10 +2137,10 @@ export async function chatWithStudio(req: ChatRequest): Promise<ChatResponse> {
         suggestedFollowUps: [],
       };
     }
-    const targetName = formatCircledTargetLabel(targets);
+    // 囲んだ部品の名前は、画面の側でシステム行として出す。画面の文字をそのまま読み上げないよう、返事には入れない
     return {
       intent: 'explain',
-      reply: `${targetName}ですね。気になることを聞くか、どう手直ししたいか教えてください`,
+      reply: '気になることを聞くか、どう手直ししたいか教えてください',
       suggestedFollowUps: [...CIRCLE_INQUIRY_FOLLOW_UPS],
       pointedComponentIds: targets.map((t) => t.id),
     };
