@@ -25,4 +25,10 @@ export default defineConfig({
   server: {
     ...(extraAllowedHosts ? { allowedHosts: extraAllowedHosts } : {}),
   },
+  build: {
+    rolldownOptions: {
+      // 書き写したアイコンの著作権表示を、配信するJSにも残す。ライセンスの条件のため
+      output: { comments: { legal: true } },
+    },
+  },
 });
