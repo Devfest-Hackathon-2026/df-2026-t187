@@ -6,10 +6,9 @@
 
 ログインは不要です。開くとすぐ始められます。
 
-- **独自ドメイン**
+- **アプリ**
   - https://yukid.hinata.works
-- **Cloud Run のURL**
-  - https://yukid-df-hack-264960795870.asia-northeast1.run.app
+  - https://yukid-df-hack-264960795870.asia-northeast1.run.app でも同じアプリが開きます
 - **短時間で確かめるデモ用**
   - https://yukid.hinata.works/?scenario=demo
   - 罠を3つに絞った問題で、約3分で主な機能をひととおり確かめられます
