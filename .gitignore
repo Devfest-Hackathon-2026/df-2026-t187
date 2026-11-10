@@ -24,3 +24,28 @@ npm-debug.log*
 .idea/
 .claude/
 .aider*
+
+# 提出用リポジトリの初期設定から引き継いだもの
+# 秘密情報（コミットしない）
+.env.*
+!.env.example
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+*.pem
+*.key
+*.p12
+credentials*.json
+google-services.json
+GoogleService-Info.plist
+# 依存関係とビルドの成果物
+build/
+out/
+.next/
+.wrangler/
+__pycache__/
+*.pyc
+.venv/
+venv/
+# OS とエディタ
+Thumbs.db
