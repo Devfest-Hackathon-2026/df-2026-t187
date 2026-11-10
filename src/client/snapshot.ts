@@ -1,7 +1,7 @@
 import { renderLabel } from '../shared/appRuntime.ts';
 import { sanitizeCssColor } from '../shared/sandboxValidator.ts';
 import type { AppSpec, StateValue } from '../shared/types.ts';
-import { querySandboxComponentElements } from './sandboxRenderer.ts';
+import { getStageRelativeRect, querySandboxComponentElements } from './sandboxRenderer.ts';
 
 /**
  * サンドボックス内の現在のお題アプリ画面と、ユーザーが描き込んだペン軌跡キャンバスを合成し、
@@ -59,12 +59,7 @@ export function captureSandboxSnapshot(
     const comp = spec.components.find((c) => c.id === id);
     if (!comp) continue;
 
-    const elRect = el.getBoundingClientRect();
-    const isInsideIframe = el.ownerDocument !== document;
-    const x = isInsideIframe ? elRect.left : elRect.left - rect.left;
-    const y = isInsideIframe ? elRect.top : elRect.top - rect.top;
-    const w = elRect.width;
-    const h = elRect.height;
+    const { left: x, top: y, width: w, height: h } = getStageRelativeRect(el, rect);
     if (w <= 0 || h <= 0) continue;
 
     const win = el.ownerDocument.defaultView ?? window;
@@ -107,9 +102,9 @@ export function captureSandboxSnapshot(
     // ポップアップの閉じるボタンの位置・大きさもそのままキャンバスに描く
     const closeBtn = el.querySelector<HTMLElement>('.inapp-popup-close');
     if (closeBtn) {
-      const cRect = closeBtn.getBoundingClientRect();
-      const cx = isInsideIframe ? cRect.left : cRect.left - rect.left;
-      const cy = isInsideIframe ? cRect.top : cRect.top - rect.top;
+      const cRect = getStageRelativeRect(closeBtn, rect);
+      const cx = cRect.left;
+      const cy = cRect.top;
       const cw = Math.max(14, cRect.width);
       const ch = Math.max(14, cRect.height);
       ctx.fillStyle = 'rgba(0, 0, 0, 0.18)';

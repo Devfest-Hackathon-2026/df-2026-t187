@@ -1,6 +1,5 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type {
-  ApplyRequest,
   AppSpec,
   ChatHistoryEntry,
   ChatRequest,
@@ -10,16 +9,17 @@ import type {
   OwnerLineRequest,
   LatestReviewRecord,
   RecordDecisionRequest,
+  ReviewOutcome,
   TargetCohortId,
   TranscribeRequest,
   TtsRequest,
+  VisibilityCondition,
 } from '../shared/types.ts';
-import { isSafeStateKey } from '../shared/appRuntime.ts';
+import { isSafeComponentId, isSafeStateKey } from '../shared/appRuntime.ts';
 import { ACTIVE_THEME } from '../shared/initialTheme.ts';
 import {
   AiNotConfiguredError,
   AiTimeoutError,
-  applyOptionToSpec,
   chatWithStudio,
   evaluateAppWithPersonas,
   getAiConnectionStatus,
@@ -70,6 +70,13 @@ const VALID_OWNER_SITUATIONS = new Set<OwnerLineRequest['situation']>([
   'closing',
   'reply',
 ]);
+const VALID_REVIEW_OUTCOMES = new Set<ReviewOutcome>([
+  'achieved',
+  'bothered',
+  'abandoned',
+  'regretted',
+]);
+const SAFE_DECISION_TARGET_RE = /^[A-Za-z0-9_:,-]{1,80}$/;
 
 /** 発言の番号は 0 以上の整数だけを受け付ける。それ以外は番号なしとして扱う */
 function sanitizeTurnIndex(value: unknown): number | undefined {
@@ -94,11 +101,7 @@ function sanitizeCohortId(value: unknown): TargetCohortId | undefined {
 }
 
 export function sanitizeComponentIds(value: unknown): string[] {
-  return Array.isArray(value)
-    ? value
-        .filter((id): id is string => typeof id === 'string' && id.length > 0 && id.length <= 80)
-        .slice(0, 20)
-    : [];
+  return Array.isArray(value) ? value.filter(isSafeComponentId).slice(0, 20) : [];
 }
 
 /** 部品の座標一覧は、数値が有限で形の正しいものだけを上限件数まで受け付ける */
@@ -111,9 +114,7 @@ export function sanitizeComponentBounds(value: unknown): ComponentBoundsInput[] 
       (b): b is ComponentBoundsInput =>
         Boolean(b) &&
         typeof b === 'object' &&
-        typeof (b as ComponentBoundsInput).id === 'string' &&
-        (b as ComponentBoundsInput).id.length > 0 &&
-        (b as ComponentBoundsInput).id.length <= 80 &&
+        isSafeComponentId((b as ComponentBoundsInput).id) &&
         inCoordRange((b as ComponentBoundsInput).left) &&
         inCoordRange((b as ComponentBoundsInput).top) &&
         inCoordRange((b as ComponentBoundsInput).right) &&
@@ -160,19 +161,33 @@ function sanitizeLatestReviews(value: unknown): LatestReviewRecord | undefined {
   const v = value as Partial<LatestReviewRecord>;
   if (!Array.isArray(v.reviews)) return undefined;
   const text = (s: unknown, max: number) => (typeof s === 'string' ? s.slice(0, max) : '');
+  const reviews = v.reviews
+    .filter(
+      (r): r is LatestReviewRecord['reviews'][number] =>
+        Boolean(r) &&
+        typeof r === 'object' &&
+        VALID_REVIEW_OUTCOMES.has(r.outcome as ReviewOutcome),
+    )
+    .slice(0, 9)
+    .map((r) => ({
+      name: text(r.name, 40),
+      outcome: r.outcome,
+      actionTrace: Array.isArray(r.actionTrace)
+        ? r.actionTrace.slice(0, 16).map((t) => text(t, 160))
+        : [],
+      frictionComponentIds: sanitizeComponentIds(r.frictionComponentIds),
+    }));
   return {
     screenLabel: text(v.screenLabel, 40),
     isCurrentScreen: v.isCurrentScreen === true,
-    reviews: v.reviews.slice(0, 9).map((r) => ({
-      name: text(r?.name, 40),
-      outcome: r?.outcome,
-      actionTrace: Array.isArray(r?.actionTrace) ? r.actionTrace.slice(0, 40).map((t) => text(t, 200)) : [],
-      frictionComponentIds: sanitizeComponentIds(r?.frictionComponentIds),
-    })),
+    reviews,
     ownerMetrics: Array.isArray(v.ownerMetrics)
       ? v.ownerMetrics.slice(0, 10).map((m) => ({
           label: text(m?.label, 40),
-          count: typeof m?.count === 'number' ? m.count : 0,
+          count:
+            typeof m?.count === 'number' && Number.isInteger(m.count) && m.count >= 0 && m.count <= 100
+              ? m.count
+              : 0,
           missing: m?.missing === true,
         }))
       : undefined,
@@ -181,36 +196,66 @@ function sanitizeLatestReviews(value: unknown): LatestReviewRecord | undefined {
 
 /**
  * 今の発言と会話の履歴に、個人情報やAIへの指示の乗っ取りが含まれていないかを調べる。
- * 発言者名を偽装した履歴から個人情報が混入しないよう、全履歴に対して規則検査も行う
+ * 履歴が長くても今の発言が切り落とされないよう先に単独で検査し、発言者名を偽装した履歴も全件検査する
  */
 async function assertMessageAndHistoryAllowed(
   message: string,
   history: ChatHistoryEntry[],
+  extraTexts: ReadonlyArray<string> = [],
 ): Promise<void> {
   for (const entry of history) {
     if (findPersonalInfoByRules(entry.text)) {
       throw new PromptRejectedError('personal_info');
     }
   }
-  const combined = [
-    ...history.filter((e) => e.speaker === 'ユーザー').map((e) => e.text),
-    message,
-  ].join('\n');
-  if (combined.trim()) {
-    await assertPromptAllowed(combined);
+  for (const extra of extraTexts) {
+    if (findPersonalInfoByRules(extra)) {
+      throw new PromptRejectedError('personal_info');
+    }
+  }
+  if (message.trim()) {
+    await assertPromptAllowed(message);
+  }
+  const recentHistory = history
+    .slice(-12)
+    .map((e) => e.text)
+    .join('\n')
+    .slice(-3800);
+  if (recentHistory.trim()) {
+    await assertPromptAllowed(recentHistory);
   }
 }
 
 /** 画面の仕様を直接書き換えて送られた場合でも、部品の文字やHTMLから個人情報が Gemini に渡らないようにする */
 function assertSpecAllowed(spec: AppSpec): void {
-  if (findPersonalInfoByRules(JSON.stringify(spec.components))) {
+  const target = JSON.stringify({
+    title: spec.title,
+    subtitle: spec.subtitle,
+    state: spec.state,
+    derived: spec.derived,
+    components: spec.components,
+  });
+  if (findPersonalInfoByRules(target)) {
     throw new PromptRejectedError('personal_info');
   }
+}
+
+function isValidCondition(cond: unknown): cond is VisibilityCondition {
+  return (
+    Boolean(cond) &&
+    typeof cond === 'object' &&
+    typeof (cond as VisibilityCondition).stateKey === 'string' &&
+    isSafeStateKey((cond as VisibilityCondition).stateKey)
+  );
 }
 
 export function isValidAppSpec(value: unknown): value is AppSpec {
   if (!value || typeof value !== 'object') return false;
   const candidate = value as Partial<AppSpec>;
+  if (typeof candidate.id !== 'string' || !candidate.id || candidate.id.length > 80) return false;
+  if (typeof candidate.title !== 'string' || candidate.title.length > 120) return false;
+  if (typeof candidate.subtitle !== 'string' || candidate.subtitle.length > 120) return false;
+  if (!candidate.theme || typeof candidate.theme !== 'object') return false;
   if (!Array.isArray(candidate.components) || candidate.components.length > 60) return false;
   if (!Array.isArray(candidate.state) || candidate.state.length > 40) return false;
   if (
@@ -223,7 +268,8 @@ export function isValidAppSpec(value: unknown): value is AppSpec {
           typeof d === 'object' &&
           typeof d.key === 'string' &&
           isSafeStateKey(d.key) &&
-          typeof d.expression === 'string',
+          typeof d.expression === 'string' &&
+          d.expression.length <= 500,
       ))
   ) {
     return false;
@@ -233,12 +279,34 @@ export function isValidAppSpec(value: unknown): value is AppSpec {
       (c) =>
         Boolean(c) &&
         typeof c === 'object' &&
-        typeof c.id === 'string' &&
+        isSafeComponentId(c.id) &&
         typeof c.type === 'string' &&
+        c.type.length <= 40 &&
         typeof c.label === 'string' &&
+        c.label.length <= 500 &&
+        (c.customHtml === undefined || (typeof c.customHtml === 'string' && c.customHtml.length <= 10_000)) &&
+        (c.customCss === undefined || (typeof c.customCss === 'string' && c.customCss.length <= 5_000)) &&
+        (c.options === undefined ||
+          (Array.isArray(c.options) &&
+            c.options.length <= 20 &&
+            c.options.every((o) => typeof o === 'string' && o.length <= 200))) &&
+        (c.rows === undefined ||
+          (Array.isArray(c.rows) &&
+            c.rows.length <= 20 &&
+            c.rows.every(
+              (r) =>
+                Boolean(r) &&
+                typeof r === 'object' &&
+                typeof r.label === 'string' &&
+                r.label.length <= 120 &&
+                typeof r.value === 'string' &&
+                r.value.length <= 120 &&
+                (r.visibleWhen === undefined || isValidCondition(r.visibleWhen)),
+            ))) &&
         Boolean(c.style) &&
         typeof c.style === 'object' &&
         Array.isArray(c.actions) &&
+        c.actions.length <= 20 &&
         c.actions.every(
           (a) =>
             Boolean(a) &&
@@ -248,22 +316,15 @@ export function isValidAppSpec(value: unknown): value is AppSpec {
         ) &&
         (c.stateKey === undefined ||
           (typeof c.stateKey === 'string' && isSafeStateKey(c.stateKey))) &&
-        (c.visibleWhen === undefined ||
-          (Boolean(c.visibleWhen) &&
-            typeof c.visibleWhen === 'object' &&
-            typeof c.visibleWhen.stateKey === 'string' &&
-            isSafeStateKey(c.visibleWhen.stateKey))) &&
-        (c.trapWhen === undefined ||
-          (Boolean(c.trapWhen) &&
-            typeof c.trapWhen === 'object' &&
-            typeof c.trapWhen.stateKey === 'string' &&
-            isSafeStateKey(c.trapWhen.stateKey))),
+        (c.visibleWhen === undefined || isValidCondition(c.visibleWhen)) &&
+        (c.trapWhen === undefined || isValidCondition(c.trapWhen)),
     ) &&
     candidate.state.every(
       (s) =>
         Boolean(s) &&
         typeof s === 'object' &&
         typeof s.key === 'string' &&
+        s.key.length <= 80 &&
         isSafeStateKey(s.key),
     )
   );
@@ -345,8 +406,8 @@ export async function handleApiRequest(
     return true;
   }
 
-  // ほかのサイトのページや、Origin のないスクリプトからの POST は断る
-  if (req.method === 'POST' && !isAllowedOrigin(req)) {
+  // ほかのサイトのページや、Origin / Sec-Fetch-Site のない外部スクリプトからの呼び出しは断る
+  if ((req.method !== 'GET' || url !== '/api/status') && !isAllowedOrigin(req)) {
     sendJson(res, 403, { error: 'このサイトの画面からだけ使えます。' });
     return true;
   }
@@ -411,20 +472,29 @@ async function routeApiRequest(
         !body?.stage ||
         !VALID_DECISION_STAGES.has(body.stage) ||
         typeof body.targetId !== 'string' ||
-        !body.targetId.trim() ||
+        !SAFE_DECISION_TARGET_RE.test(body.targetId) ||
         typeof body.chosenLabel !== 'string' ||
         !body.chosenLabel.trim()
       ) {
         sendJson(res, 400, { error: '有効な stage, targetId, chosenLabel が必要です' });
         return true;
       }
+      const isAllowedDecision =
+        body.stage === 'select_cohort'
+          ? ACTIVE_THEME.cohorts.some((c) => c.id === body.targetId && c.label === body.chosenLabel)
+          : body.stage === 'apply_change'
+            ? body.chosenLabel === '何もしない' || body.chosenLabel === '手直し指示'
+            : body.chosenLabel.length <= 40 && !findPersonalInfoByRules(body.chosenLabel);
+      if (!isAllowedDecision) {
+        sendJson(res, 400, { error: '有効な stage, targetId, chosenLabel が必要です' });
+        return true;
+      }
       // 判断の記録に残すのは決まった値だけ。自由に書かれた理由は受け取らない
       const result = await recordHumanDecisionWithFunctionCalling({
         stage: body.stage,
-        targetId: body.targetId.slice(0, 80),
-        chosenLabel: body.chosenLabel.slice(0, 80),
+        targetId: body.targetId,
+        chosenLabel: body.chosenLabel,
         reason: '',
-        cohortId: sanitizeCohortId(body.cohortId),
       });
       sendJson(res, 200, result);
       return true;
@@ -438,10 +508,18 @@ async function routeApiRequest(
       }
       const userMessage = body.userMessage.slice(0, MAX_TEXT_INPUT_LENGTH);
       const history = sanitizeHistory(body.history);
+      const latestReviews = sanitizeLatestReviews(body.latestReviews);
+      const reviewTexts = latestReviews
+        ? [
+            latestReviews.screenLabel,
+            ...latestReviews.reviews.flatMap((r) => [r.name, ...r.actionTrace]),
+            ...(latestReviews.ownerMetrics?.map((m) => m.label) ?? []),
+          ]
+        : [];
       // Gemini に送る前に、個人情報やAIへの指示の乗っ取りが含まれていないかを調べる。
       // 履歴の発言も調べ、画面を通さずに送られた履歴から乗っ取られないようにする
       assertSpecAllowed(body.currentSpec);
-      await assertMessageAndHistoryAllowed(userMessage, history);
+      await assertMessageAndHistoryAllowed(userMessage, history, reviewTexts);
       const result = await chatWithStudio({
         currentSpec: body.currentSpec,
         runId: sanitizeRunId(body.runId),
@@ -450,43 +528,12 @@ async function routeApiRequest(
         shareForAggregate: body.shareForAggregate === true,
         userMessage,
         history,
-        latestReviews: sanitizeLatestReviews(body.latestReviews),
+        latestReviews,
         targetComponentIds: sanitizeComponentIds(body.targetComponentIds),
         annotatedImageBase64: sanitizeBase64(body.annotatedImageBase64),
         mode: body.mode === 'circled' ? 'circled' : undefined,
         recipient: typeof body.recipient === 'string' ? body.recipient.slice(0, 40) : undefined,
         componentBounds: sanitizeComponentBounds(body.componentBounds),
-      });
-      sendJson(res, 200, result);
-      return true;
-    }
-
-    if (req.method === 'POST' && url === '/api/apply') {
-      const body = await readJsonBody<ApplyRequest>(req);
-      if (
-        !isValidAppSpec(body?.currentSpec) ||
-        typeof body.userInstruction !== 'string' ||
-        !body.userInstruction.trim()
-      ) {
-        sendJson(res, 400, { error: 'currentSpec と手直し内容が必要です' });
-        return true;
-      }
-      const userInstruction = body.userInstruction.slice(0, MAX_TEXT_INPUT_LENGTH);
-      const history = sanitizeHistory(body.history);
-      assertSpecAllowed(body.currentSpec);
-      await assertMessageAndHistoryAllowed(userInstruction, history);
-      const result = await applyOptionToSpec({
-        currentSpec: body.currentSpec,
-        runId: sanitizeRunId(body.runId),
-        cohortId: sanitizeCohortId(body.cohortId),
-        turnIndex: sanitizeTurnIndex(body.turnIndex),
-        shareForAggregate: body.shareForAggregate === true,
-        userInstruction,
-        selectionReason:
-          typeof body.selectionReason === 'string' ? body.selectionReason.slice(0, 200) : undefined,
-        history,
-        targetComponentIds: sanitizeComponentIds(body.targetComponentIds),
-        annotatedImageBase64: sanitizeBase64(body.annotatedImageBase64),
       });
       sendJson(res, 200, result);
       return true;
@@ -532,18 +579,19 @@ async function routeApiRequest(
           ? body.userMessage.slice(0, MAX_TEXT_INPUT_LENGTH)
           : undefined;
       const history = sanitizeHistory(body.history);
-      await assertMessageAndHistoryAllowed(userMessage ?? '', history);
       const facts = body.facts
         .filter((f): f is string => typeof f === 'string')
         .slice(0, 12)
         .map((f) => f.slice(0, 200));
+      const fallback = body.fallback.slice(0, 200);
+      await assertMessageAndHistoryAllowed(userMessage ?? '', history, [...facts, fallback]);
       sendJson(
         res,
         200,
         await voiceOwnerLine({
           situation: body.situation,
           facts,
-          fallback: body.fallback.slice(0, 200),
+          fallback,
           userMessage,
           history,
         }),

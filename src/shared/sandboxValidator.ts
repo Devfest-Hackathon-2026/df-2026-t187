@@ -44,6 +44,43 @@ export function sanitizeCssColor(raw: string | undefined, fallback: string): str
   return SAFE_CSS_COLOR_RE.test(trimmed) ? trimmed : fallback;
 }
 
+export const FORBIDDEN_CUSTOM_HTML_TAGS = [
+  'script',
+  'style',
+  'iframe',
+  'object',
+  'embed',
+  'applet',
+  'meta',
+  'link',
+  'base',
+  'form',
+  'noscript',
+  'template',
+  'foreignObject',
+  'animate',
+  'animateMotion',
+  'animateTransform',
+  'set',
+  'use',
+  'feImage',
+  'math',
+  'portal',
+  'audio',
+  'video',
+  'source',
+  'track',
+] as const;
+
+const FORBIDDEN_TAG_PAIR_RE = new RegExp(
+  `<(${FORBIDDEN_CUSTOM_HTML_TAGS.join('|')})\\b[\\s\\S]*?<\\/\\1>`,
+  'gi',
+);
+const FORBIDDEN_TAG_SINGLE_RE = new RegExp(
+  `<(${FORBIDDEN_CUSTOM_HTML_TAGS.join('|')})\\b[^>]*\\/?>`,
+  'gi',
+);
+
 /**
  * カスタムCSS文字列から外部通信やスクリプト実行につながる危険な記述を取り除く。
  */
@@ -55,6 +92,7 @@ export function sanitizeCustomCss(raw: string | undefined): string {
     .replace(/\\/g, '')
     .replace(/@(?:import|charset|namespace)\b[^;{}]*;?/gi, '')
     .replace(/url\s*\([^)]*\)?/gi, 'none')
+    .replace(/(?:-[a-z]+-)?image-set\s*\([^)]*\)?/gi, 'none')
     .replace(/expression\s*\([^)]*\)?/gi, 'none')
     .replace(/(?:behavior|-moz-binding)\s*:[^;{}]+;?/gi, '')
     .replace(/position\s*:\s*fixed\b/gi, 'position: relative')
@@ -70,14 +108,8 @@ export function sanitizeCustomHtml(raw: string): string {
   return raw
     .slice(0, 8000)
     .replace(/<!--[\s\S]*?(?:-->|$)/g, '')
-    .replace(
-      /<(script|style|iframe|object|embed|applet|meta|link|base|form|noscript|template|foreignObject|animate|set|use|math)\b[\s\S]*?<\/\1>/gi,
-      '',
-    )
-    .replace(
-      /<(script|style|iframe|object|embed|applet|meta|link|base|form|noscript|template|foreignObject|animate|set|use|math)\b[^>]*\/?>/gi,
-      '',
-    )
+    .replace(FORBIDDEN_TAG_PAIR_RE, '')
+    .replace(FORBIDDEN_TAG_SINGLE_RE, '')
     .replace(/(?<=[\s/"'])on[a-z0-9_-]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '')
     .replace(/(?<=[\s/"'])(?:srcdoc|ping)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '')
     .replace(
@@ -96,13 +128,11 @@ export function sanitizeCustomHtml(raw: string): string {
 
 /**
  * お題アプリ仕様 (AppSpec) から、iframe 内で単一HTMLとして独立動作する HTML 文字列を生成する。
- * タスク完了時には window.parent.postMessage({ type: 'PONKOTSU_TASK_COMPLETED' }, '*') を発火する。
  */
 export function buildStandaloneSandboxHtml(spec: AppSpec): string {
   const safeTitle = escapeHtml(spec.title || 'お題アプリ');
   const bg = sanitizeCssColor(spec.theme?.bgColor, '#ffffff');
   const fg = sanitizeCssColor(spec.theme?.textColor, '#1c1917');
-  const serializedSpec = JSON.stringify(spec).replace(/</g, '\\u003c');
 
   return `<!DOCTYPE html>
 <html lang="ja">
@@ -130,8 +160,7 @@ export function buildStandaloneSandboxHtml(spec: AppSpec): string {
   </style>
 </head>
 <body>
-  <div id="sandbox-mount" data-spec-id="${escapeHtml(spec.id)}"></div>
-  <script id="ponkotsu-spec-data" type="application/json">${serializedSpec}</script>
+  <div id="sandbox-mount" data-spec-id="${escapeHtml(spec.id || 'app')}"></div>
 </body>
 </html>`;
 }
@@ -157,7 +186,6 @@ export function validateSandboxSpec(
       valid: false,
       canRenderHtml: false,
       hasTaskCompletionEvent: false,
-      untouchedComponentsIntact: false,
       errors: ['アプリ仕様データが空または不正です'],
     };
   }
@@ -174,7 +202,7 @@ export function validateSandboxSpec(
   let canRenderHtml = false;
   try {
     const html = buildStandaloneSandboxHtml(spec);
-    canRenderHtml = html.includes('<!DOCTYPE html>') && html.includes('ponkotsu-spec-data');
+    canRenderHtml = html.includes('<!DOCTYPE html>') && html.includes('sandbox-mount');
   } catch {
     canRenderHtml = false;
     errors.push('単一HTMLの組み立てに失敗しました');
@@ -221,13 +249,11 @@ export function validateSandboxSpec(
   }
 
   // パッチ対象外の部品が変わっていないかチェック
-  let untouchedComponentsIntact = true;
   if (options.previousSpec && options.touchedComponentIds && Array.isArray(spec.components)) {
     for (const prevComp of options.previousSpec.components) {
       if (options.touchedComponentIds.has(prevComp.id)) continue;
       const nextComp = spec.components.find((c) => c.id === prevComp.id);
       if (!nextComp || JSON.stringify(nextComp) !== JSON.stringify(prevComp)) {
-        untouchedComponentsIntact = false;
         errors.push(`変更対象外の部品 ${prevComp.id} が書き換わっています`);
       }
     }
@@ -237,7 +263,6 @@ export function validateSandboxSpec(
     valid: errors.length === 0 && canRenderHtml,
     canRenderHtml,
     hasTaskCompletionEvent,
-    untouchedComponentsIntact,
     errors,
   };
 }

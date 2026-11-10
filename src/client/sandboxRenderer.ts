@@ -16,6 +16,7 @@ import {
 import {
   buildStandaloneSandboxHtml,
   escapeHtml,
+  FORBIDDEN_CUSTOM_HTML_TAGS,
   sanitizeCssColor,
   sanitizeCustomCss,
   sanitizeCustomHtml,
@@ -53,6 +54,28 @@ export function findSandboxComponentElement(
   return querySandboxComponentElements(container).find(
     (node) => node.dataset.componentId === componentId,
   );
+}
+
+/**
+ * サンドボックス内の要素の矩形を、ステージ基準の座標にそろえる。
+ * iframe 内の要素は iframe がステージ全面に重なっているためそのまま使い、直下フォールバック時はステージ左上を引く
+ */
+export function getStageRelativeRect(
+  el: HTMLElement,
+  stageRect: DOMRect,
+): { left: number; top: number; right: number; bottom: number; width: number; height: number } {
+  const r = el.getBoundingClientRect();
+  const isInsideIframe = el.ownerDocument !== document;
+  const dx = isInsideIframe ? 0 : stageRect.left;
+  const dy = isInsideIframe ? 0 : stageRect.top;
+  return {
+    left: r.left - dx,
+    top: r.top - dy,
+    right: r.right - dx,
+    bottom: r.bottom - dy,
+    width: r.width,
+    height: r.height,
+  };
 }
 
 function syncStylesIntoIframe(iframeDoc: Document): void {
@@ -573,7 +596,7 @@ function scheduleFit(
 /** 判定用に裏で描画している最中か。見えている画面のタイマーや監視を、裏の描画で書き換えないために使う */
 let measuringRender = false;
 
-export interface RenderSandboxOptions {
+interface RenderSandboxOptions {
   /**
    * 判定用の座標を測るための、画面外での描画。広告や完了ページのタイマー、残り時間の時計、
    * スタイルの監視、大きさの測り直しの予約をせず、見えている画面の状態に触れない
@@ -635,10 +658,6 @@ function renderSandboxAppInner(
         watchParentStyles(iframe);
         refitWhenFontsLoad(iframeDoc);
       }
-    }
-    const specScript = iframeDoc.getElementById('ponkotsu-spec-data');
-    if (specScript) {
-      specScript.textContent = JSON.stringify(spec).replace(/</g, '\\u003c');
     }
     mountRoot = iframeDoc.getElementById('sandbox-mount') ?? iframeDoc.body;
     // 状態が変わるたびに中身を作り直すため、スクロール位置を覚えておき、作り直したあとに戻す
@@ -778,15 +797,11 @@ function renderSandboxAppInner(
     const tpl = targetDoc.createElement('template');
     tpl.innerHTML = templated;
     const frag = tpl.content;
-    frag
-      .querySelectorAll(
-        'script, style, iframe, object, embed, applet, meta, link, base, form, noscript, template, foreignObject, animate, set, use, math',
-      )
-      .forEach((node) => node.remove());
+    frag.querySelectorAll(FORBIDDEN_CUSTOM_HTML_TAGS.join(', ')).forEach((node) => node.remove());
     frag.querySelectorAll('*').forEach((node) => {
       for (const attr of Array.from(node.attributes)) {
         const attrName = attr.name.toLowerCase();
-        const attrVal = attr.value.replace(/[\s\u0000-\u001f]+/g, '').toLowerCase();
+        const attrVal = attr.value.replace(/[\s\u0000-\u001f]+/g, '');
         if (attrName === 'style') {
           const cleanedCss = sanitizeCustomCss(attr.value);
           if (cleanedCss) {
@@ -796,22 +811,20 @@ function renderSandboxAppInner(
           }
           continue;
         }
-        const isSafeDataImage = /^data:image\/(?:png|jpeg|jpg|gif|webp);base64,/i.test(attrVal);
+        const isSafeDataImage =
+          /^data:image\/(?:png|jpeg|jpg|gif|webp);base64,[a-z0-9+/=]+$/i.test(attrVal);
         if (
           attrName.startsWith('on') ||
           attrName === 'srcdoc' ||
           attrName === 'ping' ||
-          ((attrName === 'href' ||
-            attrName === 'src' ||
-            attrName === 'srcset' ||
-            attrName === 'xlink:href' ||
-            attrName === 'action' ||
-            attrName === 'formaction' ||
-            attrName === 'poster' ||
-            attrName === 'background') &&
-            (attrVal.startsWith('javascript:') ||
-              attrVal.startsWith('vbscript:') ||
-              (attrVal.startsWith('data:') && !isSafeDataImage)))
+          attrName === 'srcset' ||
+          attrName === 'xlink:href' ||
+          attrName === 'action' ||
+          attrName === 'formaction' ||
+          attrName === 'poster' ||
+          attrName === 'background' ||
+          (attrName === 'src' && !isSafeDataImage) ||
+          (attrName === 'href' && !attrVal.startsWith('#'))
         ) {
           node.removeAttribute(attr.name);
         }

@@ -7,9 +7,7 @@ import {
   applyPatchesToSpecWithValidation,
   canApplyWithoutRedPen,
   chatWithStudio,
-  classifyUserMessageIntent,
   describeOwnerContext,
-  detectExplicitRecipientMention,
   evaluateAppWithPersonas,
   getAiConnectionStatus,
   normalizeUpdatedSpec,
@@ -63,7 +61,11 @@ import {
   simulatePersonaComputerUse,
   validateSandboxSpec,
 } from '../src/shared/sandboxValidator.ts';
-import { detectCheckpointRevertCommand } from '../src/shared/intent.ts';
+import {
+  classifyUserMessageIntent,
+  detectCheckpointRevertCommand,
+  detectExplicitRecipientMention,
+} from '../src/shared/intent.ts';
 import {
   formatPredictionBadgeText,
   formatPredictionReportLine,
@@ -1133,6 +1135,16 @@ describe('core-loop', () => {
       cohortId: 'careful',
     });
     assert.equal(noReasonRes.decision.reason, '');
+
+    // 手直しの記録には自由入力の文章を残さず、決まったラベルに置き換える
+    const applyDecisionRes = await recordHumanDecisionWithFunctionCalling({
+      stage: 'apply_change',
+      targetId: 'btn-order',
+      chosenLabel: '山田太郎の住所に合わせて注文ボタンを直して',
+      reason: '連絡先は test@example.com です',
+    });
+    assert.equal(applyDecisionRes.decision.chosenLabel, '手直し指示');
+    assert.equal(applyDecisionRes.decision.reason, '');
   });
 
   it('AIの接続設定がない場合は代替処理をせずエラーにする', async () => {
@@ -2812,6 +2824,20 @@ describe('任意の選択欄と押しやすいチェック欄', () => {
       { type: 'set_state', targetKey: 'prototype', value: 'x' },
     ];
     assert.equal(isValidAppSpec(pollutedActionTargetSpec), false);
+
+    // 部品IDのプロトタイプ汚染キー・壊れた rows・深すぎる計算式・全角メールアドレス・CSS image-set を拒否する
+    const pollutedCompIdSpec = structuredClone(salesPush);
+    pollutedCompIdSpec.components[0].id = 'constructor';
+    assert.equal(isValidAppSpec(pollutedCompIdSpec), false);
+    assert.deepEqual(sanitizeComponentIds(['btn-order', '__proto__', 'constructor', 'toString']), ['btn-order']);
+
+    const brokenRowsSpec = structuredClone(salesPush);
+    (brokenRowsSpec.components[0] as unknown as { rows: unknown }).rows = [null];
+    assert.equal(isValidAppSpec(brokenRowsSpec), false);
+
+    assert.throws(() => evaluateExpression('('.repeat(60) + '1' + ')'.repeat(60), {}), /深すぎます/);
+    assert.equal(findPersonalInfoByRules('連絡先は ｔｅｓｔ＠ｅｘａｍｐｌｅ．ｃｏｍ です'), true);
+    assert.ok(!sanitizeCustomCss('.box { background-image: image-set("https://evil.example/a.png" 1x); }').includes('evil.example'));
   });
 
   it('満足が増えなかったときの一言は、未達成のお客さんが気にする部品が前と変わったときだけ出す', () => {

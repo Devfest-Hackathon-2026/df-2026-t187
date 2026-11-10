@@ -10,11 +10,16 @@ import type {
 
 export type AppState = Record<string, StateValue>;
 
-const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype', 'toString', 'valueOf']);
 
 /** プロトタイプ汚染を防ぐため、危険なオブジェクトキー名を拒否する */
 export function isSafeStateKey(key: string): boolean {
   return Boolean(key) && !UNSAFE_KEYS.has(key);
+}
+
+/** 部品IDとして安全か（空でなく長すぎず、プロトタイプ汚染キーでない） */
+export function isSafeComponentId(id: unknown): id is string {
+  return typeof id === 'string' && id.length > 0 && id.length <= 80 && isSafeStateKey(id);
 }
 
 function readStateValue(state: AppState, key: string): StateValue | undefined {
@@ -83,9 +88,18 @@ function toBool(v: StateValue): boolean {
   return Boolean(v);
 }
 
+const MAX_EXPR_TOKENS = 256;
+const MAX_EXPR_DEPTH = 32;
+
 /** 計算式を評価する。未知の状態キーは 0 として扱う */
 export function evaluateExpression(expression: string, state: AppState): StateValue {
+  if (expression.length > 1000) {
+    throw new Error(`計算式が長すぎます: ${expression.slice(0, 40)}`);
+  }
   const tokens = tokenize(expression);
+  if (tokens.length > MAX_EXPR_TOKENS) {
+    throw new Error(`計算式が複雑すぎます: ${expression.slice(0, 40)}`);
+  }
   let pos = 0;
 
   const peek = (): Token | undefined => tokens[pos];
@@ -98,7 +112,14 @@ export function evaluateExpression(expression: string, state: AppState): StateVa
     return false;
   };
 
-  const parsePrimary = (): StateValue => {
+  const checkDepth = (depth: number): void => {
+    if (depth > MAX_EXPR_DEPTH) {
+      throw new Error(`計算式の入れ子が深すぎます: ${expression.slice(0, 40)}`);
+    }
+  };
+
+  const parsePrimary = (depth: number): StateValue => {
+    checkDepth(depth);
     const t = tokens[pos++];
     if (!t) throw new Error(`計算式が途中で終わっています: ${expression}`);
     if (t.kind === 'num' || t.kind === 'str') return t.value;
@@ -108,43 +129,43 @@ export function evaluateExpression(expression: string, state: AppState): StateVa
       return readStateValue(state, t.value) ?? 0;
     }
     if (t.value === '(') {
-      const v = parseTernary();
+      const v = parseTernary(depth + 1);
       if (!takeOp(')')) throw new Error(`括弧が閉じていません: ${expression}`);
       return v;
     }
-    if (t.value === '-') return -toNumber(parsePrimary());
-    if (t.value === '!') return !toBool(parsePrimary());
+    if (t.value === '-') return -toNumber(parsePrimary(depth + 1));
+    if (t.value === '!') return !toBool(parsePrimary(depth + 1));
     throw new Error(`計算式を読めません: ${expression}`);
   };
 
-  const parseMul = (): StateValue => {
-    let left = parsePrimary();
+  const parseMul = (depth: number): StateValue => {
+    let left = parsePrimary(depth);
     for (;;) {
-      if (takeOp('*')) left = toNumber(left) * toNumber(parsePrimary());
+      if (takeOp('*')) left = toNumber(left) * toNumber(parsePrimary(depth));
       else if (takeOp('/')) {
-        const right = toNumber(parsePrimary());
+        const right = toNumber(parsePrimary(depth));
         left = right === 0 ? 0 : toNumber(left) / right;
       } else return left;
     }
   };
 
-  const parseAdd = (): StateValue => {
-    let left = parseMul();
+  const parseAdd = (depth: number): StateValue => {
+    let left = parseMul(depth);
     for (;;) {
-      if (takeOp('+')) left = toNumber(left) + toNumber(parseMul());
-      else if (takeOp('-')) left = toNumber(left) - toNumber(parseMul());
+      if (takeOp('+')) left = toNumber(left) + toNumber(parseMul(depth));
+      else if (takeOp('-')) left = toNumber(left) - toNumber(parseMul(depth));
       else return left;
     }
   };
 
-  const parseCompare = (): StateValue => {
-    const left = parseAdd();
+  const parseCompare = (depth: number): StateValue => {
+    const left = parseAdd(depth);
     const t = peek();
     if (t?.kind !== 'op') return left;
     if (['>=', '<=', '>', '<'].includes(t.value)) {
       pos++;
       const a = toNumber(left);
-      const b = toNumber(parseAdd());
+      const b = toNumber(parseAdd(depth));
       if (t.value === '>=') return a >= b;
       if (t.value === '<=') return a <= b;
       if (t.value === '>') return a > b;
@@ -152,35 +173,36 @@ export function evaluateExpression(expression: string, state: AppState): StateVa
     }
     if (t.value === '==' || t.value === '!=') {
       pos++;
-      const right = parseAdd();
+      const right = parseAdd(depth);
       const equal = String(left) === String(right);
       return t.value === '==' ? equal : !equal;
     }
     return left;
   };
 
-  const parseAnd = (): StateValue => {
-    let left = parseCompare();
-    while (takeOp('&&')) left = toBool(left) && toBool(parseCompare());
+  const parseAnd = (depth: number): StateValue => {
+    let left = parseCompare(depth);
+    while (takeOp('&&')) left = toBool(left) && toBool(parseCompare(depth));
     return left;
   };
 
-  const parseOr = (): StateValue => {
-    let left = parseAnd();
-    while (takeOp('||')) left = toBool(left) || toBool(parseAnd());
+  const parseOr = (depth: number): StateValue => {
+    let left = parseAnd(depth);
+    while (takeOp('||')) left = toBool(left) || toBool(parseAnd(depth));
     return left;
   };
 
-  const parseTernary = (): StateValue => {
-    const cond = parseOr();
+  const parseTernary = (depth: number): StateValue => {
+    checkDepth(depth);
+    const cond = parseOr(depth);
     if (!takeOp('?')) return cond;
-    const whenTrue = parseTernary();
+    const whenTrue = parseTernary(depth + 1);
     if (!takeOp(':')) throw new Error(`三項演算子の : がありません: ${expression}`);
-    const whenFalse = parseTernary();
+    const whenFalse = parseTernary(depth + 1);
     return toBool(cond) ? whenTrue : whenFalse;
   };
 
-  const result = parseTernary();
+  const result = parseTernary(0);
   if (pos !== tokens.length) throw new Error(`計算式の末尾を読めません: ${expression}`);
   return result;
 }

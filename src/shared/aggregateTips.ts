@@ -52,7 +52,7 @@ export interface AggregateTipTag {
  * collecting: 挑戦の数が足りないので集計中と出す（Gemini は呼ばない）
  * unavailable: BigQuery の集計を読めなかった
  */
-export type AggregateTipStatus = 'ready' | 'collecting' | 'unavailable';
+type AggregateTipStatus = 'ready' | 'collecting' | 'unavailable';
 
 export interface AggregateTipBox {
   id: AggregateTipBoxId;
@@ -90,11 +90,11 @@ export interface AggregateTipBoxFacts {
 }
 
 /** 3件以上の公開の決まりとは別に、コツの根拠として使う区分に必要な最小件数 */
-export const MIN_TIP_EVIDENCE_COUNT = 5;
-export const MAX_TIP_TAGS = 3;
-export const MAX_TIP_HEADING_CHARS = 15;
-export const MAX_TIP_BODY_SENTENCES = 2;
-export const MAX_TIP_BODY_CHARS = 120;
+const MIN_TIP_EVIDENCE_COUNT = 5;
+const MAX_TIP_TAGS = 3;
+const MAX_TIP_HEADING_CHARS = 15;
+const MAX_TIP_BODY_SENTENCES = 2;
+const MAX_TIP_BODY_CHARS = 120;
 
 // ============================================================================
 // 部品の名前
@@ -314,8 +314,8 @@ function buildBlindspotFacts(stats: PublicAggregateStats): AggregateTipBoxFacts 
     );
   const removed =
     (stats.totalRuns ?? 0) >= target &&
-    (stats.executeRunCount ?? stats.totalRuns ?? 0) >= target &&
-    (stats.executePrompts ?? target) >= target
+    (stats.executeRunCount ?? 0) >= target &&
+    (stats.executePrompts ?? 0) >= target
       ? stats.removedNeededFeatureRatePercent
       : undefined;
 
@@ -450,7 +450,7 @@ export function containsTipBracket(text: string): boolean {
   return TIP_BRACKET_RE.test(text);
 }
 
-export function countTipChars(text: string): number {
+function countTipChars(text: string): number {
   return [...text].length;
 }
 

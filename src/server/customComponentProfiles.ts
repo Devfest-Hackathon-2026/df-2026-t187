@@ -4,6 +4,7 @@
 // Firestore には先に書いた結果だけを残し（あとから同じ鍵で書こうとしても上書きしない）、Cloud Run が複数台でも結果をそろえる
 
 import { createHash } from 'node:crypto';
+import { isSafeComponentId } from '../shared/appRuntime.ts';
 import {
   isCustomComponent,
   isCustomComponentProfile,
@@ -12,7 +13,11 @@ import {
   type CustomComponentProfile,
 } from '../shared/customComponentProfile.ts';
 import type { AppComponent, AppSpec } from '../shared/types.ts';
-import { getGcpAccessToken } from './store.ts';
+import {
+  getFirestoreDocumentsBaseUrl,
+  getGcpAccessToken,
+  isSafeFirestoreDocId,
+} from './store.ts';
 
 /**
  * 読み取りの決まり（プロンプト・スキーマ・モデル）を変えたら上げる。鍵に含めるので、古い読み取り結果は使われなくなる
@@ -63,12 +68,6 @@ export function clearCustomProfileMemoryCache(): void {
 const FIRESTORE_COLLECTION = 'custom_component_profiles';
 const FIRESTORE_TIMEOUT_MS = 2500;
 
-function firestoreProject(): string | null {
-  const project = process.env.GOOGLE_CLOUD_PROJECT;
-  if (process.env.FIRESTORE_ENABLED === '0' || !project || project === 'your-gcp-project-id') return null;
-  return project;
-}
-
 type FsValue = { stringValue?: string; booleanValue?: boolean };
 
 /** 保存するのは読み取り結果の値だけ。部品のHTMLや文字は保存しない */
@@ -107,17 +106,18 @@ async function firestoreHeaders(): Promise<Record<string, string> | null> {
   return { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` };
 }
 
-function docBaseUrl(project: string): string {
-  return `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(project)}/databases/(default)/documents/${FIRESTORE_COLLECTION}`;
+function collectionUrl(): string | null {
+  const baseUrl = getFirestoreDocumentsBaseUrl();
+  return baseUrl ? `${baseUrl}/${FIRESTORE_COLLECTION}` : null;
 }
 
 async function readFromFirestore(key: string): Promise<CustomComponentProfile | null> {
-  const project = firestoreProject();
-  if (!project) return null;
+  const base = collectionUrl();
+  if (!base || !isSafeFirestoreDocId(key)) return null;
   try {
     const headers = await firestoreHeaders();
     if (!headers) return null;
-    const res = await fetch(`${docBaseUrl(project)}/${key}`, {
+    const res = await fetch(`${base}/${encodeURIComponent(key)}`, {
       headers,
       signal: AbortSignal.timeout(FIRESTORE_TIMEOUT_MS),
     });
@@ -137,12 +137,12 @@ async function writeOnceToFirestore(
   key: string,
   profile: CustomComponentProfile,
 ): Promise<CustomComponentProfile> {
-  const project = firestoreProject();
-  if (!project) return profile;
+  const base = collectionUrl();
+  if (!base || !isSafeFirestoreDocId(key)) return profile;
   try {
     const headers = await firestoreHeaders();
     if (!headers) return profile;
-    const res = await fetch(`${docBaseUrl(project)}?documentId=${key}`, {
+    const res = await fetch(`${base}?documentId=${encodeURIComponent(key)}`, {
       method: 'POST',
       headers,
       body: JSON.stringify({ fields: toFirestoreFields(profile) }),
@@ -206,8 +206,8 @@ export async function resolveCustomComponentProfiles(
   convert: CustomComponentConverter,
   model: string,
 ): Promise<ResolvedCustomProfiles> {
-  const targets = spec.components.filter(isCustomComponent);
-  const profiles: Record<string, CustomComponentProfile> = {};
+  const targets = spec.components.filter((comp) => isCustomComponent(comp) && isSafeComponentId(comp.id));
+  const profiles = Object.create(null) as Record<string, CustomComponentProfile>;
   const fallbackIds: string[] = [];
   await Promise.all(
     targets.map(async (comp) => {
@@ -217,5 +217,5 @@ export async function resolveCustomComponentProfiles(
     }),
   );
   fallbackIds.sort();
-  return { profiles, fallbackIds };
+  return { profiles: { ...profiles }, fallbackIds };
 }

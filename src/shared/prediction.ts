@@ -9,19 +9,16 @@ export interface PredictionOption {
   label: string;
 }
 
-export const PREDICTION_OPTIONS: readonly PredictionOption[] = [
-  { outcome: 'achieved', label: '満足して買える' },
-  { outcome: 'bothered', label: '買えたけど不満' },
-  { outcome: 'abandoned', label: '途中でやめる' },
-  { outcome: 'regretted', label: '後悔する' },
-];
-
 const OUTCOME_LABELS: Record<ReviewOutcome, string> = {
   achieved: '満足して買える',
   bothered: '買えたけど不満',
   abandoned: '途中でやめる',
   regretted: '後悔する',
 };
+
+export const PREDICTION_OPTIONS: readonly PredictionOption[] = (
+  Object.entries(OUTCOME_LABELS) as Array<[ReviewOutcome, string]>
+).map(([outcome, label]) => ({ outcome, label }));
 
 export function outcomePredictionLabel(outcome: ReviewOutcome): string {
   return OUTCOME_LABELS[outcome] ?? outcome;

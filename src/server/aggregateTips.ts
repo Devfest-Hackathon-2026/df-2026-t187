@@ -15,12 +15,17 @@ import {
 import { MIN_PUBLIC_RUN_COUNT } from '../shared/promptTelemetry.ts';
 import type { PublicAggregateStats } from '../shared/types.ts';
 import { draftAggregateTipsWithGemini } from './gemini.ts';
-import { getGcpAccessToken, getPublicAggregateStats } from './store.ts';
+import {
+  getFirestoreDocumentsBaseUrl,
+  getGcpAccessToken,
+  getPublicAggregateStats,
+  isSafeFirestoreDocId,
+} from './store.ts';
 
 /** コツを作り直す間隔 */
 export const AGGREGATE_TIPS_REFRESH_MS = 60 * 60 * 1000;
 /** 集計を読めなかったときや、どのボックスも集計中のときは、早めに読み直す */
-export const AGGREGATE_TIPS_RETRY_MS = 5 * 60 * 1000;
+const AGGREGATE_TIPS_RETRY_MS = 5 * 60 * 1000;
 
 /**
  * 保存したコツの決まり（プロンプト・タグの決め方・形）を変えたら上げる。古い保存は使われなくなる
@@ -55,8 +60,9 @@ function hasGeneratedContent(value: PublicAggregateTips): boolean {
   return value.available && value.boxes.some((b) => b.status === 'ready');
 }
 
-function refreshAtFor(value: PublicAggregateTips): number {
-  const base = Date.parse(value.generatedAt);
+function refreshAtFor(value: PublicAggregateTips, now: number): number {
+  const parsed = Date.parse(value.generatedAt);
+  const base = Number.isFinite(parsed) ? Math.min(parsed, now) : now;
   return base + (hasGeneratedContent(value) ? AGGREGATE_TIPS_REFRESH_MS : AGGREGATE_TIPS_RETRY_MS);
 }
 
@@ -66,11 +72,12 @@ function refreshAtFor(value: PublicAggregateTips): number {
 
 const FIRESTORE_COLLECTION = 'aggregate_tips';
 const FIRESTORE_TIMEOUT_MS = 2500;
+const MAX_STORED_PAYLOAD_LENGTH = 32_000;
 
 function firestoreDocUrl(key: string): string | null {
-  const project = process.env.GOOGLE_CLOUD_PROJECT;
-  if (process.env.FIRESTORE_ENABLED === '0' || !project || project === 'your-gcp-project-id') return null;
-  return `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(project)}/databases/(default)/documents/${FIRESTORE_COLLECTION}/${encodeURIComponent(key)}`;
+  const baseUrl = getFirestoreDocumentsBaseUrl();
+  if (!baseUrl || !isSafeFirestoreDocId(key)) return null;
+  return `${baseUrl}/${FIRESTORE_COLLECTION}/${encodeURIComponent(key)}`;
 }
 
 async function readStoredFromFirestore(key: string): Promise<PublicAggregateTips | null> {
@@ -89,7 +96,7 @@ async function readStoredFromFirestore(key: string): Promise<PublicAggregateTips
     };
     if (doc.fields?.version?.stringValue !== AGGREGATE_TIPS_VERSION) return null;
     const payload = doc.fields?.payload?.stringValue;
-    if (!payload) return null;
+    if (!payload || payload.length > MAX_STORED_PAYLOAD_LENGTH) return null;
     const parsed: unknown = JSON.parse(payload);
     return isPublicAggregateTips(parsed) ? parsed : null;
   } catch {
@@ -161,14 +168,15 @@ async function rebuildTips(
     }
     const facts = buildAggregateTipFacts(stats);
     const boxes = await composeAggregateTips(facts, deps.drafter, { previous: previous?.boxes });
+    const now = deps.now();
     const value: PublicAggregateTips = {
       available: stats.available,
-      generatedAt: new Date(deps.now()).toISOString(),
+      generatedAt: new Date(now).toISOString(),
       segment,
       minRunsForDisplay: stats.minRunsForDisplay,
       boxes,
     };
-    memoryCache.set(key, { value, refreshAt: refreshAtFor(value) });
+    memoryCache.set(key, { value, refreshAt: refreshAtFor(value, now) });
     if (hasGeneratedContent(value)) {
       await deps.writeStored(key, value);
     }
@@ -192,15 +200,17 @@ export async function getPublicAggregateTips(
   deps: AggregateTipsDeps = defaultDeps,
 ): Promise<PublicAggregateTips> {
   const key = aggregateTipSegmentKey(segment);
+  const now = deps.now();
   let cached = memoryCache.get(key);
-  if (cached && cached.refreshAt > deps.now()) return cached.value;
+  if (cached && cached.refreshAt > now) return cached.value;
 
   if (!cached) {
     const stored = await deps.readStored(key);
     if (stored) {
-      cached = { value: stored, refreshAt: refreshAtFor(stored) };
+      const currentNow = deps.now();
+      cached = { value: stored, refreshAt: refreshAtFor(stored, currentNow) };
       memoryCache.set(key, cached);
-      if (cached.refreshAt > deps.now()) return stored;
+      if (cached.refreshAt > currentNow) return stored;
     }
   }
 

@@ -1,6 +1,7 @@
 // プロンプト・テレメトリ分析と行動ベースの到達効率集計
 // 主指標はLLMの主観採点ではなく、探索と実行を分離した行動データ（初回到達率・往復数・手戻り有無）に置く。
 
+import { GOAL_STATEMENT_RE } from './intent.ts';
 import { isCouponComponent, isSubscriptionComponent } from './sandboxValidator.ts';
 import type { AppSpec, OwnerReport, SpecPatch, TargetCohortId } from './types.ts';
 
@@ -73,11 +74,6 @@ export interface PromptTelemetryEvent {
   removedNeededFeature: boolean;
   nlSignal: NaturalLanguageSignal;
   embeddingSignal: EmbeddingSignal;
-  outcomeAfterTurn?: {
-    achievedCount: number;
-    totalCustomers: number;
-    passed: boolean;
-  };
   createdAt: string;
 }
 
@@ -182,10 +178,6 @@ const CONDITION_DESIGN_RE =
 const VAGUE_DELEGATE_RE =
   /^(?:いい感じに|うまく|適当に|なんとか|全部|まとめて|とりあえず|おまかせで|きれいに|使いやすく|見やすく|買いやすく)(?:直して|して|変えて|手直しして|改造して)?[！!。？?]*$/;
 
-/** 誰が（人・お客さん）どうできるようにしたいか、という目的の言い方 */
-const GOAL_DIRECTED_RE =
-  /(?:人|方|お客さん|客|誰|高齢|お年寄り|初めて)(?:が|でも|だけ|も|に|は)[^。]*?(?:ように|やすく|られる|できる|迷わ|安心)/;
-
 const NEGATIVE_SENTIMENT_TERMS = ['邪魔', 'ウザい', 'だます', '騙す', '罠', '最悪', 'ひどい', '消せ', '紛らわしい'];
 const POSITIVE_SENTIMENT_TERMS = ['安心', '親切', '見やすい', 'わかりやすい', '分かりやすい', '正直', '丁寧', '気持ちよく'];
 
@@ -206,7 +198,7 @@ export function extractDeterministicNlSignal(promptText: string): NaturalLanguag
     CONDITION_DESIGN_RE.test(text) ||
     (entities.length >= 2 && /(?:を|の).*?(?:に|へ|よう)/.test(text) && !SIMPLE_DELETE_RE.test(text));
 
-  const hasGoalStatement = GOAL_DIRECTED_RE.test(text);
+  const hasGoalStatement = GOAL_STATEMENT_RE.test(text);
 
   let sentiment = 0;
   for (const neg of NEGATIVE_SENTIMENT_TERMS) {
@@ -248,7 +240,7 @@ export function classifyDeterministicArchetype(
       analyzedVia: 'local_deterministic',
     };
   }
-  if (GOAL_DIRECTED_RE.test(text)) {
+  if (GOAL_STATEMENT_RE.test(text)) {
     return {
       closestArchetype: 'goal_directed',
       similarityScore: 0.9,
@@ -827,7 +819,7 @@ export function buildClearFeedbackFacts(input: ClearFeedbackInput): ClearFeedbac
 /** 個人の挑戦が推測されないよう、公開の集計で数値を出すために必要な最小の挑戦数 */
 export const MIN_PUBLIC_RUN_COUNT = 3;
 
-export const ARCHETYPE_PUBLIC_LABELS: ReadonlyArray<{
+const ARCHETYPE_PUBLIC_LABELS: ReadonlyArray<{
   archetype: PromptArchetype;
   label: string;
 }> = [
@@ -849,7 +841,6 @@ export interface PublicAggregateCohortStat {
   runCount?: number;
   /** この客層で手直しを1回以上した挑戦の数 */
   executeRunCount?: number;
-  clearedCount?: number;
   clearRatePercent?: number;
   avgExecuteTurnsOnClear?: number | null;
 }
@@ -866,7 +857,6 @@ export interface PublicAggregateArchetypeOutcome {
   runsNeeded?: number;
   runCount?: number;
   executeCount?: number;
-  redoneCount?: number;
   redoneRatePercent?: number;
 }
 
@@ -880,7 +870,6 @@ export interface PublicAggregateComponentStat {
   suppressed: boolean;
   runsNeeded?: number;
   runCount?: number;
-  struggleRunCount?: number;
   struggleRatePercent?: number;
 }
 
@@ -896,22 +885,12 @@ export interface PublicAggregateStats {
   /** 全体を伏せているとき、表示できるまでにあと何件の挑戦が要るか */
   runsNeeded?: number;
   totalRuns?: number;
-  clearedRuns?: number;
-  resetRuns?: number;
-  abandonedRuns?: number;
   clearRatePercent?: number;
   avgExecuteTurnsOnClear?: number | null;
-  totalPrompts?: number;
   executePrompts?: number;
   executeRunCount?: number;
   reworkRatePercent?: number;
   removedNeededFeatureRatePercent?: number;
-  archetypeBreakdown?: Array<{
-    archetype: PromptArchetype;
-    label: string;
-    count: number;
-    percent: number;
-  }>;
   topEntities?: Array<{ term: string; count: number }>;
   /** 手直しの指示のうち、あとで同じ部品を直し直した割合 */
   redoneRatePercent?: number;
@@ -1033,15 +1012,12 @@ export function formatPublicAggregateStats(
   }
 
   const clearedRuns = toSafeInt(raw.runTotals?.cleared_runs);
-  const resetRuns = toSafeInt(raw.runTotals?.reset_runs);
-  const abandonedRuns = toSafeInt(raw.runTotals?.abandoned_runs);
   const clearRatePercent = Math.round((clearedRuns / totalRuns) * 100);
   const avgExecuteTurnsOnClear =
     clearedRuns >= minRunsForDisplay
       ? toSafeAvg(raw.runTotals?.avg_execute_turns_on_clear)
       : null;
 
-  const totalPrompts = toSafeInt(raw.promptTotals?.total_prompts);
   const executePrompts = toSafeInt(raw.promptTotals?.execute_prompts);
   const reworkPrompts = toSafeInt(raw.promptTotals?.rework_prompts);
   const removedNeededPrompts = toSafeInt(raw.promptTotals?.removed_needed_prompts);
@@ -1055,26 +1031,6 @@ export function formatPublicAggregateStats(
   const removedNeededFeatureRatePercent = executeShown
     ? Math.round((removedNeededPrompts / executePrompts) * 100)
     : undefined;
-
-  const archetypeCountMap = new Map<PromptArchetype, number>();
-  for (const row of raw.archetypeStats ?? []) {
-    const key = row?.archetype as PromptArchetype | undefined;
-    if (key && ARCHETYPE_PUBLIC_LABELS.some((item) => item.archetype === key)) {
-      archetypeCountMap.set(key, toSafeInt(row?.cnt));
-    }
-  }
-  const archetypeBreakdown =
-    totalPrompts >= minRunsForDisplay
-      ? ARCHETYPE_PUBLIC_LABELS.map(({ archetype, label }) => {
-          const count = archetypeCountMap.get(archetype) ?? 0;
-          return {
-            archetype,
-            label,
-            count,
-            percent: Math.round((count / totalPrompts) * 100),
-          };
-        })
-      : undefined;
 
   // 指示の型ごとの、その後のやり直し。全体の割合は、型が分からない指示も含めて数える
   const outcomeRows = new Map<string, { executeCount: number; runCount: number; redoneCount: number }>();
@@ -1111,7 +1067,6 @@ export function formatPublicAggregateStats(
           suppressed: false,
           runCount,
           executeCount: row.executeCount,
-          redoneCount: row.redoneCount,
           redoneRatePercent: Math.round((row.redoneCount / row.executeCount) * 100),
         };
       })
@@ -1143,7 +1098,6 @@ export function formatPublicAggregateStats(
               label,
               suppressed: false,
               runCount: row.runCount,
-              struggleRunCount: row.struggleRunCount,
               struggleRatePercent: Math.round((row.struggleRunCount / row.runCount) * 100),
             },
       )
@@ -1188,7 +1142,6 @@ export function formatPublicAggregateStats(
       suppressed: false,
       runCount,
       executeRunCount: cohortExecuteRuns,
-      clearedCount,
       clearRatePercent: Math.round((clearedCount / cohortExecuteRuns) * 100),
       avgExecuteTurnsOnClear:
         clearedCount >= minRunsForDisplay ? toSafeAvg(row?.avg_execute_turns_on_clear) : null,
@@ -1201,17 +1154,12 @@ export function formatPublicAggregateStats(
     minRunsForDisplay,
     suppressed: false,
     totalRuns,
-    clearedRuns,
-    resetRuns,
-    abandonedRuns,
     clearRatePercent,
     avgExecuteTurnsOnClear,
-    totalPrompts: totalPrompts >= minRunsForDisplay ? totalPrompts : undefined,
     executePrompts: executeShown ? executePrompts : undefined,
     executeRunCount: executeShown ? executeRunCount : undefined,
     reworkRatePercent,
     removedNeededFeatureRatePercent,
-    archetypeBreakdown,
     topEntities,
     redoneRatePercent,
     archetypeOutcomes,

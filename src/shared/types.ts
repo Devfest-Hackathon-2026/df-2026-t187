@@ -10,7 +10,6 @@ import type {
   PromptSessionMode,
   PromptSessionSummary,
   PromptTelemetryEvent,
-  PublicAggregateCohortStat,
   PublicAggregateStats,
 } from './promptTelemetry.ts';
 
@@ -21,7 +20,6 @@ export type {
   PromptSessionMode,
   PromptSessionSummary,
   PromptTelemetryEvent,
-  PublicAggregateCohortStat,
   PublicAggregateStats,
 };
 
@@ -354,7 +352,6 @@ export interface SandboxValidationResult {
   valid: boolean;
   canRenderHtml: boolean;
   hasTaskCompletionEvent: boolean;
-  untouchedComponentsIntact?: boolean;
   errors: string[];
 }
 
@@ -378,7 +375,6 @@ export interface ApplyRequest {
   currentSpec: AppSpec;
   targetComponentIds: string[];
   userInstruction: string;
-  selectionReason?: string;
   cohortId?: TargetCohortId;
   /** 1回の挑戦ごとの番号。振り返りの記録を、ほかの挑戦やほかの人の記録と混ぜないために使う */
   runId?: string;
@@ -404,8 +400,6 @@ export interface ApplyResponse {
   ownerComponentIds?: string[];
   validation?: SandboxValidationResult;
   rolledBack?: boolean;
-  decisionRecord?: HumanDecisionRecord;
-  telemetryEvent?: PromptTelemetryEvent;
 }
 
 // 店長のせりふ API の入出力
@@ -485,7 +479,7 @@ export interface ChatRequest {
   history?: ChatHistoryEntry[];
   /** circled は、学習者が赤ペンで囲んだだけのとき。受け止めて尋ねるだけで、画面は変えない */
   mode?: 'circled';
-  /** 誰に向けて送った発言か（auto / assistant / owner / ペルソナID） */
+  /** 誰に向けて送った発言か（assistant / owner / customer / ペルソナID） */
   recipient?: string;
   /** 決まった条件で描画して測った部品の座標。お客さんへの質問の返事を、反応を見たときと同じ条件で判定するために使う */
   componentBounds?: ComponentBoundsInput[];
@@ -498,11 +492,8 @@ export interface ChatResponse {
   applied?: ApplyResponse;
   /** 返答の中で画面上の部品を指し示しているときの部品IDリスト */
   pointedComponentIds?: string[];
-  /** intent が customer のときの返答したペルソナID */
-  customerPersonaId?: string;
   /** intent が customer で選んだ客層のお客さんたちが順番に返答するときのリスト */
   customerReplies?: Array<{ personaId: string; text: string; pointedComponentIds?: string[] }>;
-  telemetryEvent?: PromptTelemetryEvent;
 }
 
 export interface TtsRequest {

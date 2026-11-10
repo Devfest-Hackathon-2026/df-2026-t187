@@ -286,13 +286,15 @@ export function prepareSimulationInput(
   bounds?: ComponentBoundsInput[],
 ): SimulationInput {
   if (!profiles || Object.keys(profiles).length === 0) return { spec, bounds };
+  const lookupProfile = (id: string): CustomComponentProfile | undefined =>
+    Object.hasOwn(profiles, id) ? profiles[id] : undefined;
   const components = spec.components.map((comp) => {
-    const profile = isCustomComponent(comp) ? profiles[comp.id] : undefined;
+    const profile = isCustomComponent(comp) ? lookupProfile(comp.id) : undefined;
     return profile ? buildCustomComponentProxy(spec, comp, profile) : comp;
   });
   const adjustedBounds = bounds?.map((b) => {
     const comp = spec.components.find((c) => c.id === b.id);
-    const profile = comp && isCustomComponent(comp) ? profiles[comp.id] : undefined;
+    const profile = comp && isCustomComponent(comp) ? lookupProfile(comp.id) : undefined;
     return profile ? shrinkToTapTarget(b, profile.tapTargetSize) : b;
   });
   return { spec: { ...spec, components }, bounds: adjustedBounds };

@@ -131,7 +131,7 @@ export interface ThemeDefinition {
 }
 
 /** 再現できる乱数（mulberry32） */
-export function createSeededRandom(seed: number): () => number {
+function createSeededRandom(seed: number): () => number {
   let a = seed >>> 0;
   return () => {
     a = (a + 0x6d2b79f5) >>> 0;

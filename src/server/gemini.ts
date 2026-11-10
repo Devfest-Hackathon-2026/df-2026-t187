@@ -16,7 +16,7 @@ import {
   TARGET_COHORTS,
 } from '../shared/initialTheme.ts';
 import { buildScenarioSpec } from '../shared/theme.ts';
-import { hasCompletionAction } from '../shared/appRuntime.ts';
+import { COUNTDOWN_INITIAL_TEXT, hasCompletionAction } from '../shared/appRuntime.ts';
 import { describeOtherCohortImpact } from '../shared/otherCohorts.ts';
 import {
   buildOwnerChangeReaction,
@@ -47,6 +47,7 @@ import {
 import { describeWorkSteps } from '../shared/workSteps.ts';
 import {
   buildAggregateTipsPrompt,
+  splitTipSentences,
   type AggregateTipDraftRequest,
   type AggregateTipDrafts,
 } from '../shared/aggregateTips.ts';
@@ -63,7 +64,6 @@ import {
   type ResolvedCustomProfiles,
 } from './customComponentProfiles.ts';
 
-export { classifyUserMessageIntent, detectExplicitRecipientMention };
 import type {
   AppComponent,
   ApplyRequest,
@@ -90,6 +90,8 @@ import type {
 } from '../shared/types.ts';
 import {
   finalizeTelemetryOnEvaluate,
+  getConfiguredGcpProject,
+  isSafeGcpLocation,
   recordPromptTelemetryEvent,
   saveHumanDecision,
 } from './store.ts';
@@ -148,8 +150,9 @@ function createGenAIClient(): GenAIClientInfo | null {
   loadLocalEnv();
   const model = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
   const apiKey = process.env.GEMINI_API_KEY;
-  const project = process.env.GOOGLE_CLOUD_PROJECT;
-  const location = process.env.GOOGLE_CLOUD_LOCATION || 'global';
+  const project = getConfiguredGcpProject();
+  const rawLocation = process.env.GOOGLE_CLOUD_LOCATION || 'global';
+  const location = isSafeGcpLocation(rawLocation) ? rawLocation : 'global';
 
   if (apiKey) {
     const cacheKey = `key:${apiKey}:${model}`;
@@ -163,7 +166,7 @@ function createGenAIClient(): GenAIClientInfo | null {
     }
     return cachedClientInfo;
   }
-  if (project && project !== 'your-gcp-project-id') {
+  if (project) {
     const cacheKey = `agent-platform:${project}:${location}:${model}`;
     if (cachedClientInfo?.cacheKey !== cacheKey) {
       cachedClientInfo = {
@@ -175,7 +178,7 @@ function createGenAIClient(): GenAIClientInfo | null {
           location,
         }),
         model,
-        mode: `Gemini Enterprise Agent Platform (${project}/${location})`,
+        mode: 'Gemini Enterprise Agent Platform',
       };
     }
     return cachedClientInfo;
@@ -203,22 +206,22 @@ function thinkingConfig(): { thinkingConfig?: { thinkingLevel: ThinkingLevel } }
 
 /**
  * Gemini の応答はまれに数分固まることがあるため、呼び出しごとに待つ時間の上限を決める。
- * 短い返事はすぐ切ってやり直す。画面の改造は確認画面のように大きくなると時間がかかるので、長めに待ってやり直さない。
- * それでも返らなければ、学習者にもう一度送ってもらうよう伝えるエラーにする
+ * 画面の改造は確認画面のように大きくなると時間がかかるので長めに待ち、
+ * 時間内に返らなければ学習者にもう一度送ってもらうよう伝えるエラーにする
  */
 const TIMEOUTS = {
   /** 質問への回答・囲みへの反応 */
-  reply: { timeoutMs: 15_000, retries: 0 },
+  reply: 15_000,
   /** 画面の改造 */
-  apply: { timeoutMs: 90_000, retries: 0 },
+  apply: 90_000,
   /** お客さんの感想（間に合わなければシミュレーターの言葉を使う） */
-  review: { timeoutMs: 8_000, retries: 0 },
+  review: 8_000,
   /** 店長のせりふ・判断の記録（間に合わなければ決まった形で済ませる） */
-  side: { timeoutMs: 8_000, retries: 0 },
+  side: 8_000,
   /** 独自の部品の読み取り（間に合わなければ、その回は部品のHTMLに書かれた動きだけで判定し、結果は保存しない） */
-  convert: { timeoutMs: 10_000, retries: 0 },
+  convert: 10_000,
   /** みんなの集計のコツ（間に合わなければテンプレートの文を使う。1時間に1回しか呼ばない） */
-  tips: { timeoutMs: 12_000, retries: 0 },
+  tips: 12_000,
 } as const;
 
 export class AiTimeoutError extends Error {
@@ -232,10 +235,10 @@ export class AiTimeoutError extends Error {
 async function generateContentWithTimeout(
   aiInfo: GenAIClientInfo,
   params: GenerateContentParameters,
-  { timeoutMs, retries }: { timeoutMs: number; retries: number },
+  timeoutMs: number,
 ): Promise<GenerateContentResponse> {
   let rateLimitRetried = false;
-  for (let attempt = 0; attempt <= retries; attempt++) {
+  for (;;) {
     // 1日あたりの上限を数える。やり直しも1回として数え、上限に達したらそれ以上呼ばない
     dailyGeminiCounter.consume();
     try {
@@ -250,7 +253,6 @@ async function generateContentWithTimeout(
         status === 429 || msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED');
       if (isRateLimited && !rateLimitRetried) {
         rateLimitRetried = true;
-        attempt--;
         console.warn('[gemini] 利用枠（429）に当たったため2秒待って1回やり直します');
         await new Promise((resolve) => setTimeout(resolve, 2_000));
         continue;
@@ -258,10 +260,10 @@ async function generateContentWithTimeout(
       const name = (err as Error)?.name;
       const timedOut = name === 'TimeoutError' || name === 'AbortError';
       if (!timedOut) throw err;
-      console.warn(`[gemini] ${timeoutMs}ms 以内に応答がなかったため${attempt < retries ? 'やり直します' : '諦めます'}`);
+      console.warn(`[gemini] ${timeoutMs}ms 以内に応答がなかったため諦めます`);
+      throw new AiTimeoutError();
     }
   }
-  throw new AiTimeoutError();
 }
 
 const MAX_HISTORY_ENTRIES = 12;
@@ -284,10 +286,7 @@ const SIMPLIFIED_PATTERN = new RegExp(`[${SIMPLIFIED_ONLY_CHARS}]`);
 /** 簡体字が混ざった文だけを取り除く。全部取り除かれたら代わりの文を使う */
 function cleanJapaneseText(text: string, fallback: string): string {
   if (!SIMPLIFIED_PATTERN.test(text)) return text;
-  const kept = text
-    .split(/(?<=[。！？!?])/)
-    .map((sentence) => sentence.trim())
-    .filter((sentence) => sentence && !SIMPLIFIED_PATTERN.test(sentence));
+  const kept = splitTipSentences(text).filter((sentence) => !SIMPLIFIED_PATTERN.test(sentence));
   return kept.length > 0 ? kept.join('') : fallback;
 }
 
@@ -382,7 +381,7 @@ function formatCircledTargetLabel(targets: AppComponent[]): string {
     .map(
       (t) =>
         t.label
-          .replace(/\{countdown\}/g, '2:59')
+          .replace(/\{countdown\}/g, COUNTDOWN_INITIAL_TEXT)
           .replace(/\{[^}]+\}/g, '')
           .replace(/\s+/g, ' ')
           .trim() ||
@@ -427,7 +426,9 @@ export function describeOwnerContext(
     }
   }
   const labelsByRole = (role: string) =>
-    spec.components.filter((c) => c.role === role).map((c) => `「${c.label.replace(/\{countdown\}/g, '2:59')}」`);
+    spec.components
+      .filter((c) => c.role === role)
+      .map((c) => `「${c.label.replace(/\{countdown\}/g, COUNTDOWN_INITIAL_TEXT)}」`);
   const popups = labelsByRole('popup');
   if (popups.length > 0) facts.push(`今の画面には、店長が付けた広告${popups.join('と')}がある`);
   const pushes = [...labelsByRole('decoy'), ...labelsByRole('distraction')];
@@ -683,9 +684,14 @@ export async function recordHumanDecisionWithFunctionCalling(
   // 理由は任意。空のまま記録し、AIが勝手に理由を補わないようにする
   const originalReason = (req.reason ?? '').trim();
 
-  // 手直し（applyOptionToSpec）のたびに理由なしで並列呼び出しすると、利用枠（429）の消費が2倍になり、
-  // しかも返り値の引数は使われないため、客層選択（/api/decision）や理由があるときだけ Gemini を呼ぶ
-  const shouldCallGeminiFunction = req.stage !== 'apply_change' || Boolean(originalReason);
+  const safeTargetId = req.targetId.replace(/[^A-Za-z0-9_:,-]/g, '').slice(0, 80) || 'unknown';
+  const safeChosenLabel =
+    req.stage === 'apply_change' && req.chosenLabel !== '何もしない'
+      ? '手直し指示'
+      : req.chosenLabel.slice(0, 80);
+
+  // 手直し（apply_change）では毎回同じラベルになるため Gemini を呼ばず、客層選択（/api/decision）のときだけ Function Calling を使う
+  const shouldCallGeminiFunction = req.stage !== 'apply_change';
   if (aiInfo && shouldCallGeminiFunction) {
     try {
       const response = await generateContentWithTimeout(aiInfo, {
@@ -693,8 +699,8 @@ export async function recordHumanDecisionWithFunctionCalling(
         contents: [
           '学習者がアプリ改造スタジオで以下の判断を行いました。関数 record_human_decision を呼び出して判断と理由をそのまま記録してください。人間の判断を上書きしないでください。',
           `フェーズ: ${req.stage}`,
-          `対象ID: ${req.targetId}`,
-          `選んだ内容: ${req.chosenLabel}`,
+          `対象ID: ${safeTargetId}`,
+          `選んだ内容: ${safeChosenLabel}`,
           `学習者の理由: ${originalReason || 'なし'}`,
         ].join('\n'),
         config: {
@@ -717,8 +723,8 @@ export async function recordHumanDecisionWithFunctionCalling(
   const decision: HumanDecisionRecord = {
     id: `dec-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
     stage: req.stage,
-    targetId: req.targetId,
-    chosenLabel: req.chosenLabel,
+    targetId: safeTargetId,
+    chosenLabel: safeChosenLabel,
     // 自由に書かれた理由は、学習者を特定できる言葉が混ざりうるので保存しない。保存するのは決まった値だけ
     reason: '',
     recordedVia,
@@ -1184,21 +1190,19 @@ export function applyPatchesToSpecWithValidation(
  */
 export async function applyOptionToSpec(req: ApplyRequest): Promise<ApplyResponse> {
   const aiInfo = requireGenAIClient();
-  const reason = req.selectionReason?.trim() ?? '';
   const targetComponents = req.currentSpec.components.filter((c) =>
     req.targetComponentIds.includes(c.id),
   );
-  const chosenLabel = req.userInstruction;
   const targetId =
     req.targetComponentIds.length > 0 ? req.targetComponentIds.join(',') : 'chat_instruction';
 
-  const decisionPromise = recordHumanDecisionWithFunctionCalling({
+  // 指示の文章は保存せず、手直しを行ったという決まった値だけを裏で記録する
+  void recordHumanDecisionWithFunctionCalling({
     stage: 'apply_change',
     targetId,
-    chosenLabel,
-    reason,
-    cohortId: req.cohortId,
-  }).then((r) => r.decision);
+    chosenLabel: '手直し指示',
+    reason: '',
+  }).catch(() => {});
 
   const defaultScenarioSpec = buildScenarioSpec(
     ACTIVE_THEME,
@@ -1237,7 +1241,6 @@ export async function applyOptionToSpec(req: ApplyRequest): Promise<ApplyRespons
     }`,
     `【直近の会話】\n${formatHistory(req.history)}`,
     `【人間の手直し指示】\n${req.userInstruction}`,
-    reason ? `【人間がこの手直しを選んだ理由】\n${reason}` : '',
   ]
     .filter(Boolean)
     .join('\n');
@@ -1296,36 +1299,24 @@ export async function applyOptionToSpec(req: ApplyRequest): Promise<ApplyRespons
       );
     });
 
-  // 判断の記録は裏で続けてよい。画面の改造が終わったら、記録を少しだけ待って返事をする
-  const safeDecision = decisionPromise.catch(() => undefined);
   const candidate = await specUpdatePromise;
   const changeStats = candidate.rolledBack
     ? { changedComponentIds: [], removedNeededFeature: false }
     : inspectAppliedChangeForTelemetry(req.currentSpec, candidate.updatedSpec, candidate.patches);
-  const [decisionRecord, telemetryEvent] = await Promise.all([
-    Promise.race([
-      safeDecision,
-      new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 1500)),
-    ]),
-    recordPromptTelemetryEvent({
-      cohortId: req.cohortId,
-      runId: req.runId,
-      turnIndex: req.turnIndex,
-      shareForAggregate: req.shareForAggregate,
-      promptText: req.userInstruction,
-      sessionMode: 'execute',
-      recipient: 'assistant',
-      hasPenAnnotation: req.targetComponentIds.length > 0 || Boolean(req.annotatedImageBase64),
-      changedComponentIds: changeStats.changedComponentIds,
-      removedNeededFeature: changeStats.removedNeededFeature,
-    }),
-  ]);
+  await recordPromptTelemetryEvent({
+    cohortId: req.cohortId,
+    runId: req.runId,
+    turnIndex: req.turnIndex,
+    shareForAggregate: req.shareForAggregate,
+    promptText: req.userInstruction,
+    sessionMode: 'execute',
+    recipient: 'assistant',
+    hasPenAnnotation: req.targetComponentIds.length > 0 || Boolean(req.annotatedImageBase64),
+    changedComponentIds: changeStats.changedComponentIds,
+    removedNeededFeature: changeStats.removedNeededFeature,
+  });
 
-  return {
-    ...candidate,
-    decisionRecord,
-    telemetryEvent,
-  };
+  return candidate;
 }
 
 const CLEAR_FEEDBACK_SCHEMA: Schema = {
@@ -1749,15 +1740,14 @@ export async function evaluateAppWithPersonas(req: EvaluateRequest): Promise<Eva
 
   const achievedCount = results.filter((r) => r.outcome === 'achieved').length;
   const telemetryPromise =
-    achievedCount === results.length
-      ? (prestartedClearPromise ?? finalizeWithClearFeedback())
-      : finalizeTelemetryOnEvaluate(
-          req.cohortId,
-          achievedCount,
-          results.length,
-          req.runId,
-          req.turnCount,
-        );
+    prestartedClearPromise ??
+    finalizeTelemetryOnEvaluate(
+      req.cohortId,
+      achievedCount,
+      results.length,
+      req.runId,
+      req.turnCount,
+    );
   const [closing, telemetrySummary] = await Promise.all([closingPromise, telemetryPromise]);
   if (closing) owner.closingLines = closing.text.split('\n').filter(Boolean);
 
@@ -1856,10 +1846,10 @@ function inferMentionedComponentIds(spec: AppSpec, userMessage: string): string[
   return found.sort((a, b) => a.at - b.at).map((f) => f.id);
 }
 
-async function buildRequireRedPenResponse(
+function buildRequireRedPenResponse(
   req: ChatRequest,
   extraPointedIds: string[] = [],
-): Promise<ChatResponse> {
+): ChatResponse {
   const existingIds = new Set(req.currentSpec.components.map((c) => c.id));
   const pointedIds = Array.from(
     new Set([
@@ -1896,7 +1886,6 @@ async function applyFromChat(req: ChatRequest): Promise<ChatResponse> {
     reply: applied.commitMessage,
     suggestedFollowUps: [],
     applied,
-    telemetryEvent: applied.telemetryEvent,
   };
 }
 
@@ -2036,15 +2025,11 @@ export async function chatWithStudio(req: ChatRequest): Promise<ChatResponse> {
   const explicitMention = circledOnly
     ? null
     : detectExplicitRecipientMention(effectiveReq.userMessage);
-  const recipient =
-    explicitMention ??
-    (effectiveReq.recipient && effectiveReq.recipient !== 'auto'
-      ? effectiveReq.recipient
-      : 'assistant');
+  const recipient = explicitMention ?? (effectiveReq.recipient || 'assistant');
 
   // 宛先が「店長」または「客A〜C」のときは、その本人に繋ぐ
   if (!circledOnly && recipient === 'owner') {
-    const [owner, telemetryEvent] = await Promise.all([
+    const [owner] = await Promise.all([
       voiceOwnerLine({
         situation: 'reply',
         userMessage: effectiveReq.userMessage,
@@ -2089,15 +2074,14 @@ export async function chatWithStudio(req: ChatRequest): Promise<ChatResponse> {
       reply: owner.text || OWNER_REPLY_FALLBACK,
       suggestedFollowUps: [],
       pointedComponentIds: fallbackOwnerIds.slice(0, 1),
-      telemetryEvent,
     };
   }
   if (!circledOnly && recipient !== 'assistant') {
-    const [customerReplies, telemetryEvent] = await Promise.all([
+    const [customerReplies] = await Promise.all([
       voiceCohortCustomers(effectiveReq),
       recordPromptTelemetryEvent({
         cohortId: effectiveReq.cohortId,
-        runId: effectiveReq.cohortId ? effectiveReq.runId : undefined,
+        runId: effectiveReq.runId,
         turnIndex: effectiveReq.turnIndex,
         shareForAggregate: effectiveReq.shareForAggregate,
         promptText: effectiveReq.userMessage,
@@ -2112,12 +2096,10 @@ export async function chatWithStudio(req: ChatRequest): Promise<ChatResponse> {
     ).slice(0, 1);
     return {
       intent: 'customer',
-      customerPersonaId: customerReplies[0]?.personaId,
       customerReplies,
       reply: customerReplies.map((r) => r.text).join('\n'),
       suggestedFollowUps: [],
       pointedComponentIds: allCustomerPointedIds,
-      telemetryEvent,
     };
   }
 
@@ -2267,27 +2249,26 @@ export async function chatWithStudio(req: ChatRequest): Promise<ChatResponse> {
     ...(parsed.pointedComponentIds ?? []).filter((id) => existingIds.has(id)),
   ]);
 
-  const telemetryEvent = effectiveReq.userMessage
-    ? await recordPromptTelemetryEvent({
-        cohortId: effectiveReq.cohortId,
-        runId: effectiveReq.runId,
-        turnIndex: effectiveReq.turnIndex,
-        shareForAggregate: effectiveReq.shareForAggregate,
-        promptText: effectiveReq.userMessage,
-        sessionMode: 'explore',
-        recipient: 'assistant',
-        hasPenAnnotation:
-          effectiveReq.targetComponentIds.length > 0 ||
-          Boolean(effectiveReq.annotatedImageBase64),
-      })
-    : undefined;
+  if (effectiveReq.userMessage) {
+    await recordPromptTelemetryEvent({
+      cohortId: effectiveReq.cohortId,
+      runId: effectiveReq.runId,
+      turnIndex: effectiveReq.turnIndex,
+      shareForAggregate: effectiveReq.shareForAggregate,
+      promptText: effectiveReq.userMessage,
+      sessionMode: 'explore',
+      recipient: 'assistant',
+      hasPenAnnotation:
+        effectiveReq.targetComponentIds.length > 0 ||
+        Boolean(effectiveReq.annotatedImageBase64),
+    });
+  }
 
   return {
     intent: parsed.intent === 'unclear' ? 'clarify' : 'explain',
     reply: cleanJapaneseText(parsed.reply, 'どこをどう変えたいか教えてください'),
     suggestedFollowUps: [],
     pointedComponentIds: [...pointedIds].slice(0, 1),
-    telemetryEvent,
   };
 }
 

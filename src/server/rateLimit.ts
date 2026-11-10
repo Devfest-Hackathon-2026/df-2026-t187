@@ -15,7 +15,7 @@ export interface RateLimitRule {
 }
 
 /** ふつうに遊ぶと Gemini を呼ぶAPIは1分に6〜8回ほど。読み上げは発言ごとに呼ぶので多め */
-export const DEFAULT_RATE_LIMITS: Record<RateLimitGroup, RateLimitRule> = {
+const DEFAULT_RATE_LIMITS: Record<RateLimitGroup, RateLimitRule> = {
   gemini: {
     perClient: readLimit('RATE_LIMIT_GEMINI_PER_CLIENT', 20),
     global: readLimit('RATE_LIMIT_GEMINI_GLOBAL', 120),
@@ -36,7 +36,6 @@ const WINDOW_MS = 60_000;
 /** Gemini を呼ぶAPIと、読み上げのAPI。ここにないAPIは数えない */
 const GROUP_BY_PATH: Record<string, RateLimitGroup> = {
   '/api/chat': 'gemini',
-  '/api/apply': 'gemini',
   '/api/evaluate': 'gemini',
   '/api/owner-line': 'gemini',
   '/api/transcribe': 'gemini',
@@ -67,8 +66,10 @@ export function clientKeyOf(req: IncomingMessage): string {
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean);
-  return parts[parts.length - 1] ?? req.socket.remoteAddress ?? 'unknown';
+  return (parts[parts.length - 1] ?? req.socket.remoteAddress ?? 'unknown').slice(0, 128);
 }
+
+const MAX_TRACKED_KEYS = 10_000;
 
 /** 直近の時間の枠に呼んだ時刻を覚えておき、上限を超えたら断る（スライディングウィンドウ） */
 export class RateLimiter {
@@ -91,8 +92,10 @@ export class RateLimiter {
   take(group: RateLimitGroup, clientKey: string): { ok: true } | { ok: false; retryAfterSec: number } {
     const rule = this.rules[group];
     const t = this.now();
-    const clientHits = this.recent(`${group}:client:${clientKey}`, t);
-    const globalHits = this.recent(`${group}:global`, t);
+    const globalKey = `${group}:global`;
+    const clientHitKey = `${group}:client:${clientKey}`;
+    const globalHits = this.recent(globalKey, t);
+    const clientHits = this.recent(clientHitKey, t);
     const full =
       clientHits.length >= rule.perClient
         ? clientHits
@@ -105,13 +108,30 @@ export class RateLimiter {
     }
     clientHits.push(t);
     globalHits.push(t);
+    this.remember(clientHitKey, clientHits);
+    this.remember(globalKey, globalHits);
     return { ok: true };
   }
 
   private recent(key: string, t: number): number[] {
-    const list = (this.hits.get(key) ?? []).filter((at) => t - at < this.windowMs);
+    const existing = this.hits.get(key);
+    if (!existing) return [];
+    const kept = existing.filter((at) => t - at < this.windowMs);
+    if (kept.length === 0) this.hits.delete(key);
+    else this.hits.set(key, kept);
+    return kept;
+  }
+
+  private remember(key: string, list: number[]): void {
+    if (!this.hits.has(key) && this.hits.size >= MAX_TRACKED_KEYS) {
+      this.prune();
+      while (this.hits.size >= MAX_TRACKED_KEYS) {
+        const oldest = this.hits.keys().next().value;
+        if (oldest === undefined) break;
+        this.hits.delete(oldest);
+      }
+    }
     this.hits.set(key, list);
-    return list;
   }
 
   /** 古い記録を捨てる。接続元が増え続けても記録がたまらないように、定期的に呼ぶ */
@@ -130,7 +150,7 @@ export class RateLimiter {
 // ============================================================================
 
 /** Gemini を呼べる1日あたりの回数。日付は日本時間で区切る。サーバー（インスタンス）ごとに数える */
-export const DAILY_GEMINI_LIMIT = readLimit('RATE_LIMIT_GEMINI_DAILY', 2000);
+const DAILY_GEMINI_LIMIT = readLimit('RATE_LIMIT_GEMINI_DAILY', 2000);
 /** 1つの接続元から同時に処理する、Gemini を呼ぶリクエストの数 */
 export const MAX_CONCURRENT_PER_CLIENT = readLimit('RATE_LIMIT_CONCURRENT_PER_CLIENT', 2);
 
@@ -211,7 +231,7 @@ export class ConcurrencyGate {
 // ============================================================================
 
 /** 画像や音声を送るAPIだけ大きめにし、そのほかは小さく抑える */
-const LARGE_BODY_PATHS = new Set(['/api/chat', '/api/apply', '/api/evaluate', '/api/transcribe']);
+const LARGE_BODY_PATHS = new Set(['/api/chat', '/api/evaluate', '/api/transcribe']);
 export const LARGE_BODY_BYTES = 2 * 1024 * 1024;
 export const SMALL_BODY_BYTES = 16 * 1024;
 

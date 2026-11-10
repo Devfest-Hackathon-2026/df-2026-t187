@@ -3,7 +3,12 @@
 // 2. Model Armor（Sensitive Data Protection と連携）で、個人情報・プロンプトインジェクション・有害な内容を調べる
 // 止めた発言は、どこにも保存しない
 
-import { getGcpAccessToken } from './store.ts';
+import {
+  getConfiguredGcpProject,
+  getGcpAccessToken,
+  isSafeFirestoreDocId,
+  isSafeGcpLocation,
+} from './store.ts';
 import { describeErrorForLog } from './logSafe.ts';
 
 export type PromptRejectReason = 'personal_info' | 'prompt_injection' | 'harmful';
@@ -60,10 +65,10 @@ export function stripThemeSamplePhrases(text: string): string {
 
 /** コードの規則で、メールアドレスと電話番号らしいものがあるかを見る */
 export function findPersonalInfoByRules(text: string): boolean {
-  const target = stripThemeSamplePhrases(text);
+  const target = stripThemeSamplePhrases(text).normalize('NFKC');
   if (EMAIL_RE.test(target)) return true;
   for (const m of target.matchAll(PHONE_CANDIDATE_RE)) {
-    const digits = m[0].replace(/[^\d０-９]/g, '');
+    const digits = m[0].replace(/\D/g, '');
     if (digits.length === 10 || digits.length === 11) return true;
   }
   return false;
@@ -94,10 +99,10 @@ export function reasonFromModelArmorResult(result: unknown): PromptRejectReason 
  * 調べられなかったときも体験は止めず、コードの規則による確認だけで進める
  */
 async function screenWithModelArmor(text: string): Promise<PromptRejectReason | null> {
-  const project = process.env.GOOGLE_CLOUD_PROJECT;
+  const project = getConfiguredGcpProject();
   const location = process.env.MODEL_ARMOR_LOCATION;
   const templateId = process.env.MODEL_ARMOR_TEMPLATE_ID;
-  if (!project || project === 'your-gcp-project-id' || !location || !templateId) return null;
+  if (!project || !isSafeGcpLocation(location) || !isSafeFirestoreDocId(templateId)) return null;
   try {
     const token = await getGcpAccessToken();
     if (!token) return null;

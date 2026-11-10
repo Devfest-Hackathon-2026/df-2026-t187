@@ -53,12 +53,10 @@ import type {
   ChatResponse,
   Checkpoint,
   EvaluationResponse,
-  HumanDecisionRecord,
   LatestReviewRecord,
   OwnerLineRequest,
   OwnerLineResponse,
   RecordDecisionRequest,
-  RecordDecisionResponse,
   ReviewerPersona,
   ReviewOutcome,
   StateValue,
@@ -69,6 +67,7 @@ import type {
 import { ICONS } from './icons.ts';
 import {
   findSandboxComponentElement,
+  getStageRelativeRect,
   querySandboxComponentElements,
   renderSandboxApp,
   scrollSandboxBy,
@@ -141,7 +140,6 @@ interface StudioState {
   activeCheckpointIndex: number;
   liveAppState: Record<string, StateValue>;
   selectedCohortId?: TargetCohortId;
-  decisions: HumanDecisionRecord[];
   /** 今の挑戦で、お客さんの反応を見る前に立てた予想の記録 */
   predictionRounds: PredictionRound[];
   interactionMode: 'play' | 'pen';
@@ -690,7 +688,6 @@ const state: StudioState = {
   liveAppState: createInitialState(INITIAL_SPEC),
   selectedCohortId: undefined,
   clearedCohortIds: [],
-  decisions: [],
   predictionRounds: [],
   interactionMode: 'play',
   penPoints: [],
@@ -1028,7 +1025,6 @@ let lastSandboxRenderKey = '';
 const seenMessageIds = new Set<string>();
 const recipientFirstSeenAt = new Map<string, number>();
 const RECIPIENT_ENTER_DURATION_MS = 420;
-const RECIPIENT_ENTER_STAGGER_MS = 85;
 
 /**
  * 順番に出す発言。typingMs が 0 のものは書き込み中の表示をせず、少し間を置いて出す。
@@ -1320,15 +1316,17 @@ function collectComponentRects(container: HTMLElement): Rect2D[] {
     if (!id) continue;
     const r = el.getBoundingClientRect();
     if (!isPartlyVisible(el, r)) continue;
-    const isInsideIframe = el.ownerDocument !== document;
     const view = el.ownerDocument.defaultView;
-    if (isInsideIframe && view) viewport = { width: view.innerWidth, height: view.innerHeight };
+    if (el.ownerDocument !== document && view) {
+      viewport = { width: view.innerWidth, height: view.innerHeight };
+    }
+    const rel = getStageRelativeRect(el, containerRect);
     rects.push({
       id,
-      left: isInsideIframe ? r.left : r.left - containerRect.left,
-      top: isInsideIframe ? r.top : r.top - containerRect.top,
-      right: isInsideIframe ? r.right : r.right - containerRect.left,
-      bottom: isInsideIframe ? r.bottom : r.bottom - containerRect.top,
+      left: rel.left,
+      top: rel.top,
+      right: rel.right,
+      bottom: rel.bottom,
       // 画面下に固定した帯と広告は、その下の部品を隠す
       occludes: el.classList.contains('is-sticky') || el.classList.contains('inapp-popup-card'),
       pinned: el.classList.contains('is-sticky'),
@@ -1508,13 +1506,11 @@ function resolveSpeakerTargetRect(
   }
   const el = findSandboxComponentElement(container, componentId);
   if (!el) return null;
-  const containerRect = container.getBoundingClientRect();
-  const r = el.getBoundingClientRect();
-  const isInsideIframe = el.ownerDocument !== document;
-  const left = Math.max(0, isInsideIframe ? r.left : r.left - containerRect.left);
-  const top = Math.max(0, isInsideIframe ? r.top : r.top - containerRect.top);
-  const right = Math.min(canvasWidth, isInsideIframe ? r.right : r.right - containerRect.left);
-  const bottom = Math.min(canvasHeight, isInsideIframe ? r.bottom : r.bottom - containerRect.top);
+  const rel = getStageRelativeRect(el, container.getBoundingClientRect());
+  const left = Math.max(0, rel.left);
+  const top = Math.max(0, rel.top);
+  const right = Math.min(canvasWidth, rel.right);
+  const bottom = Math.min(canvasHeight, rel.bottom);
   if (right - left < 8 || bottom - top < 8) return null;
   return { left, top, right, bottom };
 }
@@ -1753,8 +1749,7 @@ function pushNewCheckpoint(commitMessage: string, updatedSpec: AppSpec): void {
 
 async function recordDecision(body: RecordDecisionRequest): Promise<void> {
   try {
-    const data = await postJson<RecordDecisionResponse>('/api/decision', body);
-    state.decisions.push(data.decision);
+    await postJson('/api/decision', body);
   } catch (err) {
     // 記録に失敗しても体験の進行は止めない
     console.warn('[studio] 判断の記録に失敗しました:', err);
@@ -1817,7 +1812,7 @@ function handleRestartFromScratch(sameCohortId?: TargetCohortId): void {
 function startCohort(cohortId: TargetCohortId): void {
   const cohort = TARGET_COHORTS.find((c) => c.id === cohortId) ?? TARGET_COHORTS[0];
   state.selectedCohortId = cohort.id;
-  state.runId = `run-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  state.runId = `run-${crypto.randomUUID()}`;
   state.runTurnTexts = [];
   state.predictionRounds = [];
   // 同意の切り替えは、次の挑戦から効く
@@ -1833,7 +1828,6 @@ function startCohort(cohortId: TargetCohortId): void {
     targetId: cohort.id,
     chosenLabel: cohort.label,
     reason: '',
-    cohortId: cohort.id,
   });
 
   void playCohortHearing(cohort, getCurrentSpec());
@@ -2408,8 +2402,6 @@ interface LastUserTurnSnapshot {
   checkpointsBefore: Checkpoint[];
   activeCheckpointIndexBefore: number;
   liveAppStateBefore: Record<string, StateValue>;
-  /** 送信前の判断記録の数 */
-  decisionsLengthBefore: number;
   /** 送信前の発言一覧の長さ */
   turnTextsLengthBefore: number;
   /** 送信前の赤ペン・話題の対象部品 */
@@ -2456,7 +2448,6 @@ function handleCancelLastUserMessage(): void {
   state.checkpoints = snap.checkpointsBefore;
   state.activeCheckpointIndex = snap.activeCheckpointIndexBefore;
   state.liveAppState = snap.liveAppStateBefore;
-  state.decisions.length = snap.decisionsLengthBefore;
   state.runTurnTexts.length = snap.turnTextsLengthBefore;
   state.circledComponentIds = snap.circledComponentIdsBefore;
   state.topicTargetIds = snap.topicTargetIdsBefore;
@@ -2498,7 +2489,6 @@ async function handleSendMessage(
     checkpointsBefore: structuredClone(state.checkpoints),
     activeCheckpointIndexBefore: state.activeCheckpointIndex,
     liveAppStateBefore: structuredClone(state.liveAppState),
-    decisionsLengthBefore: state.decisions.length,
     turnTextsLengthBefore: state.runTurnTexts.length,
     circledComponentIdsBefore: [...state.circledComponentIds],
     topicTargetIdsBefore: [...state.topicTargetIds],
@@ -2654,9 +2644,6 @@ async function handleSendMessage(
     logTimers.forEach((t) => window.clearTimeout(t));
     if (data.applied) {
       const applied = data.applied;
-      if (applied.decisionRecord) {
-        state.decisions.push(applied.decisionRecord);
-      }
       // お助けエージェントが判断して改造に進んだときは、ここで作業ログを出す
       logMessage ??= startWorkLog(targetIdsSnapshot);
       if (!applied.rolledBack) {
@@ -2743,16 +2730,7 @@ async function handleSendMessage(
         state.topicTargetIds = [...targetIdsSnapshot];
       }
       state.chatLoading = false;
-      const replies =
-        data.customerReplies && data.customerReplies.length > 0
-          ? data.customerReplies
-          : [
-              {
-                personaId: data.customerPersonaId ?? '',
-                text: data.reply,
-                pointedComponentIds: data.pointedComponentIds,
-              },
-            ];
+      const replies = data.customerReplies ?? [];
       const queued: QueuedMessage[] = [];
       replies.forEach((item, idx) => {
         const chunks = splitIntoChatChunks(item.text);
@@ -2788,15 +2766,6 @@ async function handleSendMessage(
         targetComponentIds: targetIdsSnapshot,
         pointedComponentIds: restChunks.length === 0 ? data.pointedComponentIds : undefined,
       });
-      const followUpMsg: Omit<TimelineMessage, 'id'> | undefined =
-        data.suggestedFollowUps && data.suggestedFollowUps.length > 0
-          ? {
-              role: 'system',
-              text: FOLLOW_UP_PROMPT_TEXT,
-              targetComponentIds: targetIdsSnapshot,
-              followUps: data.suggestedFollowUps,
-            }
-          : undefined;
       if (restChunks.length > 0) {
         state.chatLoading = false;
         const queued: QueuedMessage[] = restChunks.map((chunk, idx) => ({
@@ -2809,14 +2778,8 @@ async function handleSendMessage(
           },
           typingMs: typingDurationFor(chunk),
         }));
-        if (followUpMsg) {
-          queued.push({ message: followUpMsg, typingMs: 0 });
-        }
         enqueueMessages(queued);
         return;
-      }
-      if (followUpMsg) {
-        pushMessage(followUpMsg);
       }
     }
   } catch (err) {
@@ -3340,10 +3303,7 @@ function renderActionChoiceRow(msg: TimelineMessage): HTMLElement | null {
     });
     pillRow.appendChild(btn);
   }
-  if (
-    followUps.length > 0 &&
-    !followUps.some((f) => f.includes('何もしない') || f.includes('そのまま'))
-  ) {
+  if (followUps.length > 0) {
     const noopBtn = document.createElement('button');
     noopBtn.type = 'button';
     noopBtn.className = 'cohort-pill-btn';
@@ -3355,7 +3315,6 @@ function renderActionChoiceRow(msg: TimelineMessage): HTMLElement | null {
           targetId: msg.targetComponentIds.join(','),
           chosenLabel: '何もしない',
           reason: '',
-          cohortId: state.selectedCohortId,
         });
       }
       state.penPoints = [];
@@ -3860,7 +3819,7 @@ function renderChatPanel(): HTMLElement {
     !workLogRunning &&
     state.recipient !== 'assistant' &&
     state.recipient !== 'owner'
-      ? (findPersona(state.recipient) ?? cohortPersonas[0])
+      ? cohortPersonas[0]
       : undefined;
 
   // 店長の書き込み中の表示
@@ -3955,7 +3914,7 @@ function renderChatPanel(): HTMLElement {
   const recipientOptions: Array<{
     key: string;
     label: string;
-    customerIndex?: number;
+    isCustomer?: boolean;
     achieved?: boolean;
   }> = [
     { key: 'assistant', label: AGENT_NAME },
@@ -3965,7 +3924,7 @@ function renderChatPanel(): HTMLElement {
           {
             key: 'customer',
             label: allCustomersAchieved ? '✓ お客さん' : 'お客さん',
-            customerIndex: 0,
+            isCustomer: true,
             achieved: allCustomersAchieved,
           },
         ]
@@ -3978,8 +3937,8 @@ function renderChatPanel(): HTMLElement {
     pill.type = 'button';
     pill.dataset.recipientKey = opt.key;
     pill.disabled = isCohortLocked;
-    pill.className = `composer-recipient-pill${state.recipient === opt.key ? ' is-active' : ''}${opt.customerIndex !== undefined ? ' is-customer-pill' : ''}${opt.achieved ? ' is-achieved-customer' : ''}`;
-    if (opt.customerIndex !== undefined) {
+    pill.className = `composer-recipient-pill${state.recipient === opt.key ? ' is-active' : ''}${opt.isCustomer ? ' is-customer-pill' : ''}${opt.achieved ? ' is-achieved-customer' : ''}`;
+    if (opt.isCustomer) {
       pill.title = opt.achieved
         ? 'お客さん全員が満足して注文できました（クリックで話しかける）'
         : 'お客さんに質問する';
@@ -3988,12 +3947,10 @@ function renderChatPanel(): HTMLElement {
         firstSeen = now;
         recipientFirstSeenAt.set(opt.key, firstSeen);
       }
-      const delayMs = opt.customerIndex * RECIPIENT_ENTER_STAGGER_MS;
-      const totalMs = delayMs + RECIPIENT_ENTER_DURATION_MS;
       const elapsed = now - firstSeen;
-      if (elapsed < totalMs) {
+      if (elapsed < RECIPIENT_ENTER_DURATION_MS) {
         pill.classList.add('is-entering');
-        pill.style.animationDelay = `${Math.round(delayMs - elapsed)}ms`;
+        pill.style.animationDelay = `${Math.round(-elapsed)}ms`;
       }
     }
     pill.textContent = opt.label;

@@ -47,6 +47,39 @@ function ensureTtsPresetsLoaded(): void {
   }
 }
 
+const GCP_PROJECT_ID_RE = /^(?:[a-z0-9-]+(?:\.[a-z0-9-]+)*:)?[a-z0-9][a-z0-9-]{2,62}$/i;
+const GCP_LOCATION_RE = /^[a-z0-9-]{2,40}$/i;
+const BQ_IDENTIFIER_RE = /^[A-Za-z0-9_]{1,64}$/;
+const FIRESTORE_DOC_ID_RE = /^[A-Za-z0-9_:-]{1,128}$/;
+
+export function isSafeGcpProjectId(project: unknown): project is string {
+  return typeof project === 'string' && project !== 'your-gcp-project-id' && GCP_PROJECT_ID_RE.test(project);
+}
+
+export function isSafeGcpLocation(location: unknown): location is string {
+  return typeof location === 'string' && GCP_LOCATION_RE.test(location);
+}
+
+export function isSafeFirestoreDocId(id: unknown): id is string {
+  return typeof id === 'string' && FIRESTORE_DOC_ID_RE.test(id);
+}
+
+function isSafeBqIdentifier(name: string): boolean {
+  return BQ_IDENTIFIER_RE.test(name);
+}
+
+export function getConfiguredGcpProject(): string | null {
+  const project = process.env.GOOGLE_CLOUD_PROJECT;
+  return isSafeGcpProjectId(project) ? project : null;
+}
+
+export function getFirestoreDocumentsBaseUrl(): string | null {
+  if (process.env.FIRESTORE_ENABLED === '0') return null;
+  const project = getConfiguredGcpProject();
+  if (!project) return null;
+  return `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(project)}/databases/(default)/documents`;
+}
+
 let googleAuth: GoogleAuth | null = null;
 
 export async function getGcpAccessToken(): Promise<string | null> {
@@ -71,25 +104,24 @@ export async function getGcpAccessToken(): Promise<string | null> {
 export async function saveHumanDecision(
   decision: HumanDecisionRecord,
 ): Promise<{ persistedToFirestore: boolean }> {
-  const project = process.env.GOOGLE_CLOUD_PROJECT;
-  const firestoreEnabled =
-    process.env.FIRESTORE_ENABLED !== '0' &&
-    Boolean(project) &&
-    project !== 'your-gcp-project-id';
-  if (!firestoreEnabled) {
+  const baseUrl = getFirestoreDocumentsBaseUrl();
+  if (!baseUrl || !isSafeFirestoreDocId(decision.id)) {
     return { persistedToFirestore: false };
   }
 
   try {
     const token = await getGcpAccessToken();
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-    if (token) {
-      headers.Authorization = `Bearer ${token}`;
+    if (!token) {
+      return { persistedToFirestore: false };
     }
-    const endpoint = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(project ?? '')}/databases/(default)/documents/decisions?documentId=${encodeURIComponent(decision.id)}`;
+    const expireAt = new Date(Date.now() + TELEMETRY_TTL_MS).toISOString();
+    const endpoint = `${baseUrl}/decisions?documentId=${encodeURIComponent(decision.id)}`;
     const res = await fetch(endpoint, {
       method: 'POST',
-      headers,
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
       body: JSON.stringify({
         fields: {
           stage: { stringValue: decision.stage },
@@ -98,6 +130,7 @@ export async function saveHumanDecision(
           reason: { stringValue: decision.reason },
           recordedVia: { stringValue: decision.recordedVia },
           createdAt: { stringValue: decision.createdAt },
+          expireAt: { timestampValue: expireAt },
         },
       }),
       signal: AbortSignal.timeout(2500),
@@ -108,7 +141,7 @@ export async function saveHumanDecision(
   }
 }
 
-const ARCHETYPE_ANCHOR_TEXTS: Record<PromptArchetype, string> = {
+const ARCHETYPE_ANCHOR_TEXTS: Record<Exclude<PromptArchetype, 'inquiry'>, string> = {
   simple_delete: '定期便やクーポンや広告の欄をそのまま消して削除してなくして',
   condition_design:
     '初期チェックを外して自分で選べるようにして解約条件を分かりやすく明記して閉じるボタンを大きく下に配置して',
@@ -116,7 +149,6 @@ const ARCHETYPE_ANCHOR_TEXTS: Record<PromptArchetype, string> = {
   vague_delegate: 'いい感じに全部まとめて使いやすく見やすく直しておまかせで',
   goal_directed:
     '定期便を望むお客さんだけが自分で選べるようにしたい クーポンを使いたい人が迷わず使えるようにして',
-  inquiry: '店長やお客さんにどこで困ったか理由や狙いを質問して教えて',
 };
 
 let cachedAnchorEmbeddings: Map<PromptArchetype, number[]> | null = null;
@@ -129,8 +161,8 @@ async function analyzePromptWithCloudNaturalLanguage(
   promptText: string,
 ): Promise<NaturalLanguageSignal> {
   const base = extractDeterministicNlSignal(promptText);
-  const project = process.env.GOOGLE_CLOUD_PROJECT;
-  if (!project || project === 'your-gcp-project-id' || !promptText.trim()) {
+  const project = getConfiguredGcpProject();
+  if (!project || !promptText.trim()) {
     return base;
   }
 
@@ -203,8 +235,8 @@ export async function classifyPromptWithAgentPlatformEmbeddings(
   if (sessionMode !== 'execute' || base.closestArchetype !== 'direct_fix') {
     return base;
   }
-  const project = process.env.GOOGLE_CLOUD_PROJECT;
-  if (!project || project === 'your-gcp-project-id' || !promptText.trim()) {
+  const project = getConfiguredGcpProject();
+  if (!project || !promptText.trim()) {
     return base;
   }
 
@@ -214,9 +246,10 @@ export async function classifyPromptWithAgentPlatformEmbeddings(
 
     const rawLocation = process.env.GOOGLE_CLOUD_LOCATION || 'us-central1';
     const location = rawLocation === 'global' ? 'us-central1' : rawLocation;
+    if (!isSafeGcpLocation(location)) return base;
     const endpoint = `https://${encodeURIComponent(location)}-aiplatform.googleapis.com/v1/projects/${encodeURIComponent(project)}/locations/${encodeURIComponent(location)}/publishers/google/models/text-multilingual-embedding-002:predict`;
 
-    const archetypes = Object.keys(ARCHETYPE_ANCHOR_TEXTS) as PromptArchetype[];
+    const archetypes = Object.keys(ARCHETYPE_ANCHOR_TEXTS) as Array<Exclude<PromptArchetype, 'inquiry'>>;
     const needAnchors = !cachedAnchorEmbeddings;
     const instances = needAnchors
       ? [
@@ -260,7 +293,6 @@ export async function classifyPromptWithAgentPlatformEmbeddings(
     let bestArchetype: PromptArchetype = base.closestArchetype;
     let bestScore = -1;
     for (const [arch, vec] of cachedAnchorEmbeddings.entries()) {
-      if (arch === 'inquiry') continue;
       const sim = cosineSimilarity(promptVector, vec);
       if (sim > bestScore) {
         bestScore = sim;
@@ -286,6 +318,9 @@ async function insertBigQueryRows(
   rows: Array<{ insertId: string; json: Record<string, unknown> }>,
 ): Promise<void> {
   const dataset = process.env.BIGQUERY_DATASET || 'studio_telemetry';
+  if (!isSafeGcpProjectId(project) || !isSafeBqIdentifier(dataset) || !isSafeBqIdentifier(table)) {
+    return;
+  }
   const url = `https://bigquery.googleapis.com/bigquery/v2/projects/${encodeURIComponent(project)}/datasets/${encodeURIComponent(dataset)}/tables/${encodeURIComponent(table)}/insertAll`;
   await fetch(url, {
     method: 'POST',
@@ -312,7 +347,7 @@ const VALID_PROMPT_ARCHETYPES = new Set<PromptArchetype>([
   'inquiry',
 ]);
 
-export interface FirestoreFieldValue {
+interface FirestoreFieldValue {
   stringValue?: string;
   integerValue?: string;
   doubleValue?: number;
@@ -320,7 +355,7 @@ export interface FirestoreFieldValue {
   timestampValue?: string;
 }
 
-export interface FirestoreDocumentLike {
+interface FirestoreDocumentLike {
   name?: string;
   fields?: Record<string, FirestoreFieldValue>;
 }
@@ -482,18 +517,14 @@ export function mergeTelemetryEvents(
  */
 async function fetchRunTelemetryFromFirestore(runId?: string): Promise<PromptTelemetryEvent[]> {
   if (!runId) return [];
-  const project = process.env.GOOGLE_CLOUD_PROJECT;
-  const firestoreEnabled =
-    process.env.FIRESTORE_ENABLED !== '0' &&
-    Boolean(project) &&
-    project !== 'your-gcp-project-id';
-  if (!firestoreEnabled || !project) return [];
+  const baseUrl = getFirestoreDocumentsBaseUrl();
+  if (!baseUrl) return [];
 
   try {
     const token = await getGcpAccessToken();
     if (!token) return [];
 
-    const url = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(project)}/databases/(default)/documents:runQuery`;
+    const url = `${baseUrl}:runQuery`;
     const res = await fetch(url, {
       method: 'POST',
       headers: {
@@ -540,8 +571,8 @@ async function fetchRunTelemetryFromFirestore(runId?: string): Promise<PromptTel
  * BigQuery には、学習者が集計に加えることに同意した挑戦の値だけを送る
  */
 async function persistTelemetryToCloud(event: PromptTelemetryEvent, shareForAggregate: boolean): Promise<void> {
-  const project = process.env.GOOGLE_CLOUD_PROJECT;
-  if (!project || project === 'your-gcp-project-id') return;
+  const project = getConfiguredGcpProject();
+  if (!project) return;
 
   try {
     const token = await getGcpAccessToken();
@@ -553,8 +584,9 @@ async function persistTelemetryToCloud(event: PromptTelemetryEvent, shareForAggr
     };
 
     // 1. Cloud Firestore への保存
-    if (process.env.FIRESTORE_ENABLED !== '0') {
-      const firestoreUrl = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(project)}/databases/(default)/documents/prompt_telemetry?documentId=${encodeURIComponent(event.id)}`;
+    const firestoreBase = getFirestoreDocumentsBaseUrl();
+    if (firestoreBase && isSafeFirestoreDocId(event.id)) {
+      const firestoreUrl = `${firestoreBase}/prompt_telemetry?documentId=${encodeURIComponent(event.id)}`;
       void fetch(firestoreUrl, {
         method: 'POST',
         headers,
@@ -614,8 +646,8 @@ export interface RunEventInput {
  * 送るのは挑戦の番号と決まった値だけで、発言の本文や接続元は送らない
  */
 export async function recordRunEvent(input: RunEventInput): Promise<void> {
-  const project = process.env.GOOGLE_CLOUD_PROJECT;
-  if (!project || project === 'your-gcp-project-id') return;
+  const project = getConfiguredGcpProject();
+  if (!project) return;
   try {
     const token = await getGcpAccessToken();
     if (!token) return;
@@ -678,7 +710,7 @@ export async function recordPromptTelemetryEvent(input: {
   const localPriorEvents = inMemoryTelemetryEvents.filter((e) =>
     input.runId
       ? e.runId === input.runId
-      : !input.cohortId || !e.cohortId || e.cohortId === input.cohortId,
+      : !e.runId && (!input.cohortId || !e.cohortId || e.cohortId === input.cohortId),
   );
 
   const [nlSignal, embeddingSignal, cloudPriorEvents] = await Promise.all([
@@ -734,8 +766,8 @@ export async function recordPromptTelemetryEvent(input: {
  */
 export async function finalizeTelemetryOnEvaluate(
   cohortId: TargetCohortId | undefined,
-  achievedCount: number,
-  totalCustomers: number,
+  _achievedCount: number,
+  _totalCustomers: number,
   runId?: string,
   turnCount?: number,
 ): Promise<PromptSessionSummary> {
@@ -743,23 +775,13 @@ export async function finalizeTelemetryOnEvaluate(
   pruneInMemoryTelemetryEventsFromTurn(runId, turnCount);
   const localEvents = runId
     ? inMemoryTelemetryEvents.filter((e) => e.runId === runId)
-    : inMemoryTelemetryEvents;
+    : inMemoryTelemetryEvents.filter((e) => !e.runId);
   const cloudEvents = runId ? await fetchRunTelemetryFromFirestore(runId) : [];
   const merged = runId ? mergeTelemetryEvents(localEvents, cloudEvents) : localEvents;
   const events =
     turnCount !== undefined && turnCount >= 0
       ? merged.filter((e) => e.turnIndex < 0 || e.turnIndex < turnCount)
       : merged;
-  const latest = [...events]
-    .reverse()
-    .find((e) => !cohortId || !e.cohortId || e.cohortId === cohortId);
-  if (latest) {
-    latest.outcomeAfterTurn = {
-      achievedCount,
-      totalCustomers,
-      passed: achievedCount === totalCustomers && totalCustomers > 0,
-    };
-  }
   return summarizePromptTelemetry(events, cohortId);
 }
 
@@ -779,14 +801,6 @@ function publicComponentLabels(): Map<string, string> {
   return componentLabelsCache;
 }
 
-function isSafeBqIdentifier(name: string): boolean {
-  return /^[A-Za-z0-9_]{1,64}$/.test(name);
-}
-
-function isSafeGcpProjectId(project: string): boolean {
-  return /^[A-Za-z0-9:.-]{1,100}$/.test(project);
-}
-
 /**
  * BigQuery の run_events と prompt_events から、同意した挑戦の集計値だけを取得する。
  * 個別の行や発言は返さず、挑戦数が少ない区分は formatPublicAggregateStats で非表示にする
@@ -797,15 +811,13 @@ export async function getPublicAggregateStats(): Promise<PublicAggregateStats> {
     return cachedAggregateStats.value;
   }
 
-  const project = process.env.GOOGLE_CLOUD_PROJECT;
+  const project = getConfiguredGcpProject();
   const dataset = process.env.BIGQUERY_DATASET || 'studio_telemetry';
   const promptTable = process.env.BIGQUERY_TABLE || 'prompt_events';
   const runTable = process.env.BIGQUERY_RUN_TABLE || 'run_events';
 
   if (
     !project ||
-    project === 'your-gcp-project-id' ||
-    !isSafeGcpProjectId(project) ||
     !isSafeBqIdentifier(dataset) ||
     !isSafeBqIdentifier(promptTable) ||
     !isSafeBqIdentifier(runTable)
@@ -869,8 +881,6 @@ export async function getPublicAggregateStats(): Promise<PublicAggregateStats> {
       '  SELECT',
       '    COUNT(*) AS total_runs,',
       "    COUNTIF(end_reason = 'cleared') AS cleared_runs,",
-      "    COUNTIF(end_reason = 'reset') AS reset_runs,",
-      "    COUNTIF(end_reason IN ('closed', 'idle', 'unfinished')) AS abandoned_runs,",
       "    AVG(IF(end_reason = 'cleared', execute_turns, NULL)) AS avg_execute_turns_on_clear",
       '  FROM merged_runs',
       '),',
@@ -887,7 +897,6 @@ export async function getPublicAggregateStats(): Promise<PublicAggregateStats> {
       '),',
       'prompt_totals AS (',
       '  SELECT',
-      '    COUNT(*) AS total_prompts,',
       "    COUNTIF(session_mode = 'execute') AS execute_prompts,",
       "    COUNTIF(session_mode = 'execute' AND is_rework IS TRUE) AS rework_prompts,",
       "    COUNTIF(session_mode = 'execute' AND removed_needed IS TRUE) AS removed_needed_prompts,",
@@ -944,14 +953,6 @@ export async function getPublicAggregateStats(): Promise<PublicAggregateStats> {
       '  ORDER BY run_count DESC, component_id ASC',
       '  LIMIT 40',
       '),',
-      'archetype_stats AS (',
-      '  SELECT',
-      '    closest_archetype AS archetype,',
-      '    COUNT(*) AS cnt',
-      '  FROM prompts_by_id',
-      "  WHERE closest_archetype IS NOT NULL AND closest_archetype != ''",
-      '  GROUP BY closest_archetype',
-      '),',
       'entity_stats AS (',
       '  SELECT',
       '    TRIM(ent) AS term,',
@@ -968,7 +969,6 @@ export async function getPublicAggregateStats(): Promise<PublicAggregateStats> {
       '  (SELECT AS STRUCT * FROM run_totals) AS runTotals,',
       '  ARRAY(SELECT AS STRUCT * FROM cohort_stats) AS cohortStats,',
       '  (SELECT AS STRUCT * FROM prompt_totals) AS promptTotals,',
-      '  ARRAY(SELECT AS STRUCT * FROM archetype_stats) AS archetypeStats,',
       '  ARRAY(SELECT AS STRUCT * FROM entity_stats) AS entityStats,',
       '  ARRAY(SELECT AS STRUCT * FROM archetype_outcomes) AS archetypeOutcomes,',
       '  ARRAY(SELECT AS STRUCT * FROM component_stats) AS componentStats',
@@ -1076,8 +1076,8 @@ export async function synthesizeStudioSpeech(req: TtsRequest): Promise<TtsRespon
     return { audioContent: cached };
   }
 
-  const project = process.env.GOOGLE_CLOUD_PROJECT;
-  if (!project || project === 'your-gcp-project-id') {
+  const project = getConfiguredGcpProject();
+  if (!project) {
     return { fallbackBrowserTts: true };
   }
 
@@ -1110,6 +1110,7 @@ export async function synthesizeStudioSpeech(req: TtsRequest): Promise<TtsRespon
         },
         audioConfig,
       }),
+      signal: AbortSignal.timeout(4000),
     });
     if (!res.ok) {
       return { fallbackBrowserTts: true };

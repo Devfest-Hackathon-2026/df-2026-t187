@@ -4,6 +4,7 @@
 // チャット画面のシステムメッセージ行でインラインコードバッジとして表示する。
 
 import { createInitialState, renderLabel } from './appRuntime.ts';
+import { isCouponComponent, isSubscriptionComponent } from './sandboxValidator.ts';
 import type {
   AppComponent,
   AppSpec,
@@ -150,12 +151,7 @@ export function describeComponentFunctionName(comp: AppComponent): string {
   const label = comp.label ?? '';
   const stateKey = comp.stateKey ?? '';
 
-  if (
-    id === 'popup-coupon' ||
-    /coupon/i.test(id) ||
-    /coupon|discount/i.test(stateKey) ||
-    /クーポン|OFF|割引/.test(label)
-  ) {
+  if (id === 'popup-coupon' || isCouponComponent(comp)) {
     if (comp.type === 'popup') return 'クーポン広告のポップアップ';
     if (comp.type === 'button') return 'クーポン適用のボタン';
     return 'クーポンの選択欄';
@@ -179,7 +175,7 @@ export function describeComponentFunctionName(comp: AppComponent): string {
   if (id === 'btn-buy-now' || comp.role === 'decoy') {
     return '今すぐ購入ボタン';
   }
-  if (id === 'check-subscription' || stateKey === 'subscription' || /定期/.test(label)) {
+  if (id === 'check-subscription' || isSubscriptionComponent(comp)) {
     return '定期便の選択欄';
   }
   if (

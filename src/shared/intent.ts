@@ -67,7 +67,8 @@ export function detectCheckpointRevertCommand(message: string): 'undo' | 'reset'
  * 「高齢の人でも買いやすくして」のように目的だけで対象の部品がない発言は、すぐ改修するとAIが直す部品を選んでしまい、
  * どこが悪いかを学習者が見つける体験がなくなる。triage に回して、どの部品でそう感じたかを聞き返させる。
  */
-const GOAL_PHRASE_RE =
+/** 誰が（人・お客さん）どうできるようにしたいか、という目的の言い方 */
+export const GOAL_STATEMENT_RE =
   /(?:人|方|お客さん|客|誰|高齢|お年寄り|初めて)(?:が|でも|だけ|も|に|は)[^。]*?(?:ように|やすく|られる|できる|迷わ|安心)/;
 const TARGET_HINT_RE = new RegExp(
   `${SPECIFIC_PART_KEYWORDS.source}|部品|クーポン|注文|カート|これ|ここ|この|それ|その|あれ|あの`,
@@ -86,7 +87,7 @@ export function classifyUserMessageIntent(message: string): 'apply' | 'triage' {
   const msg = message.trim();
   if (QUESTION_PATTERN.test(msg)) return 'triage';
   if (CHANGE_REQUEST_PATTERN.test(msg)) {
-    if (GOAL_PHRASE_RE.test(msg) && !TARGET_HINT_RE.test(msg)) return 'triage';
+    if (GOAL_STATEMENT_RE.test(msg) && !TARGET_HINT_RE.test(msg)) return 'triage';
     return 'apply';
   }
   if (GOAL_REQUEST_RE.test(msg) && PART_NAME_RE.test(msg)) return 'apply';

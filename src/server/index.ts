@@ -2,6 +2,7 @@ import { existsSync, readFileSync, statSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { extname, join, normalize, resolve, sep } from 'node:path';
 import { handleApiRequest } from './api.ts';
+import { describeErrorForLog } from './logSafe.ts';
 import { COMMON_SECURITY_HEADERS } from './rateLimit.ts';
 
 const PORT = Number(process.env.PORT || 8080);
@@ -31,64 +32,75 @@ const SECURITY_HEADERS: Record<string, string> = {
 const ROBOTS_TXT = 'User-agent: *\nDisallow: /\n';
 
 const server = createServer(async (req, res) => {
-  const handled = await handleApiRequest(req, res);
-  if (handled) return;
-
-  // Cloud Run 等での静的ファイル配信 (dist/)
-  if (req.method !== 'GET' && req.method !== 'HEAD') {
-    res.writeHead(405, SECURITY_HEADERS);
-    res.end('Method Not Allowed');
-    return;
-  }
-  const rawUrlPath = (req.url ?? '/').split('?')[0];
-  if (rawUrlPath === '/robots.txt') {
-    res.writeHead(200, { ...SECURITY_HEADERS, 'Content-Type': 'text/plain; charset=utf-8' });
-    res.end(ROBOTS_TXT);
-    return;
-  }
-  let urlPath = '/';
   try {
-    urlPath = decodeURIComponent(rawUrlPath);
-  } catch {
-    res.writeHead(400, { ...SECURITY_HEADERS, 'Content-Type': 'text/plain; charset=utf-8' });
-    res.end('Bad Request');
-    return;
-  }
-  if (urlPath.includes('\0')) {
-    res.writeHead(400, { ...SECURITY_HEADERS, 'Content-Type': 'text/plain; charset=utf-8' });
-    res.end('Bad Request');
-    return;
-  }
-  const safeRelPath = normalize(urlPath).replace(/^(\.\.(\/|\\|$))+/, '');
-  if (safeRelPath.split(/[/\\]/).some((seg) => seg.startsWith('.') && seg !== '.')) {
-    res.writeHead(403, SECURITY_HEADERS);
-    res.end('Forbidden');
-    return;
-  }
-  let targetPath = resolve(DIST_DIR, safeRelPath === '/' ? 'index.html' : `.${safeRelPath}`);
+    const handled = await handleApiRequest(req, res);
+    if (handled) return;
 
-  if (targetPath !== DIST_DIR && !targetPath.startsWith(DIST_DIR + sep)) {
-    res.writeHead(403, SECURITY_HEADERS);
-    res.end('Forbidden');
-    return;
-  }
+    // Cloud Run 等での静的ファイル配信 (dist/)
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      res.writeHead(405, SECURITY_HEADERS);
+      res.end('Method Not Allowed');
+      return;
+    }
+    const rawUrlPath = (req.url ?? '/').split('?')[0];
+    if (rawUrlPath === '/robots.txt') {
+      res.writeHead(200, { ...SECURITY_HEADERS, 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end(ROBOTS_TXT);
+      return;
+    }
+    let urlPath = '/';
+    try {
+      urlPath = decodeURIComponent(rawUrlPath);
+    } catch {
+      res.writeHead(400, { ...SECURITY_HEADERS, 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('Bad Request');
+      return;
+    }
+    if (urlPath.includes('\0')) {
+      res.writeHead(400, { ...SECURITY_HEADERS, 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('Bad Request');
+      return;
+    }
+    const safeRelPath = normalize(urlPath).replace(/^(\.\.(\/|\\|$))+/, '');
+    if (safeRelPath.split(/[/\\]/).some((seg) => seg.startsWith('.') && seg !== '.')) {
+      res.writeHead(403, SECURITY_HEADERS);
+      res.end('Forbidden');
+      return;
+    }
+    let targetPath = resolve(DIST_DIR, safeRelPath === '/' ? 'index.html' : `.${safeRelPath}`);
 
-  if (!existsSync(targetPath) || statSync(targetPath).isDirectory()) {
-    targetPath = join(DIST_DIR, 'index.html');
-  }
+    if (targetPath !== DIST_DIR && !targetPath.startsWith(DIST_DIR + sep)) {
+      res.writeHead(403, SECURITY_HEADERS);
+      res.end('Forbidden');
+      return;
+    }
 
-  if (!existsSync(targetPath)) {
-    res.writeHead(404, { ...SECURITY_HEADERS, 'Content-Type': 'text/plain; charset=utf-8' });
-    res.end('Not Found (build dist/ first)');
-    return;
-  }
+    if (!existsSync(targetPath) || statSync(targetPath).isDirectory()) {
+      targetPath = join(DIST_DIR, 'index.html');
+    }
 
-  const ext = extname(targetPath).toLowerCase();
-  const contentType = MIME_TYPES[ext] || 'application/octet-stream';
-  const content = readFileSync(targetPath);
-  res.writeHead(200, { ...SECURITY_HEADERS, 'Content-Type': contentType });
-  res.end(content);
+    if (!existsSync(targetPath)) {
+      res.writeHead(404, { ...SECURITY_HEADERS, 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end('Not Found (build dist/ first)');
+      return;
+    }
+
+    const ext = extname(targetPath).toLowerCase();
+    const contentType = MIME_TYPES[ext] || 'application/octet-stream';
+    const content = readFileSync(targetPath);
+    res.writeHead(200, { ...SECURITY_HEADERS, 'Content-Type': contentType });
+    res.end(content);
+  } catch (err) {
+    console.error('[server] リクエスト処理に失敗しました:', describeErrorForLog(err));
+    if (!res.headersSent) {
+      res.writeHead(500, { ...SECURITY_HEADERS, 'Content-Type': 'text/plain; charset=utf-8' });
+    }
+    res.end('Internal Server Error');
+  }
 });
+
+server.requestTimeout = 30_000;
+server.headersTimeout = 15_000;
 
 server.listen(PORT, () => {
   console.log(`[yukid-df-hack] Server listening on http://localhost:${PORT}`);

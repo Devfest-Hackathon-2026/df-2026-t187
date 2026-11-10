@@ -78,7 +78,7 @@ export function clipToVisibleRects(
   return visible;
 }
 
-export interface BoundingBox {
+interface BoundingBox {
   minX: number;
   minY: number;
   maxX: number;
@@ -88,7 +88,7 @@ export interface BoundingBox {
 /**
  * ペンで描かれた点列から外接矩形(BoundingBox)を計算する。
  */
-export function computeStrokeBounds(points: Point2D[], padding = 6): BoundingBox | null {
+function computeStrokeBounds(points: Point2D[], padding = 6): BoundingBox | null {
   if (points.length === 0) return null;
   let minX = Infinity;
   let minY = Infinity;
